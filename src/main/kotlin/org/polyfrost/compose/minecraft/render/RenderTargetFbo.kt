@@ -1,0 +1,103 @@
+package org.polyfrost.compose.minecraft.render
+
+import com.mojang.blaze3d.pipeline.RenderTarget
+
+//? if >= 26.2 {
+import com.mojang.renderpearl.backend.opengl.FrameBufferAttachment
+//?}
+
+//? if >= 26.1 {
+import org.polyfrost.compose.minecraft.mixin.blaze3d.GlDeviceAccessor
+import org.polyfrost.compose.minecraft.mixin.blaze3d.GpuDeviceAccessor
+//?}
+
+//? if >= 1.21.5 {
+import com.mojang.blaze3d.systems.RenderSystem
+import com.mojang.renderpearl.backend.opengl.GlTexture
+//?}
+
+//? if >= 1.21.5 && < 26.1 {
+/*import com.mojang.renderpearl.backend.opengl.GlDevice
+*///?}
+
+//? if = 1.21.1 {
+/*import net.minecraft.client.Minecraft
+import org.polyfrost.compose.minecraft.render.gl.GlHost
+*///?}
+
+//? if < 1.21.5 {
+/*import com.mojang.blaze3d.platform.GlStateManager
+import org.lwjgl.opengl.GL11
+import org.lwjgl.opengl.GL30
+import org.polyfrost.compose.minecraft.render.gl.GlFbo
+*///?}
+
+/**
+ * Credits to lowercasebtw and taken from The Fabric Project
+ * https://discord.com/channels/507304429255393322/807617488313516032/1452333789778018314
+ */
+object RenderTargetFbo {
+    //? if >= 26.2 {
+    fun getFboId(frameBuffer: RenderTarget): Int {
+        val device = RenderSystem.getDevice()
+        val backend = (device as GpuDeviceAccessor).`polycompose$getBackend`()
+        if (backend !is GlDeviceAccessor) return -1
+        val dsa = backend.`polycompose$getDirectStateAccess`()
+        val color = frameBuffer.colorTexture as? GlTexture ?: return -1
+        val depth = frameBuffer.depthTexture as? GlTexture
+        return backend.`polycompose$getFrameBufferCache`().getFbo(dsa, listOf<FrameBufferAttachment>(color), depth)
+    }
+    //? } else if >= 26.1 {
+    /*fun getFboId(frameBuffer: RenderTarget): Int {
+        val device = RenderSystem.getDevice()
+        val backend = (device as GpuDeviceAccessor).`polycompose$getBackend`()
+        if (backend !is GlDeviceAccessor) return -1
+        val dsa = backend.`polycompose$getDirectStateAccess`()
+        val texture = frameBuffer.colorTexture as? GlTexture ?: return -1
+        return texture.getFbo(dsa, frameBuffer.depthTexture)
+    }
+    *///? } else if >= 1.21.5 {
+    /*fun getFboId(frameBuffer: RenderTarget): Int {
+        val device = RenderSystem.getDevice()
+        if (device !is GlDevice) {
+            return -1
+        } else {
+            val texture = frameBuffer.colorTexture as? GlTexture
+                ?: return -1
+            return texture.getFbo(device.directStateAccess(), frameBuffer.depthTexture)
+        }
+    }
+    *///? } else {
+    /*fun getFboId(frameBuffer: RenderTarget): Int {
+        return frameBuffer.frameBufferId
+    }
+    *///? }
+
+    //? if >= 1.21.5 {
+    fun getColorTexId(frameBuffer: RenderTarget): Int =
+        (frameBuffer.colorTexture as? GlTexture)?.glId() ?: -1
+    //? } else {
+    /*fun getColorTexId(frameBuffer: RenderTarget): Int = frameBuffer.colorTextureId
+    *///? }
+
+    //? if < 1.21.5 {
+    /*fun saveBoundTarget() = IntArray(5).also {
+        //? if = 1.21.1
+        //if (GlHost.vanillaPipeline) return@also
+        GL11.glGetIntegerv(GL11.GL_VIEWPORT, it)
+        it[4] = GlFbo.binding(GL30.GL_FRAMEBUFFER)
+    }
+
+    fun restoreBoundTarget(s: IntArray) {
+        //? if = 1.21.1
+        //if (GlHost.vanillaPipeline) return Minecraft.getInstance().mainRenderTarget.bindWrite(true)
+        //? if > 1.8.9 {
+        GlStateManager._glBindFramebuffer(GL30.GL_FRAMEBUFFER, s[4])
+        GlStateManager._viewport(s[0], s[1], s[2], s[3])
+        //?} else {
+        /*GlFbo.bind(GL30.GL_FRAMEBUFFER, s[4])
+        GlStateManager.viewport(s[0], s[1], s[2], s[3])
+        *///?}
+    }
+    *///?}
+}

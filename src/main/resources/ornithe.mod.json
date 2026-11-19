@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "id": "polycompose",
+  "name": "PolyCompose",
+  "version": "${mod_version}",
+  "description": "Library mod for building Minecraft screens and overlays with Compose.",
+  "authors": [
+    "Polyfrost"
+  ],
+  "contact": {
+    "homepage": "https://polyfrost.org",
+    "sources": "https://github.com/Polyfrost/PolyCompose",
+    "issues": "https://github.com/Polyfrost/PolyCompose/issues"
+  },
+  "license": "LGPL-3.0",
+  "environment": "client",
+  "accessWidener": "polycompose.classtweaker",
+  "entrypoints": {
+    "client": [
+      {
+        "adapter": "kotlin",
+        "value": "org.polyfrost.compose.minecraft.PolyComposeClient"
+      }
+    ]
+  },
+  "mixins": [
+    "mixins.polycompose.json",
+    "mixins.polycompose.optional.json"
+  ],
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "minecraft": "${fabric_mc_version}",
+    "java": ">=${java_version}",
+    "osl-core": ">=0.10.0",
+    "osl-resource-loader": ">=0.8.0",
+    "pylon": ">=0.2.4",
+    "osl-keybinds": ">=0.3.0",
+    "osl-localization": ">=0.1.1",
+    "fabric-language-kotlin": ">=${flk_version}"
+  },
+  "breaks": {
+    "oneconfig": "<1.9.0",
+    "compose-multiplatform": "*"
+  }
+}

@@ -1,0 +1,37 @@
+package org.polyfrost.compose.runtime
+
+import androidx.compose.runtime.AbstractApplier
+import org.polyfrost.compose.node.PolyNode
+
+public class PolyApplier(root: PolyNode) : AbstractApplier<PolyNode>(root) {
+    public var changes: Long = 0L
+        private set
+
+    override fun onEndChanges() {
+        changes++
+    }
+
+    override fun insertTopDown(index: Int, instance: PolyNode) {
+        instance.parent = current
+        current.children.add(index, instance)
+    }
+
+    override fun insertBottomUp(index: Int, instance: PolyNode) {}
+
+    override fun remove(index: Int, count: Int) {
+        repeat(count) { current.children.removeAt(index).also { it.parent = null } }
+    }
+
+    override fun move(from: Int, to: Int, count: Int) {
+        val children = current.children
+        val dest = if (to > from) to - count else to
+        val moved = ArrayList(children.subList(from, from + count))
+        repeat(count) { children.removeAt(from) }
+        children.addAll(dest, moved)
+    }
+
+    override fun onClear() {
+        root.children.forEach { it.parent = null }
+        root.children.clear()
+    }
+}

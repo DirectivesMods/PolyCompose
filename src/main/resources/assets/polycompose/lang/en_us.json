@@ -1,0 +1,21 @@
+{
+  "key.polycompose.profiler": "Toggle profiler overlay",
+  "key.category.polycompose.main": "PolyCompose",
+  "key.categories.polycompose": "PolyCompose",
+  "polycompose.profiler.usage": "Usage: /polycompose profiler [on | off | capture [seconds] | stop | export | spikes <on | off> [ms] | reset]",
+  "polycompose.profiler.on": "Profiler on.",
+  "polycompose.profiler.off": "Profiler off, including spike capture.",
+  "polycompose.profiler.capture.started": "Recording. Run /polycompose profiler stop to save it.",
+  "polycompose.profiler.capture.timed": "Recording for %s seconds. The file is saved when it ends.",
+  "polycompose.profiler.capture.stopping": "Stopping. The file is saved in a moment.",
+  "polycompose.profiler.capture.busy": "A recording is already running.",
+  "polycompose.profiler.capture.none": "Nothing is recording.",
+  "polycompose.profiler.export.saved": "Saved %s. Click to open the folder.",
+  "polycompose.profiler.export.failed": "Couldn't save the profile. The log has the details.",
+  "polycompose.profiler.export.empty": "Nothing to save yet. Turn the profiler on or record a capture first.",
+  "polycompose.profiler.spikes.on": "Spike capture on. Frames slower than %s ms are saved automatically.",
+  "polycompose.profiler.spikes.off": "Spike capture off.",
+  "polycompose.profiler.spike": "Slow frame: %s ms in %s. Saved %s",
+  "polycompose.profiler.reset": "Profiler data cleared.",
+  "polycompose.profiler.invalid": "%s isn't a valid number."
+}

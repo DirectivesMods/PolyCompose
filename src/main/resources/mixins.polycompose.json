@@ -1,0 +1,20 @@
+{
+    "required": true,
+    "compatibilityLevel": "${java_level}",
+    "minVersion": "0.8",
+    "package": "org.polyfrost.compose.minecraft.mixin",
+    "plugin": "org.polyfrost.compose.minecraft.PolyComposeMixinPlugin",
+    "mixinextras": {
+        "minVersion": "0.5.0"
+    },
+    "injectors": {
+        "defaultRequire": 1
+    },
+    "client": [
+        "fixes.Mixin_ComposeImageResources",
+        "fixes.Mixin_ComposePostDelayedDispatcher",
+        "fixes.Mixin_ComposeStringHelpers",
+        "fixes.Mixin_ComposeSvgResources",
+        "render.Mixin_PreUiFrameHook"
+    ]
+}

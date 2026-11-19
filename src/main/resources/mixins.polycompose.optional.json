@@ -1,0 +1,18 @@
+{
+    "required": false,
+    "compatibilityLevel": "${java_level}",
+    "minVersion": "0.8",
+    "package": "org.polyfrost.compose.minecraft.mixin",
+    "plugin": "org.polyfrost.compose.minecraft.PolyComposeOptionalMixinPlugin",
+    "mixinextras": {
+        "minVersion": "0.5.0"
+    },
+    "injectors": {
+        "defaultRequire": 0
+    },
+    "client": [
+        "host.Mixin_HudDrawCounter",
+        "render.Mixin_PreviewNameTag",
+        "screen.Mixin_ScreenGuard"
+    ]
+}

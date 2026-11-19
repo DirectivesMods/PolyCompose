@@ -1,0 +1,392 @@
+package org.polyfrost.compose.minecraft.font
+
+import com.google.gson.JsonObject
+import java.io.ByteArrayInputStream
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.zip.ZipInputStream
+import kotlin.jvm.optionals.getOrNull
+import net.minecraft.client.Minecraft
+import net.minecraft.server.packs.resources.ResourceManager
+import org.polyfrost.compose.mc.McFontQueue
+import org.polyfrost.compose.mc.McGlyph
+import org.polyfrost.compose.mc.McGlyphs
+import org.polyfrost.compose.render.FontManager
+import org.polyfrost.compose.render.PolyBitmap
+import org.polyfrost.compose.host.ComposeHost
+import org.polyfrost.compose.host.HostCallbacks
+import org.polyfrost.compose.minecraft.platform.BackgroundTasks
+import org.polyfrost.compose.minecraft.platform.HostEvents
+import org.polyfrost.compose.minecraft.platform.HostJson
+import org.polyfrost.compose.minecraft.platform.RenderThread
+import org.slf4j.LoggerFactory
+//? if > 1.8.9 {
+import net.minecraft.resources.Identifier
+//?} else {
+/*import java.util.Locale
+import net.ornithemc.osl.core.api.util.NamespacedIdentifiers
+*///?}
+
+// below 1.21.11 the tessellator can't draw with the game's font, so its providers are read from the active resources instead
+internal object McResourceFont {
+    private val LOGGER = LoggerFactory.getLogger("PolyCompose/McResourceFont")
+
+    //~ if = 1.8.9 'minecraft:default' -> 'polycompose:legacy_default'
+    private const val ROOT_FONT = "minecraft:default"
+    private const val OPTION_UNIFORM = 1
+    private const val OPTION_JP = 2
+    private const val UNIHEX_BLOCK_MASK = 0x7F
+    private const val UNIHEX_HEIGHT = 16
+    private const val UNIHEX_SHEET_WIDTH = 256
+
+    private class Unihex(val rows: IntArray, val left: Int, val right: Int)
+
+    private class Layer(val glyphs: Map<Int, McGlyph>, val unihex: Map<Int, Unihex>, val ttf: Ttf?) {
+        private val baked = ConcurrentHashMap<Int, McGlyph>()
+
+        fun glyph(cp: Int): McGlyph? {
+            if (ttf != null) return ttf.glyph(cp)
+            glyphs[cp]?.let { return it }
+            if (cp !in unihex) return null
+            baked[cp]?.let { return it }
+            val block = bakeBlock(cp and UNIHEX_BLOCK_MASK.inv(), unihex)
+            for ((code, g) in block) baked.putIfAbsent(code, g)
+            return baked[cp]
+        }
+    }
+
+    private class Ttf(
+        private val face: StbFonts.Face,
+        private val size: Float,
+        private val oversample: Float,
+        private val shiftX: Float,
+        private val shiftY: Float,
+        private val skip: Set<Int>,
+    ) {
+        private val cache = ConcurrentHashMap<Int, McGlyph>()
+
+        fun glyph(cp: Int): McGlyph? {
+            if (cp in skip) return null
+            val cached = cache[cp]
+            if (cached != null) return cached.takeIf { it !== MISSING }
+            val baked = bake(cp)
+            cache.putIfAbsent(cp, baked ?: MISSING)
+            return baked
+        }
+
+        private fun bake(cp: Int): McGlyph? {
+            val id = face.glyph(cp)
+            if (id == 0) return null
+            val advance = face.advance(id) * size
+            val raster = face.raster(id, size * oversample, 0f)
+            if (raster == null || raster.w <= 0 || raster.h <= 0) return McGlyph(null, 0f, 0f, 0f, 0f, 0f, 0f, 0f, advance, 1f)
+            val pad = Math.round((raster.offX / oversample + shiftX) * oversample).coerceAtLeast(0)
+            val width = raster.w + pad
+            val pixels = ByteArray(width * raster.h * 4)
+            for (row in 0 until raster.h) for (col in 0 until raster.w) {
+                val o = (row * width + pad + col) * 4
+                pixels[o] = -1
+                pixels[o + 1] = -1
+                pixels[o + 2] = -1
+                pixels[o + 3] = raster.coverage[row * raster.w + col]
+            }
+            return McGlyph(
+                PolyBitmap(width, raster.h, pixels), 0f, 0f, 1f, 1f,
+                7f + raster.offY / oversample + shiftY, width / oversample, raster.h / oversample, advance, 1f,
+            )
+        }
+
+        fun free() = face.free()
+
+        private companion object {
+            val MISSING = McGlyph(null, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
+        }
+    }
+
+    private class Font(private val layers: List<Layer>) {
+        fun glyph(cp: Int): McGlyph? {
+            for (layer in layers) layer.glyph(cp)?.let { return it }
+            return null
+        }
+
+        fun close() {
+            for (layer in layers) layer.ttf?.free()
+        }
+    }
+
+    @Volatile private var font: Font? = null
+    @Volatile private var requested = -1
+    private val generation = AtomicInteger()
+
+    fun init() {
+        McGlyphs.source = { cp -> font?.glyph(cp) }
+        McFontQueue.measureWidth = McGlyphs::width
+        McFontQueue.measureLiteralWidth = { text, scale -> McGlyphs.width(text, scale, true) }
+        HostEvents.onResourcesReloaded(::reload)
+        // vanilla applies font option changes without a resource reload
+        HostEvents.onClientTick { if (requested != fontOptions()) reload() }
+    }
+
+    private fun reload() {
+        val options = fontOptions()
+        requested = options
+        val gen = generation.incrementAndGet()
+        //~ if = 1.8.9 'Minecraft.getInstance().resourceManager' -> 'ResourceManager.client()'
+        val rm = Minecraft.getInstance().resourceManager
+        BackgroundTasks.submit {
+            val loaded = runCatching { load(rm, options) }.onFailure { LOGGER.warn("Failed to load the game font", it) }.getOrNull()
+            RenderThread.schedule(Runnable {
+                if (gen != generation.get()) {
+                    loaded?.close()
+                    return@Runnable
+                }
+                val previous = font
+                font = loaded
+                previous?.close()
+                FontManager.invalidateMetrics()
+                HostCallbacks.each(ComposeHost.listeners, "HostListener.onFontsChanged") { it.onFontsChanged() }
+            })
+        }
+    }
+
+    private fun fontOptions(): Int {
+        val options = Minecraft.getInstance().options
+        //? if > 1.8.9 {
+        return (if (options.forceUnicodeFont().get()) OPTION_UNIFORM else 0) or (if (options.japaneseGlyphVariants().get()) OPTION_JP else 0)
+        //?} else {
+        /*return (if (options.forceUnicodeFont) OPTION_UNIFORM else 0) or (if (Locale.getDefault().language.equals("ja", ignoreCase = true)) OPTION_JP else 0)
+        *///?}
+    }
+
+    private fun load(rm: ResourceManager, options: Int): Font? {
+        val providers = ArrayList<JsonObject>()
+        collectProviders(rm, ROOT_FONT, providers, HashSet(), options)
+        val layers = ArrayList<Layer>()
+        var glyphs = HashMap<Int, McGlyph>()
+        var unihex = HashMap<Int, Unihex>()
+        fun flush() {
+            if (glyphs.isNotEmpty() || unihex.isNotEmpty()) layers += Layer(glyphs, unihex, null)
+            glyphs = HashMap()
+            unihex = HashMap()
+        }
+        // like vanilla, the first provider with a codepoint wins
+        fun unclaimed(cp: Int) = cp !in glyphs && cp !in unihex
+        for (provider in providers) {
+            val type = provider.get("type")?.asString
+            runCatching {
+                when (type) {
+                    "space" -> provider.getAsJsonObject("advances")?.entrySet()?.forEach { (key, advance) ->
+                        if (key.isEmpty()) return@forEach
+                        val cp = key.codePointAt(0)
+                        if (unclaimed(cp)) glyphs[cp] = McGlyph(null, 0f, 0f, 0f, 0f, 0f, 0f, 0f, advance.asFloat, 1f)
+                    }
+                    "bitmap" -> loadBitmap(rm, provider).forEach { (cp, g) -> if (unclaimed(cp)) glyphs[cp] = g }
+                    "unihex" -> loadUnihex(rm, provider).forEach { (cp, u) -> if (unclaimed(cp)) unihex[cp] = u }
+                    "ttf" -> loadTtf(rm, provider)?.let {
+                        flush()
+                        layers += Layer(emptyMap(), emptyMap(), it)
+                    }
+                }
+            }.onFailure { LOGGER.warn("Failed to load {} font provider, skipping", type, it) }
+        }
+        flush()
+        return if (layers.isEmpty()) null else Font(layers)
+    }
+
+    private fun loadTtf(rm: ResourceManager, provider: JsonObject): Ttf? {
+        val file = provider.get("file")?.asString ?: return null
+        val bytes = read(rm, file, "font/") ?: return null.also { LOGGER.warn("ttf font provider references missing file {}", file) }
+        val shift = provider.getAsJsonArray("shift")
+        val skip = HashSet<Int>()
+        val skipElement = provider.get("skip")
+        if (skipElement != null && skipElement.isJsonArray) skipElement.asJsonArray.forEach { e -> e.asString.codePoints().forEach { skip += it } }
+        else if (skipElement != null && skipElement.isJsonPrimitive) skipElement.asString.codePoints().forEach { skip += it }
+        val oversample = (provider.get("oversample")?.asFloat ?: 1f).takeIf { it > 0f } ?: 1f
+        return Ttf(
+            StbFonts.Face(bytes),
+            provider.get("size")?.asFloat ?: 11f,
+            oversample,
+            shift?.get(0)?.asFloat ?: 0f,
+            shift?.get(1)?.asFloat ?: 0f,
+            skip,
+        )
+    }
+
+    private fun collectProviders(rm: ResourceManager, ref: String, out: MutableList<JsonObject>, visited: MutableSet<String>, options: Int) {
+        if (!visited.add(ref)) return
+        val stack = runCatching { rm.getResourceStack(id(ref, "font/", ".json")) }.getOrDefault(emptyList())
+        // vanilla lets the highest-priority pack's providers go first
+        for (resource in stack.asReversed()) {
+            val root = runCatching { resource.open().use { HostJson.parseOrNull(String(it.readBytes(), Charsets.UTF_8)) } }.getOrNull()
+            val providers = (root as? JsonObject)?.getAsJsonArray("providers") ?: continue
+            for (element in providers) {
+                val provider = element as? JsonObject ?: continue
+                if (!filterPasses(provider, options)) continue
+                if (provider.get("type")?.asString == "reference") provider.get("id")?.asString?.let { collectProviders(rm, it, out, visited, options) }
+                else out += provider
+            }
+        }
+    }
+
+    private fun filterPasses(provider: JsonObject, options: Int): Boolean {
+        val filter = provider.getAsJsonObject("filter") ?: return true
+        filter.get("uniform")?.let { if (it.asBoolean != (options and OPTION_UNIFORM != 0)) return false }
+        filter.get("jp")?.let { if (it.asBoolean != (options and OPTION_JP != 0)) return false }
+        return true
+    }
+
+    private fun loadBitmap(rm: ResourceManager, provider: JsonObject): Map<Int, McGlyph> {
+        val file = provider.get("file")?.asString ?: return emptyMap()
+        val image = read(rm, file, "textures/")?.let(PolyBitmap::decode) ?: return emptyMap()
+        val rows = provider.getAsJsonArray("chars")?.map { it.asString.codePoints().toArray() } ?: return emptyMap()
+        val cols = rows.firstOrNull()?.size ?: 0
+        if (cols == 0 || rows.any { it.size != cols }) return emptyMap()
+        val cellW = image.width / cols
+        val cellH = image.height / rows.size
+        if (cellW == 0 || cellH == 0) return emptyMap()
+        val ascent = provider.get("ascent")?.asInt ?: 7
+        val scale = (provider.get("height")?.asInt ?: 8).toFloat() / cellH
+        val sheet = spaced(image, cols, rows.size, cellW, cellH)
+        val out = HashMap<Int, McGlyph>()
+        rows.forEachIndexed { r, cps ->
+            cps.forEachIndexed { c, cp ->
+                if (cp == 0 || cp in out) return@forEachIndexed
+                val x = c * cellW
+                val y = r * cellH
+                val w = (cellW downTo 1).firstOrNull { px -> (y until y + cellH).any { py -> image.pixels[(py * image.width + x + px - 1) * 4 + 3].toInt() != 0 } } ?: 0
+                val sx = c * (cellW + 2) + 1
+                val sy = r * (cellH + 2) + 1
+                out[cp] = McGlyph(
+                    sheet.takeIf { w > 0 }, sx / sheet.width.toFloat(), sy / sheet.height.toFloat(), (sx + w) / sheet.width.toFloat(), (sy + cellH) / sheet.height.toFloat(),
+                    (7 - ascent).toFloat(), w * scale, cellH * scale, Math.round(w * scale) + 1f, 1f,
+                )
+            }
+        }
+        return out
+    }
+
+    // repacks the sheet with a 1px border of edge pixels around each cell
+    private fun spaced(image: PolyBitmap, cols: Int, rows: Int, cellW: Int, cellH: Int): PolyBitmap {
+        val width = cols * (cellW + 2)
+        val pixels = ByteArray(width * rows * (cellH + 2) * 4)
+        for (r in 0 until rows) for (c in 0 until cols) for (py in -1..cellH) for (px in -1..cellW) {
+            val from = ((r * cellH + py.coerceIn(0, cellH - 1)) * image.width + c * cellW + px.coerceIn(0, cellW - 1)) * 4
+            image.pixels.copyInto(pixels, ((r * (cellH + 2) + 1 + py) * width + c * (cellW + 2) + 1 + px) * 4, from, from + 4)
+        }
+        return PolyBitmap(width, rows * (cellH + 2), pixels)
+    }
+
+    private fun loadUnihex(rm: ResourceManager, provider: JsonObject): Map<Int, Unihex> {
+        val file = provider.get("hex_file")?.asString ?: return emptyMap()
+        val bytes = read(rm, file, "") ?: return emptyMap<Int, Unihex>().also { LOGGER.warn("unihex font provider references missing file {}", file) }
+        val overrides = provider.getAsJsonArray("size_overrides")?.mapNotNull { element ->
+            runCatching {
+                val o = element.asJsonObject
+                intArrayOf(o.get("from").asString.codePointAt(0), o.get("to").asString.codePointAt(0), o.get("left").asInt, o.get("right").asInt)
+            }.getOrNull()
+        }.orEmpty()
+        val out = HashMap<Int, Unihex>()
+        var skipped = 0
+        ZipInputStream(ByteArrayInputStream(bytes)).use { zip ->
+            while (true) {
+                val entry = zip.nextEntry ?: break
+                if (!entry.name.endsWith(".hex")) continue
+                for (line in String(zip.readBytes(), Charsets.US_ASCII).lineSequence()) {
+                    if (line.isNotEmpty() && !parseHex(line, overrides, out)) skipped++
+                }
+            }
+        }
+        if (skipped > 0) LOGGER.warn("Skipped {} malformed unihex entries in {}", skipped, file)
+        return out
+    }
+
+    // "<codepoint>:<16 rows of 2, 4, 6 or 8 hex digits>", rows stored left-aligned
+    private fun parseHex(line: String, overrides: List<IntArray>, out: MutableMap<Int, Unihex>): Boolean {
+        val colon = line.indexOf(':')
+        val perRow = (line.length - colon - 1) / 16
+        if (colon !in 4..6 || perRow !in 2..8 step 2 || line.length - colon - 1 != perRow * 16) return false
+        val cp = line.substring(0, colon).toIntOrNull(16) ?: return false
+        val rows = IntArray(16)
+        var mask = 0
+        var p = colon + 1
+        for (r in 0 until 16) {
+            var v = 0
+            repeat(perRow) {
+                val d = Character.digit(line[p++], 16)
+                if (d < 0) return false
+                v = (v shl 4) or d
+            }
+            rows[r] = v shl (32 - perRow * 4)
+            mask = mask or rows[r]
+        }
+        // vanilla applies the first matching override
+        val o = overrides.firstOrNull { cp in it[0]..it[1] }
+        out[cp] = when {
+            o != null -> Unihex(rows, o[2], o[3])
+            mask == 0 -> Unihex(rows, 0, perRow * 4)
+            else -> Unihex(rows, Integer.numberOfLeadingZeros(mask), 31 - Integer.numberOfTrailingZeros(mask))
+        }
+        return true
+    }
+
+    private fun bakeBlock(base: Int, unihex: Map<Int, Unihex>): Map<Int, McGlyph> {
+        val out = HashMap<Int, McGlyph>()
+        val inked = ArrayList<Int>()
+        for (cp in base..base + UNIHEX_BLOCK_MASK) {
+            val u = unihex[cp] ?: continue
+            val w = u.right - u.left + 1
+            // unihex glyphs are 16px tall drawn at half size
+            if (w <= 0 || u.rows.all { it == 0 }) out[cp] = McGlyph(null, 0f, 0f, 1f, 1f, 0f, w / 2f, 8f, (w / 2 + 1).toFloat(), 0.5f)
+            else inked += cp
+        }
+        if (inked.isEmpty()) return out
+        val cellH = UNIHEX_HEIGHT + 2
+        val xs = IntArray(inked.size)
+        val ys = IntArray(inked.size)
+        var x = 0
+        var y = 0
+        var width = 0
+        for ((k, cp) in inked.withIndex()) {
+            val u = unihex.getValue(cp)
+            val cellW = u.right - u.left + 3
+            if (x > 0 && x + cellW > UNIHEX_SHEET_WIDTH) { x = 0; y += cellH }
+            xs[k] = x
+            ys[k] = y
+            x += cellW
+            width = maxOf(width, x)
+        }
+        val height = y + cellH
+        val px = ByteArray(width * height * 4)
+        for ((k, cp) in inked.withIndex()) {
+            val u = unihex.getValue(cp)
+            val w = u.right - u.left + 1
+            for (gy in -1..UNIHEX_HEIGHT) for (gx in -1..w) {
+                val bit = u.left + gx.coerceIn(0, w - 1)
+                val row = u.rows[gy.coerceIn(0, UNIHEX_HEIGHT - 1)]
+                if (bit in 0..31 && (row ushr (31 - bit)) and 1 != 0) {
+                    val o = ((ys[k] + 1 + gy) * width + xs[k] + 1 + gx) * 4
+                    px.fill(-1, o, o + 4)
+                }
+            }
+        }
+        val sheet = PolyBitmap(width, height, px)
+        for ((k, cp) in inked.withIndex()) {
+            val u = unihex.getValue(cp)
+            val w = u.right - u.left + 1
+            val sx = xs[k] + 1
+            val sy = ys[k] + 1
+            out[cp] = McGlyph(
+                sheet, sx / width.toFloat(), sy / height.toFloat(), (sx + w) / width.toFloat(), (sy + UNIHEX_HEIGHT) / height.toFloat(),
+                0f, w / 2f, 8f, (w / 2 + 1).toFloat(), 0.5f,
+            )
+        }
+        return out
+    }
+
+    private fun read(rm: ResourceManager, ref: String, folder: String): ByteArray? =
+        runCatching { rm.getResource(id(ref, folder)).getOrNull()?.open()?.use { it.readBytes() } }.getOrNull()
+
+    private fun id(ref: String, folder: String, suffix: String = "") =
+        //~ if = 1.8.9 'Identifier.fromNamespaceAndPath' -> 'NamespacedIdentifiers.from'
+        Identifier.fromNamespaceAndPath(ref.substringBefore(':', "minecraft"), folder + ref.substringAfter(':') + suffix)
+}

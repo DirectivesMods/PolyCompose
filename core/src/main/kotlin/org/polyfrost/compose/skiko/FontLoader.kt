@@ -1,0 +1,17 @@
+@file:OptIn(InternalComposeUiApi::class)
+
+package org.polyfrost.compose.skiko
+
+import androidx.compose.ui.InternalComposeUiApi
+import androidx.compose.ui.text.font.Font
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontResourceLoaderWithResolver
+import org.polyfrost.compose.backend.PolyText
+
+@Suppress("DEPRECATION")
+public class FontLoader : Font.ResourceLoader, FontResourceLoaderWithResolver {
+    override val fontFamilyResolver: FontFamily.Resolver = PolyText.createFontFamilyResolver()
+
+    @Deprecated("Replaced by FontFamily.Resolver")
+    override fun load(font: Font): Any = PolyText.typefaces.loadBlocking(font) ?: error("cannot load $font")
+}

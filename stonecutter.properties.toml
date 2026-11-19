@@ -1,0 +1,97 @@
+mod.name = "PolyCompose"
+mod.id = "polycompose"
+mod.version = "1.0.0"
+mod.group = "org.polyfrost"
+mod.description = "Library mod for building Minecraft screens and overlays with Compose."
+
+deps.fabric_loader = "0.19.5"
+deps.fabric_language_kotlin = "1.14.1+kotlin.2.4.20"
+deps.kotlin = "2.4.21"
+deps.kotlinx_coroutines = "1.11.0"
+deps.annotations = "26.1.0"
+deps.icu4j = "72.1"
+deps.log4j_api = "2.0-beta9"
+deps.log4j_core = "2.23.1"
+deps.compose = "1.13.0-alpha02"
+deps.androidx_compose_runtime = "1.13.0-alpha03"
+deps.compose_navigation = "2.10.0-rc01"
+deps.lifecycle = "2.11.0"
+deps.viewmodel = "2.11.0"
+deps.twelvemonkeys = "3.15.3"
+deps.junit = "6.1.3"
+deps.errorprone = "2.52.0"
+
+loomx.loom_version = "1.19-SNAPSHOT"
+
+publish.modrinth = ""
+publish.curseforge = ""
+
+["1.8.9"]
+mod.mc_compat = ">=1.8.9 <=1.8.9"
+mod.mc_releases = "1.8.9"
+feather_build = 2
+deps.osl = "0.21.1"
+deps.pylon = "0.2.6"
+
+["1.21.1"]
+mod.mc_compat = ">=1.21.1 <=1.21.1"
+mod.mc_releases = "1.21.1"
+deps.fabric_api = "0.116.17+1.21.1"
+deps.fabric_resource_loader = "v0"
+deps.controlify = "y9bu5RxH"
+
+["1.21.4"]
+mod.mc_compat = ">=1.21.4 <=1.21.4"
+mod.mc_releases = "1.21.4"
+deps.fabric_api = "0.119.4+1.21.4"
+deps.fabric_resource_loader = "v0"
+deps.controlify = "iwIrWSbZ"
+
+["1.21.5"]
+mod.mc_compat = ">=1.21.5 <=1.21.5"
+mod.mc_releases = "1.21.5"
+deps.fabric_api = "0.128.2+1.21.5"
+deps.fabric_resource_loader = "v0"
+deps.controlify = "kgAggyBv"
+
+["1.21.8"]
+mod.mc_compat = ">=1.21.8 <=1.21.8"
+mod.mc_releases = "1.21.8"
+deps.fabric_api = "0.136.1+1.21.8"
+deps.fabric_resource_loader = "v0"
+deps.controlify = "W6tNOO4I"
+
+["1.21.10"]
+mod.mc_compat = ">=1.21.10 <=1.21.10"
+mod.mc_releases = "1.21.10"
+deps.fabric_api = "0.138.4+1.21.10"
+deps.fabric_resource_loader = "v1"
+deps.controlify = "6Hff0hlS"
+
+["1.21.11"]
+mod.mc_compat = ">=1.21.11 <=1.21.11"
+mod.mc_releases = "1.21.11"
+deps.fabric_api = "0.141.6+1.21.11"
+deps.fabric_resource_loader = "v1"
+deps.controlify = "qZW7FPjm"
+
+["26.1"]
+mod.mc_compat = ">=26.1 <=26.1.2"
+mod.mc_releases = "26.1, 26.1.1, 26.1.2"
+deps.fabric_api = "0.155.2+26.1.2"
+deps.fabric_resource_loader = "v1"
+deps.controlify = "3.5.3+mc26.1"
+
+["26.2"]
+mod.mc_compat = "26.2.x"
+mod.mc_releases = "26.2"
+deps.fabric_api = "0.159.0+26.2"
+deps.fabric_resource_loader = "v1"
+deps.controlify = "3.5.3+mc26.2"
+
+["26.3"]
+mod.mc_compat = "26.3.x"
+mod.mc_releases = "26.3"
+deps.fabric_api = "0.160.3+26.3"
+deps.fabric_resource_loader = "v1"
+deps.controlify = "3.5.3+mc26.3"
