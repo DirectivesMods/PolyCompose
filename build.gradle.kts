@@ -256,7 +256,7 @@ val processComposeBundle = tasks.register<NestableJarGenerationTask>("processCom
             return if (build.isEmpty()) tagged else "$tagged$separator$build"
         }
         for (jar in nestedJars.get().asFile.listFiles { file -> file.name.endsWith(".jar") }.orEmpty()) {
-            FileSystems.newFileSystem(jar.toPath(), mapOf("compressionMethod" to "STORED")).use { zip ->
+            FileSystems.newFileSystem(jar.toPath()).use { zip ->
                 val modJson = zip.getPath("fabric.mod.json")
                 if (!Files.exists(modJson)) return@use
                 val json = Files.readString(modJson)
