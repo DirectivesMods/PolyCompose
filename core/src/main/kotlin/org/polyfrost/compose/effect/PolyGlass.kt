@@ -54,7 +54,6 @@ private const val RIM_TILT_Z = 0.8f
 private const val MIN_LIGHT = 0.008f
 private const val CELL = 32f
 private val GateSlack = 160.dp
-private val Follow = sqrt(200f)
 private const val FADE = 12f
 private const val FADED = 0.002f
 private const val SNAP = 0.02f
@@ -65,18 +64,12 @@ private const val RIM_ALPHA_CAP = 0.7f
 private const val LIGHT_GAIN = 0.4f
 
 public object PolyGlassLight {
-    private var targetX = 0f
-    private var targetY = 0f
     private var x = 0f
     private var y = 0f
-    private var vx = 0f
-    private var vy = 0f
     private var presenceTarget = 0f
     private var last = 0L
     private var cellX = NO_CELL
     private var cellY = NO_CELL
-    private var trailX = NO_CELL
-    private var trailY = NO_CELL
 
     public var known: Boolean = false
         private set
@@ -89,28 +82,18 @@ public object PolyGlassLight {
     internal var cell: Offset? by mutableStateOf(null)
         private set
 
-    internal var trail: Offset? by mutableStateOf(null)
-        private set
-
     public fun moveTo(p: Offset) {
-        if (!known || presenceTarget == 0f && presence < SNAP) {
-            known = true
-            x = p.x
-            y = p.y
-            vx = 0f
-            vy = 0f
-            last = System.nanoTime()
-            follow()
-        }
-        targetX = p.x
-        targetY = p.y
+        if (!known || presenceTarget == 0f && presence < SNAP) last = System.nanoTime()
+        known = true
+        x = p.x
+        y = p.y
         presenceTarget = 1f
         val cx = floor(p.x / CELL).toInt()
         val cy = floor(p.y / CELL).toInt()
         if (cx == cellX && cy == cellY) return
         cellX = cx
         cellY = cy
-        cell = center(cx, cy)
+        cell = Offset(cx * CELL + CELL / 2f, cy * CELL + CELL / 2f)
     }
 
     public fun leave() {
@@ -121,9 +104,7 @@ public object PolyGlassLight {
         known = false
         presence = 0f
         presenceTarget = 0f
-        vx = 0f
-        vy = 0f
-        clearCells()
+        clearCell()
     }
 
     internal fun sample() {
@@ -131,46 +112,16 @@ public object PolyGlassLight {
         val dt = ((now - last) / 1e9f).coerceIn(0f, 0.1f)
         last = now
         if (dt <= 0f) return
-        val decay = exp(-Follow * dt)
-        val ex = x - targetX
-        val ey = y - targetY
-        val kx = vx + Follow * ex
-        val ky = vy + Follow * ey
-        x = targetX + (ex + kx * dt) * decay
-        y = targetY + (ey + ky * dt) * decay
-        vx = (vx - Follow * kx * dt) * decay
-        vy = (vy - Follow * ky * dt) * decay
         presence += (presenceTarget - presence) * (1f - exp(-FADE * dt))
-        if (presenceTarget == 0f && presence < FADED) {
-            clearCells()
-            return
-        }
-        follow()
+        if (presenceTarget == 0f && presence < FADED) clearCell()
     }
 
-    private fun follow() {
-        val cx = floor(x / CELL).toInt()
-        val cy = floor(y / CELL).toInt()
-        if (cx == trailX && cy == trailY) return
-        trailX = cx
-        trailY = cy
-        trail = center(cx, cy)
+    private fun clearCell() {
+        if (cellX == NO_CELL) return
+        cellX = NO_CELL
+        cellY = NO_CELL
+        cell = null
     }
-
-    private fun clearCells() {
-        if (cellX != NO_CELL) {
-            cellX = NO_CELL
-            cellY = NO_CELL
-            cell = null
-        }
-        if (trailX != NO_CELL) {
-            trailX = NO_CELL
-            trailY = NO_CELL
-            trail = null
-        }
-    }
-
-    private fun center(cx: Int, cy: Int) = Offset(cx * CELL + CELL / 2f, cy * CELL + CELL / 2f)
 }
 
 @Composable
@@ -235,9 +186,8 @@ private fun DrawScope.drawGlassTint(tint: Color, radius: Float, alpha: Float) {
 
 private fun lightNear(bounds: Rect, range: Float): Boolean {
     if (bounds.isEmpty) return false
-    val c = PolyGlassLight.cell
-    val t = PolyGlassLight.trail
-    return c != null && distance(bounds, c) <= range || t != null && distance(bounds, t) <= range
+    val c = PolyGlassLight.cell ?: return false
+    return distance(bounds, c) <= range
 }
 
 private fun cursorNear(bounds: Rect, range: Float): Offset {
