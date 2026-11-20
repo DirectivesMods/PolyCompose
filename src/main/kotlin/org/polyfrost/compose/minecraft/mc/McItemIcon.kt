@@ -45,6 +45,11 @@ object McItemIcons {
     fun open(stack: ItemStack): McItemIconHandle = McItemAtlas.open(stack)
 
     @JvmStatic
+    fun requestAvailability() {
+        McItemAtlas.requestAvailability()
+    }
+
+    @JvmStatic
     @JvmOverloads
     fun drawDecorations(ctx: RenderContext, stack: ItemStack, x: Float, y: Float, size: Float = ITEM_SIZE, countOverride: String? = null) {
         McItemDecorations.draw(ctx, stack, x, y, size, countOverride)
