@@ -620,9 +620,10 @@ public final class org/polyfrost/compose/effect/LiquidVariant : java/lang/Enum {
 }
 
 public final class org/polyfrost/compose/effect/PolyGlassKt {
-	public static final fun polyGlass-uaWGzKE (Landroidx/compose/ui/Modifier;Landroidx/compose/ui/graphics/Shape;ZJJZJLkotlin/jvm/functions/Function0;FFFLandroidx/compose/runtime/Composer;III)Landroidx/compose/ui/Modifier;
-	public static final fun polyGlassSplit-BK6pRqs (Landroidx/compose/ui/Modifier;Landroidx/compose/ui/graphics/Shape;FFFJFF)Landroidx/compose/ui/Modifier;
-	public static synthetic fun polyGlassSplit-BK6pRqs$default (Landroidx/compose/ui/Modifier;Landroidx/compose/ui/graphics/Shape;FFFJFFILjava/lang/Object;)Landroidx/compose/ui/Modifier;
+	public static final fun polyGlass-du58o44 (Landroidx/compose/ui/Modifier;Landroidx/compose/ui/graphics/Shape;ZLkotlin/jvm/functions/Function0;Lkotlin/jvm/functions/Function0;ZLkotlin/jvm/functions/Function0;Lkotlin/jvm/functions/Function0;FFFLkotlin/jvm/functions/Function0;Landroidx/compose/runtime/Composer;III)Landroidx/compose/ui/Modifier;
+	public static final fun polyGlassGlow-NKG1LGE (Landroidx/compose/ui/Modifier;Landroidx/compose/ui/graphics/Shape;FFJZLandroidx/compose/runtime/Composer;II)Landroidx/compose/ui/Modifier;
+	public static final fun polyGlassSplit-PcYyNuk (Landroidx/compose/ui/Modifier;Landroidx/compose/ui/graphics/Shape;FFFLkotlin/jvm/functions/Function0;FFLkotlin/jvm/functions/Function0;)Landroidx/compose/ui/Modifier;
+	public static synthetic fun polyGlassSplit-PcYyNuk$default (Landroidx/compose/ui/Modifier;Landroidx/compose/ui/graphics/Shape;FFFLkotlin/jvm/functions/Function0;FFLkotlin/jvm/functions/Function0;ILjava/lang/Object;)Landroidx/compose/ui/Modifier;
 }
 
 public final class org/polyfrost/compose/effect/PolyGlassLight {

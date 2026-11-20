@@ -30,6 +30,7 @@ import androidx.compose.ui.unit.toSize
 import org.polyfrost.compose.backend.PolyDrawCanvas
 import org.polyfrost.compose.backend.drawBackdropGlass
 import org.polyfrost.compose.backend.drawPoly
+import org.polyfrost.compose.render.PolyBitmap
 import org.polyfrost.compose.render.PolyRenderer
 import org.polyfrost.compose.render.alphaByte
 import kotlin.math.PI
@@ -54,6 +55,8 @@ private const val RIM_TILT_Z = 0.8f
 private const val MIN_LIGHT = 0.008f
 private const val CELL = 32f
 private val GateSlack = 160.dp
+private val DefaultGlowRadius = 90.dp
+private const val GLOW_SIZE = 128
 private const val FADE = 12f
 private const val FADED = 0.002f
 private const val SNAP = 0.02f
@@ -128,18 +131,20 @@ public object PolyGlassLight {
 public fun Modifier.polyGlass(
     shape: Shape,
     frosted: Boolean = false,
-    tint: Color = Color.Transparent,
-    rimColor: Color = Color.White,
+    tint: () -> Color = { Color.Transparent },
+    rimColor: () -> Color = { Color.White },
     light: Boolean = true,
-    lightColor: Color = Color.White,
+    lightColor: () -> Color = { Color.White },
     alpha: () -> Float = { 1f },
     band: Dp = DefaultBand,
     refraction: Float = DEFAULT_REFRACTION,
     reach: Dp = DefaultReach,
+    opaque: () -> Boolean = { LiquidGlassSettings.reduceTransparency },
 ): Modifier {
     val density = LocalDensity.current
     val reachPx = with(density) { reach.toPx() }
-    if (!light) return glassSurface(shape, frosted, tint, rimColor, lightColor, alpha, band, refraction, reachPx, { false }) { Offset.Unspecified }
+    val colors = GlassColors(tint, rimColor, lightColor, opaque)
+    if (!light) return glassSurface(shape, frosted, colors, alpha, band, refraction, reachPx, { false }) { Offset.Unspecified }
     var bounds by remember { mutableStateOf(Rect.Zero) }
     val range = reachPx * 2f
     val slack = with(density) { GateSlack.toPx() }
@@ -147,7 +152,7 @@ public fun Modifier.polyGlass(
     return this
         .onGloballyPositioned { bounds = Rect(it.positionInWindow(), it.size.toSize()) }
         .graphicsLayer {}
-        .glassSurface(shape, frosted, tint, rimColor, lightColor, alpha, band, refraction, reachPx, { near.value }) { cursorNear(bounds, range) }
+        .glassSurface(shape, frosted, colors, alpha, band, refraction, reachPx, { near.value }) { cursorNear(bounds, range) }
 }
 
 public fun Modifier.polyGlassSplit(
@@ -155,29 +160,88 @@ public fun Modifier.polyGlassSplit(
     splitX: Dp,
     leftAlpha: Float,
     rightAlpha: Float,
-    tint: Color = Color.Transparent,
+    tint: () -> Color = { Color.Transparent },
     band: Dp = DefaultBand,
     refraction: Float = DEFAULT_REFRACTION,
+    opaque: () -> Boolean = { LiquidGlassSettings.reduceTransparency },
 ): Modifier = drawWithCache {
     val radius = (shape.createOutline(size, layoutDirection, this) as? Outline.Rounded)?.roundRect?.topLeftCornerRadius?.x ?: 0f
     val bandPx = band.toPx()
     val split = splitX.roundToPx().coerceIn(0, size.width.roundToInt()).toFloat()
     onDrawWithContent {
-        if (LiquidGlassSettings.reduceTransparency) {
+        if (opaque()) {
             drawContent()
             return@onDrawWithContent
         }
+        val fill = tint()
         clipRect(right = split) {
             drawBackdropGlass(size, radius, bandPx, refraction, leftAlpha)
-            drawGlassTint(tint, radius, leftAlpha)
+            drawGlassTint(fill, radius, leftAlpha)
         }
         clipRect(left = split) {
             drawBackdropGlass(size, radius, bandPx, refraction, rightAlpha)
-            drawGlassTint(tint, radius, rightAlpha)
+            drawGlassTint(fill, radius, rightAlpha)
         }
         drawContent()
     }
 }
+
+@Composable
+public fun Modifier.polyGlassGlow(
+    shape: Shape,
+    strength: Float,
+    radius: Dp = DefaultGlowRadius,
+    color: Color = Color.White,
+    isolate: Boolean = true,
+): Modifier {
+    var bounds by remember { mutableStateOf(Rect.Zero) }
+    val density = LocalDensity.current
+    val reach = with(density) { radius.toPx() }
+    val slack = with(density) { GateSlack.toPx() }
+    val rgb = color.toArgb() and RGB_MASK
+    val near = remember(reach, slack) { derivedStateOf { lightNear(bounds, reach + slack) } }
+    return this
+        .then(if (isolate) Modifier.graphicsLayer {} else Modifier)
+        .onGloballyPositioned { bounds = Rect(it.positionInWindow(), it.size.toSize()) }
+        .drawWithCache {
+            val outline = shape.createOutline(size, layoutDirection, this)
+            val corner = (outline as? Outline.Rounded)?.roundRect?.topLeftCornerRadius?.x ?: 0f
+            val w = size.width
+            val h = size.height
+            onDrawWithContent {
+                drawContent()
+                if (near.value) drawLight(0f, 0f, w, h, { lightKey(cursorNear(bounds, reach), strength, rgb) }) { r ->
+                    val c = cursorNear(bounds, reach)
+                    if (c.isUnspecified) return@drawLight
+                    val a = strength * PolyGlassLight.presence
+                    if (a <= 0f) return@drawLight
+                    r.save()
+                    r.clipRRect(0f, 0f, w, h, corner)
+                    r.image(GlowBitmap, c.x - reach, c.y - reach, reach * 2f, reach * 2f, 0f, 0f, 1f, 1f, tinted(a, rgb))
+                    r.restore()
+                }
+            }
+        }
+}
+
+private val GlowBitmap: PolyBitmap by lazy {
+    val n = GLOW_SIZE
+    val pixels = ByteArray(n * n * 4)
+    for (y in 0 until n) {
+        for (x in 0 until n) {
+            val dx = (x + 0.5f) / n * 2f - 1f
+            val dy = (y + 0.5f) / n * 2f - 1f
+            val o = (y * n + x) * 4
+            pixels[o] = -1
+            pixels[o + 1] = -1
+            pixels[o + 2] = -1
+            pixels[o + 3] = alphaByte((1f - sqrt(dx * dx + dy * dy)).coerceAtLeast(0f)).toByte()
+        }
+    }
+    PolyBitmap(n, n, pixels)
+}
+
+private class GlassColors(val tint: () -> Color, val rim: () -> Color, val light: () -> Color, val opaque: () -> Boolean)
 
 private fun DrawScope.drawGlassTint(tint: Color, radius: Float, alpha: Float) {
     if (tint.alpha <= 0f || alpha <= 0f) return
@@ -285,9 +349,7 @@ private fun perimeter(w: Float, h: Float, radius: Float, inset: Float, lineStep:
 private fun Modifier.glassSurface(
     shape: Shape,
     frosted: Boolean,
-    tint: Color,
-    rimColor: Color,
-    lightColor: Color,
+    colors: GlassColors,
     alpha: () -> Float,
     band: Dp,
     refraction: Float,
@@ -302,17 +364,19 @@ private fun Modifier.glassSurface(
     val rim = if (outline is Outline.Generic) null else cachedPerimeter(size.width, size.height, radius, width, 8.dp.toPx(), 3.dp.toPx())
     val lit = rim?.let { IntArray(it.size) }
     val fringe = width / 2f + 2f
-    val rimRgb = rimColor.toArgb() and RGB_MASK
-    val lightRgb = lightColor.toArgb() and RGB_MASK
     onDrawWithContent {
         val a = alpha()
-        if (frosted && !LiquidGlassSettings.reduceTransparency) {
+        if (frosted && !colors.opaque()) {
             drawBackdropGlass(size, radius, bandPx, refraction, a)
+            val tint = colors.tint()
             if (tint.alpha > 0f && a > 0f) drawOutline(outline, tint.copy(alpha = tint.alpha * a.coerceAtMost(1f)))
         }
         drawContent()
         if (rim == null || lit == null || a <= 0f) return@onDrawWithContent
-        drawRestingRim(rim, width, a * rimColor.alpha, rimRgb)
+        val rimColor = colors.rim()
+        drawRestingRim(rim, width, a * rimColor.alpha, rimColor.toArgb() and RGB_MASK)
+        val lightColor = colors.light()
+        val lightRgb = lightColor.toArgb() and RGB_MASK
         val lightAlpha = a * lightColor.alpha
         if (near()) drawLight(-fringe, -fringe, size.width + fringe * 2f, size.height + fringe * 2f, { lightKey(cursor(), lightAlpha, lightRgb) }) {
             val c = cursor()
