@@ -112,6 +112,10 @@ configurations.configureEach {
     exclude(group = "org.jetbrains.skiko")
     exclude(group = "org.jetbrains.compose.ui", module = "ui-skiko")
     exclude(group = "org.jetbrains.compose.ui", module = "ui-skiko-desktop")
+    if (name != "composeBundle") {
+        exclude(group = "org.jetbrains.compose.ui", module = "ui")
+        exclude(group = "org.jetbrains.compose.ui", module = "ui-desktop")
+    }
 }
 
 val javaVersion = if (isOrnithe || stonecutter.eval(mcVersion, ">= 26.1")) 25 else 21
@@ -169,7 +173,7 @@ dependencies {
     api("org.jetbrains.compose.runtime:runtime-desktop:$compose")
     api("org.jetbrains.compose.foundation:foundation-desktop:$compose")
     api("org.jetbrains.compose.material:material-desktop:$compose")
-    api("org.jetbrains.compose.ui:ui-desktop:$compose")
+    api(project(":compose-ui"))
     api("org.jetbrains.compose.ui:ui-util-desktop:$compose")
     api("org.jetbrains.compose.ui:ui-backhandler-desktop:$compose")
     api("org.jetbrains.androidx.navigation:navigation-compose:${dep("compose_navigation")}")

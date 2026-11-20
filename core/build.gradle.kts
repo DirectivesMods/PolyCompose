@@ -31,6 +31,8 @@ configurations.configureEach {
     exclude(group = "org.jetbrains.skiko")
     exclude(group = "org.jetbrains.compose.ui", module = "ui-skiko")
     exclude(group = "org.jetbrains.compose.ui", module = "ui-skiko-desktop")
+    exclude(group = "org.jetbrains.compose.ui", module = "ui")
+    exclude(group = "org.jetbrains.compose.ui", module = "ui-desktop")
 }
 
 dependencies {
@@ -42,7 +44,7 @@ dependencies {
     compileOnly("com.ibm.icu:icu4j:${dep("icu4j")}")
     api("org.jetbrains.compose.foundation:foundation-desktop:$compose")
     api("org.jetbrains.compose.material:material-desktop:$compose")
-    api("org.jetbrains.compose.ui:ui-desktop:$compose")
+    api(project(":compose-ui"))
     api("org.jetbrains.compose.ui:ui-util-desktop:$compose")
     for (module in listOf("imageio:imageio-webp", "imageio:imageio-bmp", "imageio:imageio-core", "imageio:imageio-metadata", "common:common-lang", "common:common-io", "common:common-image")) {
         implementation("com.twelvemonkeys.$module:$twelvemonkeys")

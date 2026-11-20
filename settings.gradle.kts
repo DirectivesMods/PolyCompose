@@ -54,5 +54,6 @@ stonecutter.create(rootProject) {
 }
 
 include(":core")
+include(":compose-ui")
 
 rootProject.name = "PolyCompose"
