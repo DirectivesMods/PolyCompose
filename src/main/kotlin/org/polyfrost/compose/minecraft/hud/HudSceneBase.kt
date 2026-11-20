@@ -3,6 +3,7 @@
 package org.polyfrost.compose.minecraft.hud
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.InternalComposeUiApi
 import androidx.compose.ui.geometry.Offset
@@ -13,7 +14,9 @@ import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.Logger
 import org.polyfrost.compose.backend.PolyCanvas
 import org.polyfrost.compose.host.ComposeHost
+import org.polyfrost.compose.host.ComposeOptions
 import org.polyfrost.compose.host.HostCallbacks
+import org.polyfrost.compose.host.LocalComposeOptions
 import org.polyfrost.compose.host.SceneKind
 import org.polyfrost.compose.minecraft.platform.McWindow
 import org.polyfrost.compose.minecraft.screen.ComposeSceneContextImpl
@@ -24,8 +27,8 @@ import org.polyfrost.compose.profile.ProfileHost
 import org.polyfrost.compose.profile.ProfilePhase
 import org.polyfrost.compose.profile.measure
 
-internal abstract class HudSceneBase(private val key: String) : HudInputTarget {
-    protected val pointer = HudPointerRouter()
+internal abstract class HudSceneBase(private val key: String, protected val options: ComposeOptions) : HudInputTarget {
+    protected val pointer = HudPointerRouter(options)
     private val text = HudTextContext()
     protected val frames = SceneFrames { dirty = true }
     protected val paintScene: (PolyCanvas) -> Unit = { canvas -> paintInto(canvas) }
@@ -113,13 +116,13 @@ internal abstract class HudSceneBase(private val key: String) : HudInputTarget {
 
     protected fun openScene(content: @Composable () -> Unit): SceneHandle? =
         try {
-            HostCallbacks.each(ComposeHost.listeners, "HostListener.onSceneCreated") { it.onSceneCreated(SceneKind.HudLayer) }
-            val created = SceneHandle.create(text, frames.onInvalidation) { dirty = true }
+            HostCallbacks.call(options, "ComposeOptions.onSceneCreated", Unit) { options.onSceneCreated(this, SceneKind.HudLayer) }
+            val created = SceneHandle.create(text, options, frames.onInvalidation) { dirty = true }
             handle = created
             builtAt = System.nanoTime()
             dirty = true
             HudInput.register(this)
-            created.scene.setContent { content() }
+            created.scene.setContent { CompositionLocalProvider(LocalComposeOptions provides options) { content() } }
             created
         } catch (t: Throwable) {
             fail(t)

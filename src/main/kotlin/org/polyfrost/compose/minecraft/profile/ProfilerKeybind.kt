@@ -1,7 +1,6 @@
 package org.polyfrost.compose.minecraft.profile
 
 import net.minecraft.client.KeyMapping
-import org.polyfrost.compose.host.ComposeHost
 import org.polyfrost.compose.minecraft.platform.McScreens
 import org.polyfrost.compose.minecraft.screen.isKeyDown
 
@@ -27,7 +26,7 @@ internal object ProfilerKeybind {
     private var mapping: KeyMapping? = null
     private var rawHeld = false
 
-    private val useMapping: Boolean get() = ComposeHost.settings.registerProfilerKey
+    private val useMapping: Boolean = System.getProperty("polycompose.profiler.key")?.toBoolean() ?: true
 
     //? if > 1.8.9 {
     @JvmStatic

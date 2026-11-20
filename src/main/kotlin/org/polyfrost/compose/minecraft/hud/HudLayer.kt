@@ -2,6 +2,7 @@ package org.polyfrost.compose.minecraft.hud
 
 import androidx.compose.runtime.Composable
 import java.util.concurrent.atomic.AtomicInteger
+import org.polyfrost.compose.host.ComposeOptions
 import org.polyfrost.compose.minecraft.platform.McWindow
 import org.polyfrost.compose.minecraft.platform.RenderThread
 import org.polyfrost.compose.minecraft.screen.positiveOrOne
@@ -10,7 +11,12 @@ import org.polyfrost.compose.minecraft.screen.positiveOrOne
 import net.minecraft.client.gui.GuiGraphicsExtractor
 //?}
 
-open class HudLayer(val id: String, private val content: @Composable () -> Unit) : AutoCloseable {
+open class HudLayer(
+    val id: String,
+    val options: ComposeOptions = ComposeOptions.Default,
+    private val content: @Composable () -> Unit,
+) : AutoCloseable {
+
     var visible: Boolean = true
         set(value) {
             field = value
@@ -45,6 +51,8 @@ open class HudLayer(val id: String, private val content: @Composable () -> Unit)
             return if (scale > 0f && scale.isFinite()) scale else 1f
         }
 
+    internal val sharedScene: SharedHudScene get() = SharedHudScene.of(options)
+
     internal val slot = HudSlot(this, order)
     private var isolatedScene: IsolatedHudScene? = null
 
@@ -60,7 +68,7 @@ open class HudLayer(val id: String, private val content: @Composable () -> Unit)
 
     @Composable
     protected open fun decorate(content: @Composable () -> Unit) {
-        content()
+        options.Decorate(this, content)
     }
 
     @Composable
@@ -72,14 +80,14 @@ open class HudLayer(val id: String, private val content: @Composable () -> Unit)
     fun draw(graphics: GuiGraphicsExtractor): Boolean {
         if (!drawable()) return false
         drawSeq = HudInput.nextDrawSeq()
-        return if (joinShared()) SharedHudScene.draw(slot, graphics) else isolatedScene().draw(graphics)
+        return if (joinShared()) sharedScene.draw(slot, graphics) else isolatedScene().draw(graphics)
     }
     //?} else {
     /*
     fun draw(): Boolean {
         if (!drawable()) return false
         drawSeq = HudInput.nextDrawSeq()
-        return if (joinShared()) SharedHudScene.draw(slot) else isolatedScene().draw()
+        return if (joinShared()) sharedScene.draw(slot) else isolatedScene().draw()
     }
     *///?}
 
@@ -87,7 +95,7 @@ open class HudLayer(val id: String, private val content: @Composable () -> Unit)
         closed = true
         RenderThread.execute {
             closeIsolated()
-            SharedHudScene.detach(slot)
+            sharedScene.detach(slot)
         }
     }
 
@@ -105,8 +113,8 @@ open class HudLayer(val id: String, private val content: @Composable () -> Unit)
     }
 
     private fun joinShared(): Boolean {
-        val join = shared && !isolated && probationOver() && SharedHudScene.admit(slot)
-        if (join) closeIsolated() else SharedHudScene.detach(slot)
+        val join = shared && !isolated && probationOver() && sharedScene.admit(slot)
+        if (join) closeIsolated() else sharedScene.detach(slot)
         return join
     }
 
@@ -127,13 +135,13 @@ open class HudLayer(val id: String, private val content: @Composable () -> Unit)
     }
 
     internal val inputTarget: HudInputTarget?
-        get() = if (slot.attached) SharedHudScene else isolatedScene
+        get() = if (slot.attached) sharedScene else isolatedScene
 
     private fun stopInput() {
         val isolated = isolatedScene
         isolated?.stopInput()
         if (isolated?.textFocused == true) isolated.releaseFocus()
-        if (slot.attached && slot.hasFocus && SharedHudScene.textFocused) SharedHudScene.releaseFocus()
+        if (slot.attached && slot.hasFocus && sharedScene.textFocused) sharedScene.releaseFocus()
     }
 
     internal val takingInput: Boolean

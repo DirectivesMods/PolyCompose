@@ -18,7 +18,7 @@ import org.polyfrost.compose.state.TickActivity
 import net.minecraft.client.gui.GuiGraphicsExtractor
 //?}
 
-internal class IsolatedHudScene(private val layer: HudLayer) : HudSceneBase("hud/${layer.id}"), AutoCloseable {
+internal class IsolatedHudScene(private val layer: HudLayer) : HudSceneBase("hud/${layer.id}", layer.options), AutoCloseable {
     private val surface = InlineCanvasSurface("hud/${layer.id}")
     private val tickActivity = TickActivity { layer.visible && System.nanoTime() - lastDrawn < HudPointer.INPUT_STALE_NANOS }
     private var retryAt = 0L

@@ -12,10 +12,10 @@ import androidx.compose.ui.scene.SingleComposeSceneRenderingScope
 import com.mojang.blaze3d.platform.InputConstants
 import org.apache.logging.log4j.LogManager
 import org.polyfrost.compose.backend.PolyCanvas
+import org.polyfrost.compose.host.ComposeOptions
 import org.polyfrost.compose.host.GameInputLayer
 import org.polyfrost.compose.host.HostErrors
 import org.polyfrost.compose.host.OverlayRenderer
-import org.polyfrost.compose.host.ScreenInputInterceptor
 import org.polyfrost.compose.minecraft.platform.McScreens
 import org.polyfrost.compose.minecraft.platform.McWindow
 import org.polyfrost.compose.minecraft.screen.ComposeSceneContextImpl
@@ -32,7 +32,7 @@ import net.minecraft.client.Minecraft
 /*import org.lwjgl.input.Mouse
 *///?}
 
-internal class ProfilerComposeOverlay(private val sampler: LiveSampler) : OverlayRenderer, GameInputLayer, ScreenInputInterceptor {
+internal class ProfilerComposeOverlay(private val sampler: LiveSampler) : OverlayRenderer, GameInputLayer {
     override val order: Int = GameInputLayer.ABOVE_HUD_LAYERS
 
     @JvmField
@@ -129,7 +129,7 @@ internal class ProfilerComposeOverlay(private val sampler: LiveSampler) : Overla
         if (failed || System.nanoTime() - retryAt < 0L || !ComposeSupport.isAvailable) return null
         return try {
             val newScope = SingleComposeSceneRenderingScope { dirty = true }
-            val created = SceneHandle.create(ComposeSceneContextImpl.platformContext, newScope::onSceneInvalidation) { dirty = true }
+            val created = SceneHandle.create(ComposeSceneContextImpl.platformContext, ComposeOptions.Default, newScope::onSceneInvalidation) { dirty = true }
             handle = created
             scope = newScope
             dirty = true
@@ -193,8 +193,6 @@ internal class ProfilerComposeOverlay(private val sampler: LiveSampler) : Overla
     }
 
     override fun consumeButton(button: Int, pressed: Boolean): Boolean = route(button, pressed)
-
-    override fun consumeMouse(button: Int, pressed: Boolean): Boolean = route(button, pressed)
 
     private fun route(button: Int, pressed: Boolean): Boolean {
         if (!shown) return false

@@ -678,15 +678,41 @@ public final class org/polyfrost/compose/host/ComposeHost {
 	public static final field $stable I
 	public static final field INSTANCE Lorg/polyfrost/compose/host/ComposeHost;
 	public static final fun addGameInput (Lorg/polyfrost/compose/host/GameInputLayer;)Ljava/lang/AutoCloseable;
-	public static final fun addListener (Lorg/polyfrost/compose/host/HostListener;)Ljava/lang/AutoCloseable;
+	public static final fun addLegacyInput (Lorg/polyfrost/compose/host/LegacyInputObserver;)Ljava/lang/AutoCloseable;
 	public static final fun addOverlay (Lorg/polyfrost/compose/host/OverlayRenderer;)Ljava/lang/AutoCloseable;
-	public static final fun addScreenInput (Lorg/polyfrost/compose/host/ScreenInputInterceptor;)Ljava/lang/AutoCloseable;
+	public static final fun getFontListeners ()Ljava/util/List;
 	public static final fun getGameInput ()Ljava/util/List;
-	public static final fun getListeners ()Ljava/util/List;
+	public static final fun getLegacyInput ()Ljava/util/List;
 	public static final fun getOverlays ()Ljava/util/List;
-	public static final fun getScreenInput ()Ljava/util/List;
-	public static final fun getSettings ()Lorg/polyfrost/compose/host/HostSettings;
-	public static final fun setSettings (Lorg/polyfrost/compose/host/HostSettings;)V
+	public static final fun onFontsChanged (Ljava/lang/Runnable;)Ljava/lang/AutoCloseable;
+	public static final fun requestFramerate (I)Ljava/lang/AutoCloseable;
+	public static final fun requestedFramerate ()Ljava/lang/Integer;
+}
+
+public class org/polyfrost/compose/host/ComposeOptions {
+	public static final field $stable I
+	public static final field Companion Lorg/polyfrost/compose/host/ComposeOptions$Companion;
+	public static final field Default Lorg/polyfrost/compose/host/ComposeOptions;
+	public fun <init> ()V
+	public fun Decorate (Ljava/lang/Object;Lkotlin/jvm/functions/Function2;Landroidx/compose/runtime/Composer;I)V
+	public fun consumeEscape (Ljava/lang/Object;)Z
+	public fun consumeMouse (Ljava/lang/Object;IZ)Z
+	public fun getAnimationScale ()F
+	public fun getMessages ()Lorg/polyfrost/compose/host/HostMessages;
+	public fun getReducedMotion ()Z
+	public fun isCapturingInput ()Z
+	public fun onFrame (Ljava/lang/Object;)Z
+	public fun onInputKind (Ljava/lang/Object;Z)V
+	public fun onPointer-MZcJ67o (Ljava/lang/Object;Landroidx/compose/ui/geometry/Offset;)V
+	public fun onRemoved (Ljava/lang/Object;)V
+	public fun onSceneCreated (Ljava/lang/Object;Lorg/polyfrost/compose/host/SceneKind;)V
+}
+
+public final class org/polyfrost/compose/host/ComposeOptions$Companion {
+}
+
+public final class org/polyfrost/compose/host/ComposeOptionsKt {
+	public static final fun getLocalComposeOptions ()Landroidx/compose/runtime/ProvidableCompositionLocal;
 }
 
 public abstract interface class org/polyfrost/compose/host/GameInputLayer {
@@ -723,24 +749,6 @@ public final class org/polyfrost/compose/host/HostErrors {
 	public static synthetic fun warn$default (Ljava/lang/String;Ljava/lang/Throwable;Lorg/apache/logging/log4j/Logger;ILjava/lang/Object;)V
 }
 
-public abstract interface class org/polyfrost/compose/host/HostListener {
-	public fun onFontsChanged ()V
-	public fun onFrame (Ljava/lang/Object;)Z
-	public fun onInputKind (Z)V
-	public fun onPointer-MZcJ67o (Ljava/lang/Object;Landroidx/compose/ui/geometry/Offset;)V
-	public fun onSceneCreated (Lorg/polyfrost/compose/host/SceneKind;)V
-	public fun onScreenRemoved (Ljava/lang/Object;)V
-}
-
-public final class org/polyfrost/compose/host/HostListener$DefaultImpls {
-	public static fun onFontsChanged (Lorg/polyfrost/compose/host/HostListener;)V
-	public static fun onFrame (Lorg/polyfrost/compose/host/HostListener;Ljava/lang/Object;)Z
-	public static fun onInputKind (Lorg/polyfrost/compose/host/HostListener;Z)V
-	public static fun onPointer-MZcJ67o (Lorg/polyfrost/compose/host/HostListener;Ljava/lang/Object;Landroidx/compose/ui/geometry/Offset;)V
-	public static fun onSceneCreated (Lorg/polyfrost/compose/host/HostListener;Lorg/polyfrost/compose/host/SceneKind;)V
-	public static fun onScreenRemoved (Lorg/polyfrost/compose/host/HostListener;Ljava/lang/Object;)V
-}
-
 public abstract interface class org/polyfrost/compose/host/HostMessages {
 	public fun disabledByFlag (Ljava/lang/String;)Ljava/lang/String;
 	public fun getAwtMissing ()Ljava/lang/String;
@@ -773,32 +781,6 @@ public final class org/polyfrost/compose/host/HostMessages$DefaultImpls {
 	public static fun unavailable (Lorg/polyfrost/compose/host/HostMessages;Ljava/lang/String;)Ljava/lang/String;
 }
 
-public abstract interface class org/polyfrost/compose/host/HostSettings {
-	public fun framerateLimit ()Ljava/lang/Integer;
-	public fun getAnimationScale ()F
-	public fun getMessages ()Lorg/polyfrost/compose/host/HostMessages;
-	public fun getReducedMotion ()Z
-	public fun getRegisterProfilerKey ()Z
-}
-
-public final class org/polyfrost/compose/host/HostSettings$Default : org/polyfrost/compose/host/HostSettings {
-	public static final field $stable I
-	public static final field INSTANCE Lorg/polyfrost/compose/host/HostSettings$Default;
-	public fun framerateLimit ()Ljava/lang/Integer;
-	public fun getAnimationScale ()F
-	public fun getMessages ()Lorg/polyfrost/compose/host/HostMessages;
-	public fun getReducedMotion ()Z
-	public fun getRegisterProfilerKey ()Z
-}
-
-public final class org/polyfrost/compose/host/HostSettings$DefaultImpls {
-	public static fun framerateLimit (Lorg/polyfrost/compose/host/HostSettings;)Ljava/lang/Integer;
-	public static fun getAnimationScale (Lorg/polyfrost/compose/host/HostSettings;)F
-	public static fun getMessages (Lorg/polyfrost/compose/host/HostSettings;)Lorg/polyfrost/compose/host/HostMessages;
-	public static fun getReducedMotion (Lorg/polyfrost/compose/host/HostSettings;)Z
-	public static fun getRegisterProfilerKey (Lorg/polyfrost/compose/host/HostSettings;)Z
-}
-
 public final class org/polyfrost/compose/host/KeyState : java/lang/Enum {
 	public static final field Pressed Lorg/polyfrost/compose/host/KeyState;
 	public static final field Released Lorg/polyfrost/compose/host/KeyState;
@@ -806,6 +788,16 @@ public final class org/polyfrost/compose/host/KeyState : java/lang/Enum {
 	public static fun getEntries ()Lkotlin/enums/EnumEntries;
 	public static fun valueOf (Ljava/lang/String;)Lorg/polyfrost/compose/host/KeyState;
 	public static fun values ()[Lorg/polyfrost/compose/host/KeyState;
+}
+
+public abstract interface class org/polyfrost/compose/host/LegacyInputObserver {
+	public fun onDrainedKeyboard ()V
+	public fun onDrainedMouse ()Z
+}
+
+public final class org/polyfrost/compose/host/LegacyInputObserver$DefaultImpls {
+	public static fun onDrainedKeyboard (Lorg/polyfrost/compose/host/LegacyInputObserver;)V
+	public static fun onDrainedMouse (Lorg/polyfrost/compose/host/LegacyInputObserver;)Z
 }
 
 public abstract interface class org/polyfrost/compose/host/OverlayRenderer {
@@ -838,25 +830,11 @@ public final class org/polyfrost/compose/host/SceneKind : java/lang/Enum {
 	public static fun values ()[Lorg/polyfrost/compose/host/SceneKind;
 }
 
-public abstract interface class org/polyfrost/compose/host/ScreenInputInterceptor {
-	public fun consumeEscape ()Z
-	public fun consumeMouse (IZ)Z
-	public fun isCapturing ()Z
-	public fun onDeferredKeyboard ()V
-	public fun onDeferredMouse ()Z
-}
-
-public final class org/polyfrost/compose/host/ScreenInputInterceptor$DefaultImpls {
-	public static fun consumeEscape (Lorg/polyfrost/compose/host/ScreenInputInterceptor;)Z
-	public static fun consumeMouse (Lorg/polyfrost/compose/host/ScreenInputInterceptor;IZ)Z
-	public static fun isCapturing (Lorg/polyfrost/compose/host/ScreenInputInterceptor;)Z
-	public static fun onDeferredKeyboard (Lorg/polyfrost/compose/host/ScreenInputInterceptor;)V
-	public static fun onDeferredMouse (Lorg/polyfrost/compose/host/ScreenInputInterceptor;)Z
-}
-
 public final class org/polyfrost/compose/host/WheelRouter {
 	public static final field $stable I
 	public fun <init> ()V
+	public fun <init> (Lkotlin/jvm/functions/Function0;)V
+	public synthetic fun <init> (Lkotlin/jvm/functions/Function0;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
 	public final fun defersWheelScroll ()Z
 	public final fun getLastRouteHandled ()Z
 	public final fun glideFrame (Lkotlin/jvm/functions/Function1;)V

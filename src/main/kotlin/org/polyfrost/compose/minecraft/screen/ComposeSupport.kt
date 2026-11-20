@@ -3,7 +3,7 @@ package org.polyfrost.compose.minecraft.screen
 import java.util.Collections
 import java.util.IdentityHashMap
 import org.apache.logging.log4j.LogManager
-import org.polyfrost.compose.host.ComposeHost
+import org.polyfrost.compose.host.HostMessages
 import org.polyfrost.compose.minecraft.render.gl.GlHost
 
 object ComposeSupport {
@@ -18,7 +18,9 @@ object ComposeSupport {
 
     private val probed: Failure? by lazy { probe() }
 
-    fun unavailableReason(): String? = (recordedFailure ?: probed)?.let(::describe) ?: GlHost.unavailableReason()
+    @JvmOverloads
+    fun unavailableReason(messages: HostMessages = HostMessages.Default): String? =
+        (recordedFailure ?: probed)?.let { describe(it, messages) } ?: GlHost.unavailableReason(messages)
 
     val isAvailable: Boolean get() = unavailableReason() == null
 
@@ -33,8 +35,7 @@ object ComposeSupport {
         LOG.error("Compose is unavailable on this system; the UI has been disabled.", error)
     }
 
-    private fun describe(failure: Failure): String {
-        val messages = ComposeHost.settings.messages
+    private fun describe(failure: Failure, messages: HostMessages): String {
         return when (failure) {
             Failure.Disabled -> messages.unavailable(messages.disabledByFlag(setDisableProperty() ?: disableProperties.first()))
             Failure.AwtMissing -> messages.awtMissing

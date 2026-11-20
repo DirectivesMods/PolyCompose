@@ -23,12 +23,13 @@ The id only has to be unique and readable. It shows up in logs and in the profil
 - `order` decides which layer draws on top when two overlap (higher draws later)
 - `acceptsInput` lets the layer take mouse and keyboard input. Turn it off for layers that only display things
 - `isolated` gives the layer its own scene (see below)
+- `options`, passed when you create the layer, sets its theme, motion and input handling (see [hooks](hooks.md))
 
 Call `close()` when you don't need the layer anymore. A closed layer stops drawing and frees what it used.
 
 ## Shared and isolated layers
 
-Layers share one Compose scene by default. Each layer still draws at its own spot between vanilla HUD elements, and layers drawn back to back get recorded together, so having lots of them costs very little when nothing changes. A layer that keeps throwing gets moved out of the shared scene on its own, so one broken mod can't take everyone else's HUD down with it.
+Layers with the same options share one Compose scene by default. Each layer still draws at its own spot between vanilla HUD elements, and layers drawn back to back get recorded together, so having lots of them costs very little when nothing changes. A layer that keeps throwing gets moved out of the shared scene on its own, so one broken mod can't take everyone else's HUD down with it.
 
 Set `isolated = true` if a layer needs its own scene, for example because it changes every single frame and you don't want it waking the others up. Players can turn sharing off for everything with `-Dpolycompose.hud.shared=false`.
 

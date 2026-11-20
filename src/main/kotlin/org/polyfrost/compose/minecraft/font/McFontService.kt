@@ -27,7 +27,7 @@ object McFontService {
         }
         HostEvents.onResourcesReloaded {
             FontManager.invalidateMetrics()
-            HostCallbacks.each(ComposeHost.listeners, "HostListener.onFontsChanged") { it.onFontsChanged() }
+            HostCallbacks.each(ComposeHost.fontListeners, "fonts changed listener") { it.run() }
         }
         //?} else {
         /*McResourceFont.init()

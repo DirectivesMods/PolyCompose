@@ -12,7 +12,9 @@ import androidx.compose.ui.scene.ComposeScene
 import androidx.compose.ui.scene.PointerEventResult
 import kotlin.math.abs
 import net.minecraft.client.gui.screens.ChatScreen
+import org.polyfrost.compose.effect.PolyGlassLight
 import org.polyfrost.compose.host.ComposeHost
+import org.polyfrost.compose.host.ComposeOptions
 import org.polyfrost.compose.host.HostCallbacks
 import org.polyfrost.compose.host.WheelRouter
 import org.polyfrost.compose.minecraft.platform.HostEvents
@@ -50,8 +52,9 @@ internal interface HudInputTarget {
     fun releaseFocus()
 }
 
-internal class HudPointerRouter {
-    val wheelRouter = WheelRouter()
+internal class HudPointerRouter(private val options: ComposeOptions) {
+    val wheelRouter = WheelRouter { options.reducedMotion }
+    private var reported: Offset? = null
     val scrollConfig = FixedScrollConfig(wheelRouter)
 
     var active = false
@@ -90,6 +93,7 @@ internal class HudPointerRouter {
         }
         val pointer = HudPointer.position()
         HudPointer.pointerRouted(pointer)
+        report(pointer)
         if (!hasLastPointer || pointer != lastPointer) {
             lastPointer = pointer
             hasLastPointer = true
@@ -105,12 +109,19 @@ internal class HudPointerRouter {
         }
     }
 
+    private fun report(position: Offset?) {
+        if (position == reported) return
+        reported = position
+        HostCallbacks.call(options, "ComposeOptions.onPointer", Unit) { options.onPointer(HudPointer, position) }
+    }
+
     fun stop(scene: ComposeScene?) {
         wheelRouter.stopFallback()
         glideCarry = Offset.Zero
         if (!active) return
         active = false
         HudPointer.routerStopped()
+        report(null)
         val hadPointer = hasLastPointer
         hasLastPointer = false
         if (scene == null) return
@@ -171,14 +182,14 @@ internal object HudPointer {
         routers = (routers - 1).coerceAtLeast(0)
         if (routers > 0 || !notified) return
         notified = false
-        HostCallbacks.each(ComposeHost.listeners, "HostListener.onPointer") { it.onPointer(HudPointer, null) }
+        PolyGlassLight.leave()
     }
 
     fun pointerRouted(position: Offset) {
         if (notified && position == notifiedAt) return
         notified = true
         notifiedAt = position
-        HostCallbacks.each(ComposeHost.listeners, "HostListener.onPointer") { it.onPointer(HudPointer, position) }
+        PolyGlassLight.moveTo(position)
     }
 
     fun inputAllowedThisFrame(): Boolean {

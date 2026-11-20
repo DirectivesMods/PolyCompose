@@ -14,11 +14,11 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineExceptionHandler
 import org.apache.logging.log4j.LogManager
 import org.polyfrost.compose.backend.PolyCompose
-import org.polyfrost.compose.host.ComposeHost
+import org.polyfrost.compose.host.ComposeOptions
 import org.polyfrost.compose.minecraft.platform.RenderThreadDispatcher
 
-internal object SceneMotionScale : MotionDurationScale {
-    override val scaleFactor: Float get() = ComposeHost.settings.animationScale
+private class SceneMotionScale(private val options: ComposeOptions) : MotionDurationScale {
+    override val scaleFactor: Float get() = options.animationScale
 }
 
 internal class SceneHandle private constructor(
@@ -62,13 +62,14 @@ internal class SceneHandle private constructor(
 
         fun create(
             platformContext: PlatformContext,
+            options: ComposeOptions,
             invalidate: () -> Unit,
             onRecompose: () -> Unit,
         ): SceneHandle {
             PolyCompose.install()
             val failure = AtomicReference<Throwable?>()
             val handler = CoroutineExceptionHandler { _, t -> failure.compareAndSet(null, t) }
-            val recomposer = FrameRecomposer(RenderThreadDispatcher + handler + SceneMotionScale, onRecompose)
+            val recomposer = FrameRecomposer(RenderThreadDispatcher + handler + SceneMotionScale(options), onRecompose)
             val scene = try {
                 CanvasLayersComposeScene(
                     frameRecomposer = recomposer,

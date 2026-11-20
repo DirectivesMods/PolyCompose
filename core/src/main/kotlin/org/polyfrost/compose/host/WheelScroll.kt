@@ -23,7 +23,7 @@ import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.exp
 
-public class WheelRouter {
+public class WheelRouter(private val reducedMotion: () -> Boolean = { false }) {
     internal var isRouting = false
         private set
 
@@ -62,7 +62,7 @@ public class WheelRouter {
     }
 
     public fun defersWheelScroll(): Boolean {
-        if (!isRouting || ComposeHost.settings.reducedMotion) return false
+        if (!isRouting || reducedMotion()) return false
         reachedScrollable = true
         return true
     }
@@ -160,7 +160,7 @@ internal class WheelScrollNode(
     override fun onCancelPointerInput() {}
 
     fun push(delta: Offset) {
-        if (ComposeHost.settings.reducedMotion) {
+        if (currentValueOf(LocalComposeOptions).reducedMotion) {
             val step = amountOf(delta) * currentValueOf(LocalDensity).density
             coroutineScope.launch { state.scrollBy(step) }
             return

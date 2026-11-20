@@ -1,17 +1,36 @@
 # Host hooks
 
-Most mods only need screens and HUD layers. The hooks here are for mods that build their own systems on top of PolyCompose, like a config library or an overlay manager. Every `add` call returns an `AutoCloseable`, and closing it removes the hook.
+Most mods only need screens and HUD layers. The hooks here are for mods that build their own systems on top of PolyCompose, like a config library or an overlay manager.
 
-## Listening to the host
+## Options for your mod
+
+Anything that changes how your UI behaves goes in a `ComposeOptions` object you own. Nothing you set there touches another mod's screens.
 
 ```kotlin
-ComposeHost.addListener(object : HostListener {
-    override fun onScreenRemoved(screen: Any) { saveDrafts() }
-    override fun onFontsChanged() { relayout() }
-})
+object MyModOptions : ComposeOptions() {
+    override val reducedMotion get() = MyConfig.reduceMotion
+
+    @Composable
+    override fun Decorate(owner: Any, content: @Composable () -> Unit) {
+        MyTheme { content() }
+    }
+
+    override fun onRemoved(owner: Any) { saveDrafts() }
+}
+
+class SettingsScreen : ComposeScreen(options = MyModOptions)
+val watermark = HudLayer("mymod:watermark", MyModOptions) { Watermark() }
 ```
 
-`HostListener` also tells you when a scene is created, when the pointer moves over a screen, and when the player switches between keyboard and mouse.
+The options also set animation speed and the messages shown when the UI can't open, and they get called when a scene is created, on every frame, when the pointer moves, when the player switches between keyboard and mouse, and when the screen or layer goes away. `isCapturingInput`, `consumeEscape` and `consumeMouse` let you take input first, for example to record a key for a keybind picker. Inside your content, `LocalComposeOptions.current` gives you the options in use.
+
+To share a look with other mods, publish your options object and let them pass it. A library can hand out one options object, and every mod that uses it gets the same theme, motion settings and input handling.
+
+## Global hooks
+
+A few things belong to the whole game rather than one mod. These hooks stack, so any number of mods can add their own, and every `add` call returns an `AutoCloseable` that removes it.
+
+`ComposeHost.onFontsChanged { relayout() }` runs after resource packs reload the fonts.
 
 ## Taking input while playing
 
@@ -24,7 +43,11 @@ ComposeHost.addGameInput(object : GameInputLayer {
 })
 ```
 
-Use `ComposeHost.addScreenInput` with a `ScreenInputInterceptor` to step in on input while a screen is open, for example to capture a key for a keybind picker.
+On 1.8.9, PolyCompose screens read the input queue themselves. If your mod posts its own input events, add a `LegacyInputObserver` with `ComposeHost.addLegacyInput` to see the events those screens read.
+
+## Frame rate
+
+`ComposeHost.requestFramerate(fps)` asks for a frame rate cap while the request is open. When several mods ask at once, the highest one wins. Close it as soon as you don't need it.
 
 ## Overlays
 

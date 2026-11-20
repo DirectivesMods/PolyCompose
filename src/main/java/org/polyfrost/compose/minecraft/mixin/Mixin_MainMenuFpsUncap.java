@@ -29,7 +29,7 @@ public class Mixin_MainMenuFpsUncap {
     //@ModifyExpressionValue(method = "getFramerateLimit", at = @At(value = "CONSTANT", args = "intValue=30"))
     private int polycompose$uncapMainMenu(int menuCap) {
         if (Minecraft.getInstance().level != null || McScreens.current() == null) return menuCap;
-        Integer limit = ComposeHost.getSettings().framerateLimit();
+        Integer limit = ComposeHost.requestedFramerate();
         if (limit != null) return limit;
         if (!(McScreens.current() instanceof ComposeScreen)) return menuCap;
         int refreshRate = McWindow.refreshRate();
@@ -39,7 +39,7 @@ public class Mixin_MainMenuFpsUncap {
 
     @ModifyReturnValue(method = "getFramerateLimit", at = @At("RETURN"))
     private int polycompose$capFramerate(int original) {
-        Integer limit = ComposeHost.getSettings().framerateLimit();
+        Integer limit = ComposeHost.requestedFramerate();
         return limit != null ? Math.min(original, limit) : original;
     }
 }

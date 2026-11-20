@@ -68,7 +68,6 @@ internal object ProfilerUi {
         overlay = created
         ComposeHost.overlays += created
         ComposeHost.gameInput += created
-        ComposeHost.screenInput += created
     }
 
     private fun hideOverlay(current: ProfilerComposeOverlay) {
@@ -76,7 +75,6 @@ internal object ProfilerUi {
         overlay = null
         ComposeHost.overlays -= current
         ComposeHost.gameInput -= current
-        ComposeHost.screenInput -= current
         current.release()
         if (current.failed) available = false
     }

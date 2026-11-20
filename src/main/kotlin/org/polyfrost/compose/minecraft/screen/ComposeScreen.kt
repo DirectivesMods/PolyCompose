@@ -43,11 +43,14 @@ import net.minecraft.client.gui.screens.Screen
 import org.apache.logging.log4j.LogManager
 import org.polyfrost.compose.backend.PolyCanvas
 import org.polyfrost.compose.host.BackStack
+import org.polyfrost.compose.effect.PolyGlassLight
 import org.polyfrost.compose.host.ComposeHost
+import org.polyfrost.compose.host.ComposeOptions
 import org.polyfrost.compose.host.HostCallbacks
 import org.polyfrost.compose.host.HostErrors
 import org.polyfrost.compose.host.KeyState
 import org.polyfrost.compose.host.LocalUiOversample
+import org.polyfrost.compose.host.LocalComposeOptions
 import org.polyfrost.compose.host.LocalWheelRouter
 import org.polyfrost.compose.host.SceneKind
 import org.polyfrost.compose.host.WheelRouter
@@ -165,6 +168,7 @@ private object SystemClipboard : Clipboard {
 @OptIn(InternalComposeUiApi::class)
 abstract class ComposeScreen(
     protected val renderMode: RenderMode = RenderMode.ON_DEMAND,
+    protected val options: ComposeOptions = ComposeOptions.Default,
 //~ if = 1.8.9 '(CommonComponents.EMPTY)' -> '()'
 ) : Screen(CommonComponents.EMPTY) {
     //? if = 1.8.9 {
@@ -183,7 +187,7 @@ abstract class ComposeScreen(
 
     @Composable
     protected open fun decorate(content: @Composable () -> Unit) {
-        content()
+        options.Decorate(this, content)
     }
 
     private var sceneHandle: SceneHandle? = null
@@ -287,10 +291,10 @@ abstract class ComposeScreen(
     private fun createScene(): SceneHandle {
         val sceneContext = SceneContext { showing }
         val semantics = if (ControllerBridge.tracksSemantics) SceneSemantics() else null
-        val handle = SceneHandle.create(semantics?.wrap(sceneContext) ?: sceneContext, frames.onInvalidation) { sceneDirty = true }
+        val handle = SceneHandle.create(semantics?.wrap(sceneContext) ?: sceneContext, options, frames.onInvalidation) { sceneDirty = true }
         sceneContextOrNull = sceneContext
         controllerSemantics = semantics
-        HostCallbacks.each(ComposeHost.listeners, "HostListener.onSceneCreated") { it.onSceneCreated(SceneKind.Screen) }
+        HostCallbacks.call(options, "ComposeOptions.onSceneCreated", Unit) { options.onSceneCreated(this, SceneKind.Screen) }
         return handle
     }
 
@@ -347,7 +351,7 @@ abstract class ComposeScreen(
         uiOversample.floatValue = surfaceScale()
 
         if (!bindContent()) {
-            closeWithMessage(ComposeHost.settings.messages.failedToStart)
+            closeWithMessage(options.messages.failedToStart)
             return
         }
 
@@ -378,6 +382,7 @@ abstract class ComposeScreen(
                 LocalUiOversample provides uiOversample.floatValue,
                 scrollConfig.provided(),
                 LocalWheelRouter provides wheelRouter,
+                LocalComposeOptions provides options,
                 LocalTickActivity provides tickActivity,
             ) {
                 val focusManager = LocalFocusManager.current
@@ -388,7 +393,7 @@ abstract class ComposeScreen(
     }
 
     private fun reportUnavailableAndClose() {
-        val reason = ComposeSupport.unavailableReason() ?: ComposeHost.settings.messages.failedToStart
+        val reason = ComposeSupport.unavailableReason(options.messages) ?: options.messages.failedToStart
         LOGGER.error("Refusing to open ${this::class.java.simpleName}: {}", reason)
         closeWithMessage(reason)
     }
@@ -550,7 +555,8 @@ abstract class ComposeScreen(
         releaseHeldButtons()
         consumedButtons.clear()
         pointerInside = false
-        HostCallbacks.each(ComposeHost.listeners, "HostListener.onScreenRemoved") { it.onScreenRemoved(this) }
+        PolyGlassLight.reset()
+        HostCallbacks.call(options, "ComposeOptions.onRemoved", Unit) { options.onRemoved(this) }
         releaseScene()
     }
 
@@ -654,7 +660,7 @@ abstract class ComposeScreen(
                     this::class.java.simpleName, sceneRebuilds,
                 )
                 closeSceneQuietly()
-                closeWithMessage(ComposeHost.settings.messages.renderError)
+                closeWithMessage(options.messages.renderError)
                 return
             }
             sceneRebuilds++
@@ -662,7 +668,7 @@ abstract class ComposeScreen(
             val rebuilt = ensureScene()
             if (rebuilt == null || !bindContent()) {
                 closeSceneQuietly()
-                closeWithMessage(ComposeSupport.unavailableReason() ?: ComposeHost.settings.messages.renderError)
+                closeWithMessage(ComposeSupport.unavailableReason(options.messages) ?: options.messages.renderError)
                 return
             }
             sceneDirty = true
@@ -735,15 +741,12 @@ abstract class ComposeScreen(
     }
 
     private fun notifyPointer(position: Offset?) {
-        HostCallbacks.each(ComposeHost.listeners, "HostListener.onPointer") { it.onPointer(this, position) }
+        if (position == null) PolyGlassLight.leave() else PolyGlassLight.moveTo(position)
+        HostCallbacks.call(options, "ComposeOptions.onPointer", Unit) { options.onPointer(this, position) }
     }
 
     private fun notifyFrame(): Boolean {
-        var dirty = false
-        for (listener in ComposeHost.listeners) {
-            dirty = HostCallbacks.call(listener, "HostListener.onFrame", false) { listener.onFrame(this) } || dirty
-        }
-        return dirty
+        return HostCallbacks.call(options, "ComposeOptions.onFrame", false) { options.onFrame(this) }
     }
 
     //? if >= 1.21.11
@@ -799,10 +802,10 @@ abstract class ComposeScreen(
             var keyboard = Keyboard.isCreated() && Keyboard.next()
             while (mouse || keyboard) {
                 if (mouse && (!keyboard || Mouse.getEventNanoseconds() <= Keyboard.getEventNanoseconds())) {
-                    if (!HostCallbacks.any(ComposeHost.screenInput, "ScreenInputInterceptor.onDeferredMouse") { it.onDeferredMouse() }) handleMouse()
+                    if (!routeMouseToGameLayers() && !HostCallbacks.any(ComposeHost.legacyInput, "LegacyInputObserver.onDrainedMouse") { it.onDrainedMouse() }) handleMouse()
                     mouse = Mouse.next()
                 } else {
-                    HostCallbacks.each(ComposeHost.screenInput, "ScreenInputInterceptor.onDeferredKeyboard") { it.onDeferredKeyboard() }
+                    HostCallbacks.each(ComposeHost.legacyInput, "LegacyInputObserver.onDrainedKeyboard") { it.onDrainedKeyboard() }
                     if (!routeToGameLayers()) handleKeyboard()
                     keyboard = Keyboard.next()
                 }
@@ -810,6 +813,12 @@ abstract class ComposeScreen(
         } finally {
             LegacyInputDrain.active = false
         }
+    }
+
+    private fun routeMouseToGameLayers(): Boolean {
+        val button = Mouse.getEventButton()
+        if (button < 0) return false
+        return GameKeyRouter.consumeButton(KeyCodes.mouseFromLegacy(button), Mouse.getEventButtonState())
     }
 
     private fun routeToGameLayers(): Boolean {
@@ -953,7 +962,7 @@ abstract class ComposeScreen(
         withScene { it.sendPointerEvent(type, button = pointerButton, position = pointerPosition()) }
     }
 
-    private val wheelRouter = WheelRouter()
+    private val wheelRouter = WheelRouter { options.reducedMotion }
     private val scrollConfig = FixedScrollConfig(wheelRouter)
     private var glideAnchor = Offset.Zero
     private var glideCarry = Offset.Zero
@@ -1157,19 +1166,19 @@ abstract class ComposeScreen(
     }
 
     private val capturingInput: Boolean
-        get() = HostCallbacks.any(ComposeHost.screenInput, "ScreenInputInterceptor.isCapturing") { it.isCapturing }
+        get() = HostCallbacks.call(options, "ComposeOptions.isCapturingInput", false) { options.isCapturingInput }
 
     private fun interceptMouse(code: Int, pressed: Boolean): Boolean =
-        HostCallbacks.any(ComposeHost.screenInput, "ScreenInputInterceptor.consumeMouse") { it.consumeMouse(code, pressed) }
+        HostCallbacks.call(options, "ComposeOptions.consumeMouse", false) { options.consumeMouse(this, code, pressed) }
 
     private fun reportInputKind(keyboard: Boolean) {
-        HostCallbacks.each(ComposeHost.listeners, "HostListener.onInputKind") { it.onInputKind(keyboard) }
+        HostCallbacks.call(options, "ComposeOptions.onInputKind", Unit) { options.onInputKind(this, keyboard) }
     }
 
     private fun dispatchKeyPressed(bindingKey: Int, shortcutKey: Int, modifiers: Int): Boolean {
         if (bindingKey in navigationKeys) reportInputKind(true)
         if (bindingKey == InputConstants.KEY_ESCAPE) {
-            if (HostCallbacks.any(ComposeHost.screenInput, "ScreenInputInterceptor.consumeEscape") { it.consumeEscape() }) {
+            if (HostCallbacks.call(options, "ComposeOptions.consumeEscape", false) { options.consumeEscape(this) }) {
                 consumedKeys += bindingKey
                 return true
             }

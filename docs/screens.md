@@ -30,7 +30,7 @@ Compose animations already ask for frames on their own, so most animated screens
 
 ## Things you can override
 
-- `decorate(content)` wraps everything in `compose()`. Put your theme or `CompositionLocalProvider` here so every screen in your mod gets it.
+- `decorate(content)` wraps everything in `compose()`. By default it calls your options' `Decorate`, so put a theme shared by all your screens in your `ComposeOptions` and override this only for one screen.
 - `blurAlpha()` returns how strong the game's background blur is, from 0 to 1.
 - `drawsPanorama()` decides whether the title screen panorama shows behind the screen when there's no world loaded.
 - `densityScale()` scales the whole screen up or down on top of the game's GUI scale.

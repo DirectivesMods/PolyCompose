@@ -144,7 +144,7 @@ internal object McResourceFont {
                 font = loaded
                 previous?.close()
                 FontManager.invalidateMetrics()
-                HostCallbacks.each(ComposeHost.listeners, "HostListener.onFontsChanged") { it.onFontsChanged() }
+                HostCallbacks.each(ComposeHost.fontListeners, "fonts changed listener") { it.run() }
             })
         }
     }

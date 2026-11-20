@@ -30,8 +30,6 @@ import androidx.compose.ui.unit.toSize
 import org.polyfrost.compose.backend.PolyDrawCanvas
 import org.polyfrost.compose.backend.drawBackdropGlass
 import org.polyfrost.compose.backend.drawPoly
-import org.polyfrost.compose.host.ComposeHost
-import org.polyfrost.compose.host.HostListener
 import org.polyfrost.compose.render.PolyRenderer
 import org.polyfrost.compose.render.alphaByte
 import kotlin.math.PI
@@ -79,24 +77,6 @@ public object PolyGlassLight {
     private var cellY = NO_CELL
     private var trailX = NO_CELL
     private var trailY = NO_CELL
-
-    private var listening = false
-
-    private val hostListener = object : HostListener {
-        override fun onPointer(screen: Any, position: Offset?) {
-            if (position == null) leave() else moveTo(position)
-        }
-
-        override fun onScreenRemoved(screen: Any) {
-            reset()
-        }
-    }
-
-    internal fun listen() {
-        if (listening) return
-        listening = true
-        ComposeHost.listeners += hostListener
-    }
 
     public var known: Boolean = false
         private set
@@ -209,7 +189,6 @@ public fun Modifier.polyGlass(
     val density = LocalDensity.current
     val reachPx = with(density) { reach.toPx() }
     if (!light) return glassSurface(shape, frosted, tint, rimColor, lightColor, alpha, band, refraction, reachPx, { false }) { Offset.Unspecified }
-    PolyGlassLight.listen()
     var bounds by remember { mutableStateOf(Rect.Zero) }
     val range = reachPx * 2f
     val slack = with(density) { GateSlack.toPx() }

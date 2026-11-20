@@ -9,7 +9,9 @@ import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.InternalComposeUiApi
 import androidx.compose.ui.geometry.Offset
+import java.util.IdentityHashMap
 import org.polyfrost.compose.backend.PolyCanvas
+import org.polyfrost.compose.host.ComposeOptions
 import org.polyfrost.compose.host.HostErrors
 import org.polyfrost.compose.host.LocalWheelRouter
 import org.polyfrost.compose.minecraft.canvas.InlineCanvasSurface
@@ -23,13 +25,8 @@ import org.polyfrost.compose.profile.measure
 import net.minecraft.client.gui.GuiGraphicsExtractor
 //?}
 
-internal object SharedHudScene : HudSceneBase("hud/@shared") {
-    private const val MAX_PROBATION_SHIFT = 4
-    private const val REJOIN_NANOS = 5_000_000_000L
-    private const val ADMIT_SPACING_NANOS = 1_000_000_000L
-    private const val SUSPECT_NANOS = 5_000_000_000L
-    private const val IDLE_DETACH_NANOS = 10_000_000_000L
-    private const val MAX_RUN = 256
+internal class SharedHudScene private constructor(options: ComposeOptions) :
+    HudSceneBase(if (options === ComposeOptions.Default) "hud/@shared" else "hud/@shared/${options.javaClass.name}", options) {
 
     private val slotOrder = compareBy<HudSlot>({ it.order }, { it.seq })
     private val slots = mutableStateListOf<HudSlot>()
@@ -336,5 +333,18 @@ internal object SharedHudScene : HudSceneBase("hud/@shared") {
     override fun releaseScene() {
         inputWanted = false
         super.releaseScene()
+    }
+
+    companion object {
+        private const val MAX_PROBATION_SHIFT = 4
+        private const val REJOIN_NANOS = 5_000_000_000L
+        private const val ADMIT_SPACING_NANOS = 1_000_000_000L
+        private const val SUSPECT_NANOS = 5_000_000_000L
+        private const val IDLE_DETACH_NANOS = 10_000_000_000L
+        private const val MAX_RUN = 256
+
+        private val scenes = IdentityHashMap<ComposeOptions, SharedHudScene>()
+
+        fun of(options: ComposeOptions): SharedHudScene = scenes.getOrPut(options) { SharedHudScene(options) }
     }
 }

@@ -62,7 +62,7 @@ internal class HudSlot(val layer: HudLayer, val seq: Int) {
     private var profile: ProfileHost? = null
 
     val tickActivity = TickActivity {
-        attached && shown && layer.visible && System.nanoTime() - SharedHudScene.drawnAt < HudPointer.INPUT_STALE_NANOS
+        attached && shown && layer.visible && System.nanoTime() - layer.sharedScene.drawnAt < HudPointer.INPUT_STALE_NANOS
     }
 
     fun profile(): ProfileHost? {
@@ -71,14 +71,14 @@ internal class HudSlot(val layer: HudLayer, val seq: Int) {
     }
 
     private val measurePolicy = MeasurePolicy { measurables, constraints ->
-        val placeables = profile().measureSlice(SharedHudScene.profile(), ProfilePhase.Layout) {
+        val placeables = profile().measureSlice(layer.sharedScene.profile(), ProfilePhase.Layout) {
             measurables.map { it.measure(constraints) }
         }
         val width = constraints.constrainWidth(placeables.maxOfOrNull { it.width } ?: 0)
         val height = constraints.constrainHeight(placeables.maxOfOrNull { it.height } ?: 0)
         layout(width, height) {
             if (shown) {
-                profile().measureSlice(SharedHudScene.profile(), ProfilePhase.Layout) {
+                profile().measureSlice(layer.sharedScene.profile(), ProfilePhase.Layout) {
                     for (placeable in placeables) placeable.place(0, 0)
                 }
             }
@@ -118,7 +118,7 @@ internal class HudSlot(val layer: HudLayer, val seq: Int) {
     private val modifier = gate.modifier
         .onFocusChanged { hasFocus = it.hasFocus }
         .drawWithContent {
-            profile().measureSlice(SharedHudScene.profile(), ProfilePhase.Record) { drawContent() }
+            profile().measureSlice(layer.sharedScene.profile(), ProfilePhase.Record) { drawContent() }
         }
 
     @Composable

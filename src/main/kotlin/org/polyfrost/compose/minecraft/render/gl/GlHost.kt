@@ -7,6 +7,7 @@ import org.lwjgl.opengl.GL11
 import org.polyfrost.compose.host.ComposeHost
 import org.polyfrost.compose.host.HostCallbacks
 import org.polyfrost.compose.host.HostErrors
+import org.polyfrost.compose.host.HostMessages
 import org.polyfrost.compose.host.OverlayRenderer
 import org.polyfrost.compose.minecraft.platform.McScreens
 import org.polyfrost.compose.minecraft.platform.McWindow
@@ -127,12 +128,13 @@ object GlHost {
     //?} else
     //val legacyGl = vanillaPipeline || !isVulkanModInstalled
 
-    fun unavailableReason(): String? {
+    @JvmOverloads
+    fun unavailableReason(messages: HostMessages = HostMessages.Default): String? {
         //? if >= 1.21.11 {
         return null
         //?} else {
         /*if (legacyGl) return null
-        return ComposeHost.settings.messages.vulkanModUnsupported
+        return messages.vulkanModUnsupported
         *///?}
     }
 
@@ -930,7 +932,7 @@ object GlHost {
         if (!allocReported) {
             allocReported = true
             runCatching {
-                McScreens.showMessage(ComposeHost.settings.messages.gpuAllocFailed(w, h))
+                McScreens.showMessage(HostMessages.Default.gpuAllocFailed(w, h))
             }
         }
     }
