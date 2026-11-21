@@ -13,7 +13,7 @@ Add PolyCompose to `depends` in your `fabric.mod.json` (or `ornithe.mod.json` on
 
 ```json
 "depends": {
-  "polycompose": ">=1.0.0"
+  "polycompose": ">=3.0.0"
 }
 ```
 
