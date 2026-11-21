@@ -44,7 +44,7 @@ public object FontManager {
         require(isReadableFont(bytes)) { "$name is not a TrueType or OpenType font" }
         fontData[name] = bytes
         if (pixelAligned) pixelFonts.add(name) else pixelFonts.remove(name)
-        if (name == DEFAULT_KEY || weights.containsKey(name)) familyRevision++
+        if (name == DEFAULT_KEY || name in GENERIC_FAMILIES || weights.containsKey(name)) familyRevision++
         bump()
     }
 
@@ -110,4 +110,5 @@ public object FontManager {
     }
 
     private const val MEDIUM_WEIGHT = 500
+    private val GENERIC_FAMILIES = setOf("sans-serif", "serif", "monospace", "cursive")
 }

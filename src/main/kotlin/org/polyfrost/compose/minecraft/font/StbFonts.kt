@@ -10,6 +10,7 @@ import org.lwjgl.stb.STBTruetype.stbtt_GetFontOffsetForIndex
 import org.lwjgl.stb.STBTruetype.stbtt_GetFontVMetrics
 import org.lwjgl.stb.STBTruetype.stbtt_GetGlyphBitmapBoxSubpixel
 import org.lwjgl.stb.STBTruetype.stbtt_GetGlyphHMetrics
+import org.lwjgl.stb.STBTruetype.stbtt_GetGlyphKernAdvance
 import org.lwjgl.stb.STBTruetype.stbtt_GetGlyphSDF
 import org.lwjgl.stb.STBTruetype.stbtt_GetGlyphShape
 import org.lwjgl.stb.STBTruetype.stbtt_InitFont
@@ -24,6 +25,7 @@ import org.polyfrost.compose.render.PolyFont
 import org.polyfrost.compose.render.PolyGlyphPage
 import org.polyfrost.compose.render.PolyTessellator
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicLongArray
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
@@ -156,6 +158,19 @@ internal object StbFonts : PolyFont.Engine, PolyGlyphPage.Rasterizer {
         private val loca = tableOffset("loca")
         private val longLoca = tableOffset("head").let { it >= 0 && data.u16(it + 50) == 1 }
         private val glyphCount = tableOffset("maxp").let { if (it < 0) 0 else data.u16(it + 4) }
+        private val kerned = tableOffset("kern") >= 0 || tableOffset("GPOS") >= 0
+        private val kerns = AtomicLongArray(KERN_SLOTS)
+
+        override fun kern(left: Int, right: Int): Float {
+            if (!kerned || left !in 1..MAX_GLYPH || right !in 1..MAX_GLYPH) return 0f
+            val key = (left shl 16) or right
+            val slot = (key * KERN_HASH) ushr (Int.SIZE_BITS - KERN_BITS)
+            val cached = kerns.get(slot)
+            if ((cached ushr 32).toInt() == key) return cached.toInt() * emScale
+            val units = synchronized(this) { if (freed) 0 else stbtt_GetGlyphKernAdvance(info, left, right) }
+            kerns.set(slot, (key.toLong() shl 32) or (units.toLong() and 0xFFFFFFFFL))
+            return units * emScale
+        }
 
         private fun f2dot14(o: Int) = data.s16(o) / 16384f
 
@@ -345,6 +360,7 @@ internal object StbFonts : PolyFont.Engine, PolyGlyphPage.Rasterizer {
         var units = 0L
         var extra = 0f
         val emoji = emoji
+        var kernGlyph = 0
         var i = 0
         while (i < text.length) {
             val at = i
@@ -354,6 +370,7 @@ internal object StbFonts : PolyFont.Engine, PolyGlyphPage.Rasterizer {
             val sequence = if (emoji != null && i < text.length) PolyGlyphPage.sequence(emoji, text, at, text.length) else 0L
             if (sequence != 0L && emoji != null) {
                 extra += emoji.advance((sequence ushr 32).toInt())
+                kernGlyph = 0
                 i = sequence.toInt()
                 continue
             }
@@ -361,6 +378,9 @@ internal object StbFonts : PolyFont.Engine, PolyGlyphPage.Rasterizer {
             val fallback = if (id == 0 && !Character.isWhitespace(cp)) PolyGlyphPage.fallback(cp, if (i < text.length) text.codePointAt(i) else 0) else null
             val fid = fallback?.glyph(cp) ?: 0
             if (fid != 0) extra += fallback!!.advance(fid) else units += face.advanceUnits(id)
+            val kernable = fid == 0 && id != 0 && PolyGlyphPage.kernable(cp)
+            if (kernable && kernGlyph != 0) extra += face.kern(kernGlyph, id)
+            kernGlyph = if (kernable) id else 0
         }
         return (units * face.emScale + extra) * font.size
     }
@@ -369,6 +389,10 @@ internal object StbFonts : PolyFont.Engine, PolyGlyphPage.Rasterizer {
 
     private val DILATE = System.getProperty("polycompose.hud.textDilate")?.toFloat() ?: if (System.getProperty("os.name").startsWith("Mac")) 0.068f else 0f
     private const val SDF_PAD = 2
+    private const val MAX_GLYPH = 0xFFFF
+    private const val KERN_BITS = 12
+    private const val KERN_SLOTS = 1 shl KERN_BITS
+    private const val KERN_HASH = -0x61c88647
     private const val CACHE_PAGE_BITS = 8
     private const val CACHE_PAGE_MASK = (1 shl CACHE_PAGE_BITS) - 1
     private const val CACHE_PAGES = 0x110000 ushr CACHE_PAGE_BITS

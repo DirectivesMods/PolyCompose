@@ -10,11 +10,14 @@ import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Canvas
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmapConfig
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.ShaderBrush
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.colorspace.ColorSpaces
 import androidx.compose.ui.graphics.drawscope.DrawStyle
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.isSpecified
 import androidx.compose.ui.graphics.platform.PlatformShader
 import androidx.compose.ui.graphics.toArgb
@@ -37,9 +40,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontSynthesis
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.font.GenericFontFamily
 import androidx.compose.ui.text.font.PlatformTypefacesLoader
 import androidx.compose.ui.text.font.createPlatformFontFamilyResolver
 import androidx.compose.ui.text.platform.PlatformText
+import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.text.style.ResolvedTextDirection
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
@@ -51,7 +56,11 @@ import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.isSpecified
 import com.ibm.icu.lang.UCharacter
 import com.ibm.icu.text.ArabicShaping
+import org.apache.logging.log4j.LogManager
+import org.polyfrost.compose.mc.McGlyphs
 import org.polyfrost.compose.render.FontManager
+import org.polyfrost.compose.render.BlurPlacement
+import org.polyfrost.compose.render.FilterQuality
 import org.polyfrost.compose.render.PolyFade
 import org.polyfrost.compose.render.PolyFont
 import org.polyfrost.compose.render.PolyGlyphPage
@@ -59,18 +68,43 @@ import org.polyfrost.compose.render.PolyImageFill
 import org.polyfrost.compose.render.ChromaBrush
 import org.polyfrost.compose.render.PolyRenderer
 import org.polyfrost.compose.render.PolyTessellator
+import org.polyfrost.compose.render.placeBlur
 import org.polyfrost.compose.text.McFonts
 import java.text.Bidi
 import java.text.BreakIterator
+import java.util.BitSet
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.CoroutineContext
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.round
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
-private val italicFonts = ConcurrentHashMap.newKeySet<String>()
-private val sourceWeights = ConcurrentHashMap<String, Int>()
+internal data class LoadedFace(val key: String, val weight: Int, val italic: Boolean)
+
+private fun faceName(loaded: Any?): String = when (loaded) {
+    is LoadedFace -> loaded.key
+    is String -> loaded
+    else -> FontManager.DEFAULT_KEY
+}
+
+private object GenericFonts {
+    private val logger by lazy { LogManager.getLogger("PolyCompose") }
+    private val reported = ConcurrentHashMap.newKeySet<String>()
+
+    fun resolve(family: FontFamily): String {
+        val generic = (family as? GenericFontFamily)?.name ?: return FontManager.DEFAULT_KEY
+        if (FontManager.fontData(generic) != null) return generic
+        if (generic != FontFamily.SansSerif.name && reported.add(generic)) {
+            runCatching { logger.debug("No font registered for the {} family, using the default font", generic) }
+        }
+        return FontManager.DEFAULT_KEY
+    }
+}
 
 private const val LIGATURE_PLACEHOLDER = '\uFFFF'
 
@@ -112,11 +146,9 @@ private fun reversedClusters(text: String): String {
 }
 
 public class PolyFontSource(public val key: String, private val bytes: () -> ByteArray, override val weight: FontWeight, override val style: FontStyle) : Font {
-    internal fun register(): String {
-        if (style == FontStyle.Italic) italicFonts += key
-        sourceWeights[key] = weight.weight
+    internal fun register(): LoadedFace {
         if (FontManager.fontData(key) == null) FontManager.register(key, bytes())
-        return key
+        return LoadedFace(key, weight.weight, style == FontStyle.Italic)
     }
 
     override fun equals(other: Any?): Boolean = other is PolyFontSource && other.key == key && other.weight == weight && other.style == style
@@ -130,7 +162,7 @@ public object PolyText : PlatformText {
         override suspend fun awaitLoad(font: Font): Any? = loadBlocking(font)
         override val cacheKey: Any? get() = FontManager.familyRevision
         override fun loadPlatformTypes(fontFamily: FontFamily, fontWeight: FontWeight, fontStyle: FontStyle): Any =
-            FontManager.resolveWeight(FontManager.DEFAULT_KEY, fontWeight.weight)
+            FontManager.resolveWeight(GenericFonts.resolve(fontFamily), fontWeight.weight)
         override val fontCollection: Any = Unit
     }
 
@@ -151,11 +183,27 @@ public object PolyText : PlatformText {
     override fun createFontFamilyResolver(): FontFamily.Resolver = createPlatformFontFamilyResolver(typefaces)
     override fun createFontFamilyResolver(coroutineContext: CoroutineContext): FontFamily.Resolver = createPlatformFontFamilyResolver(typefaces, coroutineContext)
 
+    private class CharBreaks {
+        var text: String? = null
+        val breaks: BreakIterator = BreakIterator.getCharacterInstance()
+    }
+
+    private val charBreaks = ThreadLocal.withInitial { CharBreaks() }
+
+    private fun charBreaks(text: String): BreakIterator {
+        val cached = charBreaks.get()
+        if (cached.text != text) {
+            cached.breaks.setText(text)
+            cached.text = text
+        }
+        return cached.breaks
+    }
+
     override fun findPrecedingBreak(text: String, index: Int): Int =
-        BreakIterator.getCharacterInstance().also { it.setText(text) }.preceding(index).let { if (it == BreakIterator.DONE) 0 else it }
+        charBreaks(text).preceding(index.coerceIn(0, text.length)).let { if (it == BreakIterator.DONE) 0 else it }
 
     override fun findFollowingBreak(text: String, index: Int): Int =
-        BreakIterator.getCharacterInstance().also { it.setText(text) }.following(index).let { if (it == BreakIterator.DONE) text.length else it }
+        charBreaks(text).following(index.coerceIn(0, text.length)).let { if (it == BreakIterator.DONE) text.length else it }
 
     override val defaultFontRasterizationSettings: FontRasterizationSettings = FontRasterizationSettings(FontSmoothing.AntiAlias, FontHinting.Slight, subpixelPositioning = true, autoHintingForced = false)
 }
@@ -164,6 +212,7 @@ internal class TextRun(
     val start: Int, val end: Int, val font: PolyFont, val style: SpanStyle,
     val spanColor: Color = Color.Unspecified, val spanDecoration: TextDecoration? = null, val spanShadow: Shadow? = null, val skew: Float = 0f,
     val scaleX: Float = 1f, val letter: Float = 0f, val bold: Float = 0f, val placeholder: Placeholder? = null,
+    val spanBrush: Brush? = null, val brushAlpha: Float = Float.NaN, val shift: Float = 0f,
 ) {
     val metrics get() = font.metrics
     val tracking get() = letter + bold
@@ -185,7 +234,8 @@ internal class PolyIntrinsics(
     val placeholders: List<AnnotatedString.Range<Placeholder>>, val density: Density, resolver: FontFamily.Resolver,
 ) : ParagraphIntrinsics {
     // an em paragraph size has no parent to resolve against, so it's relative to the 14 sp default
-    private val baseSize = style.fontSize.let { if (!it.isSpecified) 14f else if (it.isEm) it.value * 14f else with(density) { it.toPx() } }
+    val baseSize = style.fontSize.let { if (!it.isSpecified) 14f else if (it.isEm) it.value * 14f else with(density) { it.toPx() } }
+    val locale: Locale = style.localeList?.firstOrNull()?.let { Locale.forLanguageTag(it.toLanguageTag()) } ?: Locale.getDefault()
     private val builtRevision = FontManager.revision
     val runs: List<TextRun>
     val glyphs = Icu.shape(text)
@@ -193,7 +243,11 @@ internal class PolyIntrinsics(
     // prefix sums keep width lookups O(1) for line breaking and bidi hit testing
     private val prefix = DoubleArray(text.length + 1)
     val lineHeightPx: Float
+    val lineHeightSpec: Float
+    private var kerns: FloatArray? = null
     val align: TextAlign = style.textAlign
+    val firstIndent: Float
+    val restIndent: Float
 
     init {
         val base = style.toSpanStyle()
@@ -212,31 +266,46 @@ internal class PolyIntrinsics(
             var spanColor = Color.Unspecified
             var spanDecoration: TextDecoration? = null
             var spanShadow: Shadow? = null
+            var spanBrush: Brush? = null
+            var brushAlpha = Float.NaN
             for (sp in spans) if (sp.start <= a && sp.end >= b) {
-                s = s.merge(sp.item)
-                if (sp.item.color.isSpecified) spanColor = sp.item.color
-                sp.item.textDecoration?.let { spanDecoration = it }
-                sp.item.shadow?.let { spanShadow = it }
+                val item = sp.item
+                s = s.merge(item)
+                val brush = item.brush
+                if (brush != null) {
+                    if (spanBrush == null || !item.alpha.isNaN()) brushAlpha = item.alpha
+                    spanBrush = brush
+                    spanColor = Color.Unspecified
+                } else if (item.color.isSpecified) {
+                    spanColor = item.color
+                    spanBrush = null
+                    brushAlpha = Float.NaN
+                }
+                item.textDecoration?.let { spanDecoration = it }
+                item.shadow?.let { spanShadow = it }
             }
-            val name = resolver.resolve(s.fontFamily, s.fontWeight ?: FontWeight.Normal, s.fontStyle ?: FontStyle.Normal, s.fontSynthesis ?: FontSynthesis.All).value as? String
-                ?: FontManager.DEFAULT_KEY
+            val loaded = resolver.resolve(s.fontFamily, s.fontWeight ?: FontWeight.Normal, s.fontStyle ?: FontStyle.Normal, s.fontSynthesis ?: FontSynthesis.All).value
+            val name = faceName(loaded)
             val size = if (s.fontSize == style.fontSize) baseSize else px(s.fontSize, baseSize)
             val synthesis = s.fontSynthesis ?: FontSynthesis.All
             // like Skia, slant upright faces when italic is requested and the family has no italic face
-            val fakeItalic = s.fontStyle == FontStyle.Italic && name !in italicFonts && (synthesis == FontSynthesis.All || synthesis == FontSynthesis.Style)
-            val skew = (s.textGeometricTransform?.skewX ?: 0f) + if (fakeItalic) 0.25f else 0f
+            val fakeItalic = s.fontStyle == FontStyle.Italic && (loaded as? LoadedFace)?.italic != true && (synthesis == FontSynthesis.All || synthesis == FontSynthesis.Style)
+            val userSkew = s.textGeometricTransform?.skewX ?: 0f
+            val skew = (if (fakeItalic) 0.25f else 0f) - userSkew
             val scaleX = s.textGeometricTransform?.scaleX?.takeIf { it > 0f && it.isFinite() } ?: 1f
-            val fakeBold = (s.fontWeight ?: FontWeight.Normal).weight >= BOLD_SYNTHESIS_WEIGHT && faceWeight(name) < BOLD_SYNTHESIS_WEIGHT &&
+            val fakeBold = (s.fontWeight ?: FontWeight.Normal).weight >= BOLD_SYNTHESIS_WEIGHT && faceWeight(loaded, name) < BOLD_SYNTHESIS_WEIGHT &&
                 !McFonts.isMinecraft(name) && (synthesis == FontSynthesis.All || synthesis == FontSynthesis.Weight)
             val letter = s.letterSpacing.let { if (!it.isSpecified) 0f else if (it.isEm) it.value * size else with(density) { it.toPx() } }
             val placeholder = placeholders.firstOrNull { it.start <= a && it.end >= b }?.item
+            val font = fontCache.getOrPut(name to size) { PolyFont(name, size) }
+            val shift = s.baselineShift?.multiplier?.takeIf { it.isFinite() && it != 0f }?.let { it * font.metrics.ascent } ?: 0f
             runs += TextRun(
-                a, b, fontCache.getOrPut(name to size) { PolyFont(name, size) }, s, spanColor, spanDecoration, spanShadow, skew,
-                scaleX, letter, if (fakeBold) fakeBoldWidth(size) else 0f, placeholder,
+                a, b, font, s, spanColor, spanDecoration, spanShadow, skew,
+                scaleX, letter, if (fakeBold) fakeBoldWidth(size) else 0f, placeholder, spanBrush, brushAlpha, shift,
             )
         }
         if (runs.isEmpty()) {
-            val name = resolver.resolve(base.fontFamily, base.fontWeight ?: FontWeight.Normal, base.fontStyle ?: FontStyle.Normal).value as? String ?: FontManager.DEFAULT_KEY
+            val name = faceName(resolver.resolve(base.fontFamily, base.fontWeight ?: FontWeight.Normal, base.fontStyle ?: FontStyle.Normal).value)
             runs += TextRun(0, 0, PolyFont(name, baseSize), base)
         }
         // shortcut: one glyph per code point without OpenType shaping, so scripts that reorder or substitute glyphs
@@ -251,6 +320,10 @@ internal class PolyIntrinsics(
             val letter = run.tracking
             val scaleX = run.scaleX
             val mc = McFonts.isMinecraft(run.font.name)
+            val kernFace = if (mc) null else PolyGlyphPage.rasterizer?.face(run.font.name)
+            val kernScale = run.font.size * scaleX
+            var kernAt = -1
+            var kernGlyph = 0
             var i = run.start
             while (i < run.end) {
                 val cp = glyphs.codePointAt(i)
@@ -259,18 +332,41 @@ internal class PolyIntrinsics(
                 if (sequence != 0L) {
                     val end = sequence.toInt()
                     advances[i] = run.font.measureTextWidth(glyphs.substring(i, end)) * scaleX + letter
+                    kernAt = -1
                     i = end
                     continue
                 }
                 val emoji = !mc && i + n < glyphs.length && glyphs.codePointAt(i + n) == PolyGlyphPage.EMOJI_VARIATION
-                advances[i] = if (cp == '\n'.code || cp == LIGATURE_PLACEHOLDER.code || PolyGlyphPage.isIgnorable(cp)) 0f else Advances.of(run.font, cp, emoji) * scaleX + letter
+                val ignorable = PolyGlyphPage.isIgnorable(cp)
+                advances[i] = if (cp == '\n'.code || cp == LIGATURE_PLACEHOLDER.code || ignorable) 0f else Advances.of(run.font, cp, emoji) * scaleX + letter
+                if (kernFace != null && !ignorable) {
+                    val glyph = if (PolyGlyphPage.kernable(cp)) kernFace.glyph(cp) else 0
+                    if (glyph != 0 && kernAt >= 0) kern(kernAt, kernFace.kern(kernGlyph, glyph) * kernScale)
+                    kernAt = if (glyph != 0) i else -1
+                    kernGlyph = glyph
+                }
                 i += n
             }
         }
         for (i in advances.indices) prefix[i + 1] = prefix[i] + advances[i]
         val natural = runs.maxOf { it.metrics.spacing }
-        lineHeightPx = if (style.lineHeight.isSpecified) px(style.lineHeight, natural) else round(natural)
+        lineHeightSpec = if (style.lineHeight.isSpecified) px(style.lineHeight, natural) else Float.NaN
+        lineHeightPx = if (style.lineHeight.isSpecified) lineHeightSpec else round(natural)
+        firstIndent = style.textIndent?.firstLine?.let { px(it, 0f) }?.takeIf { it.isFinite() } ?: 0f
+        restIndent = style.textIndent?.restLine?.let { px(it, 0f) }?.takeIf { it.isFinite() } ?: 0f
     }
+
+    val shifted: Boolean = runs.any { it.shift != 0f && it.placeholder == null }
+
+    private val spaceCounts: IntArray by lazy {
+        IntArray(text.length + 1).also { counts ->
+            for (i in text.indices) counts[i + 1] = counts[i] + if (Character.isWhitespace(text[i])) 1 else 0
+        }
+    }
+
+    fun spaces(from: Int, to: Int): Int = if (to <= from) 0 else spaceCounts[to] - spaceCounts[from]
+
+    fun indentAt(lineStart: Int): Float = if (lineStart <= 0 || text[lineStart - 1] == '\n') firstIndent else restIndent
 
     fun px(unit: TextUnit, fallback: Float): Float = if (!unit.isSpecified) fallback else with(density) {
         if (unit.isEm) unit.value * baseSize else unit.toPx()
@@ -280,27 +376,47 @@ internal class PolyIntrinsics(
         if (unit.isEm) unit.value * run.font.size else unit.toPx()
     }
 
-    private fun faceWeight(name: String): Int = sourceWeights[name] ?: FontManager.weightOf(name)
+    private fun faceWeight(loaded: Any?, name: String): Int = (loaded as? LoadedFace)?.weight ?: FontManager.weightOf(name)
 
-    fun runAt(offset: Int): TextRun = runs.firstOrNull { offset < it.end } ?: runs.last()
+    private fun kern(at: Int, amount: Float) {
+        if (amount == 0f) return
+        advances[at] += amount
+        (kerns ?: FloatArray(text.length).also { kerns = it })[at] = amount
+    }
+
+    fun kernAfter(at: Int): Float = kerns?.getOrNull(at) ?: 0f
+
+    fun inkWidth(start: Int, end: Int): Float = if (end <= start) 0f else width(start, end) - kernAfter(end - 1)
+
+    fun runIndexAt(offset: Int): Int {
+        var lo = 0
+        var hi = runs.size - 1
+        while (lo < hi) {
+            val mid = (lo + hi + 1) ushr 1
+            if (runs[mid].start <= offset) lo = mid else hi = mid - 1
+        }
+        return lo
+    }
+
+    fun runAt(offset: Int): TextRun = runs[runIndexAt(offset)]
 
     fun width(start: Int, end: Int): Float = if (end <= start) 0f else (prefix[end] - prefix[start]).toFloat()
 
     override val maxIntrinsicWidth: Float by lazy {
         var best = 0f; var cur = 0f
-        for (i in text.indices) { if (text[i] == '\n') { best = max(best, cur); cur = 0f } else cur += advances[i] }
-        max(best, cur)
+        for (i in text.indices) { if (text[i] == '\n') { best = max(best, cur + firstIndent); cur = 0f } else cur += advances[i] }
+        max(best, cur + firstIndent)
     }
 
     override val minIntrinsicWidth: Float by lazy {
-        val it = BreakIterator.getLineInstance().also { b -> b.setText(text) }
-        var best = 0f
+        val it = BreakIterator.getLineInstance(locale).also { b -> b.setText(text) }
+        var best = firstIndent
         var start = it.first()
         var end = it.next()
         while (end != BreakIterator.DONE) {
             var e = end
             while (e > start && text[e - 1].isWhitespace()) e--
-            best = max(best, width(start, e))
+            best = max(best, width(start, e) + indentAt(start))
             start = end
             end = it.next()
         }
@@ -341,6 +457,46 @@ private object Intrinsics {
     }
 }
 
+private object SharedShadowBakes {
+    private const val MAX_BYTES = 8L shl 20
+    private const val MAX_ENTRIES = 32
+
+    class Key(
+        val intr: PolyIntrinsics, val maxLines: Int, val overflow: TextOverflow, val maxWidth: Float, val color: Color, val blur: Float, val runs: BitSet,
+        val scale: Float, val revision: Int,
+    ) {
+        private val hash = ((((((System.identityHashCode(intr) * 31 + maxLines) * 31 + overflow.hashCode()) * 31 + maxWidth.toRawBits()) * 31 +
+            color.hashCode()) * 31 + blur.toRawBits()) * 31 + runs.hashCode()) * 31 + scale.toRawBits()
+
+        override fun hashCode(): Int = hash
+
+        override fun equals(other: Any?): Boolean = other is Key && hash == other.hash && intr === other.intr && maxLines == other.maxLines &&
+            overflow == other.overflow && maxWidth.toRawBits() == other.maxWidth.toRawBits() && scale.toRawBits() == other.scale.toRawBits() &&
+            revision == other.revision && color == other.color && blur.toRawBits() == other.blur.toRawBits() && runs == other.runs
+    }
+
+    private val bakes = LinkedHashMap<Key, BlurPlacement>(16, 0.75f, true)
+    private var bytes = 0L
+
+    private fun sizeOf(p: BlurPlacement): Long = p.bitmap.width.toLong() * p.bitmap.height * 4L
+
+    fun get(key: Key): BlurPlacement? = synchronized(bakes) { bakes[key] }
+
+    fun put(key: Key, placed: BlurPlacement) {
+        val size = sizeOf(placed)
+        if (size > MAX_BYTES / 2) return
+        synchronized(bakes) {
+            bakes.put(key, placed)?.let { bytes -= sizeOf(it) }
+            bytes += size
+            val it = bakes.values.iterator()
+            while ((bytes > MAX_BYTES || bakes.size > MAX_ENTRIES) && it.hasNext()) {
+                bytes -= sizeOf(it.next())
+                it.remove()
+            }
+        }
+    }
+}
+
 private object Advances {
     private val cache = ConcurrentHashMap<PolyFont, ConcurrentHashMap<Int, Float>>()
     @Volatile private var fonts = -1
@@ -362,14 +518,38 @@ private object Advances {
 
 internal class Seg(val str: String, val x: Float, val w: Float, val run: TextRun)
 
+private class TextPass(val r: PolyRenderer, private val stroke: Stroke?, private val forced: Int?) : PolyRenderer by r {
+    override fun rect(x: Float, y: Float, w: Float, h: Float, color: Int, radius: Float) = r.rect(x, y, w, h, forced ?: color, radius)
+
+    override fun text(text: String, x: Float, y: Float, color: Int, font: PolyFont, letterSpacing: Float, skewX: Float) {
+        val t = r as? PolyTessellator
+        if (stroke != null && t != null) t.textStroke(text, x, y, forced ?: color, font, letterSpacing, skewX, stroke.width)
+        else r.text(text, x, y, forced ?: color, font, letterSpacing, skewX)
+    }
+
+    override fun mcText(text: String, x: Float, y: Float, color: Int, shadow: Boolean, scale: Float, literal: Boolean, snapX: Boolean) {
+        val t = r as? PolyTessellator
+        if (stroke != null && t != null) t.mcTextStroke(text, x, y, forced ?: color, scale, literal, snapX)
+        else r.mcText(text, x, y, forced ?: color, shadow, scale, literal, snapX)
+    }
+}
+
+private fun tessellatorOf(r: PolyRenderer): PolyTessellator? {
+    var cur = r
+    while (cur is TextPass) cur = cur.r
+    return cur as? PolyTessellator
+}
+
 internal class Line(
     val start: Int, val end: Int, val visibleEnd: Int, val top: Float, val bottom: Float, val baseline: Float, val left: Float, val width: Float, val ellipsis: Boolean,
     val rtl: Boolean = false, val runs: IntArray? = null, val runX: FloatArray? = null, val segs: Array<Seg>? = null,
-    val gapStart: Int = -1, val gapEnd: Int = -1, val gapW: Float = 0f,
+    val gapStart: Int = -1, val gapEnd: Int = -1, val gapW: Float = 0f, val extra: Float = 0f, val justifyFrom: Int = start,
+    val ascent: Float = 0f, val descent: Float = 0f,
 )
 
 internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, overflow: TextOverflow, private val maxWidth: Float) : PlatformParagraph {
     private val text = intr.text
+    private val lineStyle = intr.style.lineHeightStyle ?: LineHeightStyle.Default
     private val lines: List<Line>
     private val levels: ByteArray?
     override val didExceedMaxLines: Boolean
@@ -382,10 +562,7 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
         val limit = if (maxLines <= 0) Int.MAX_VALUE else maxLines
         didExceedMaxLines = breaks.size > limit
         val kept = breaks.take(limit)
-        val lh = intr.lineHeightPx
-        val ascent = -intr.runs.minOf { it.metrics.ascent }
-        val content = ascent + intr.runs.maxOf { it.metrics.descent }
-        val boxW = if (maxWidth.isFinite()) maxWidth else kept.maxOfOrNull { intr.width(it.first, it.third) } ?: 0f
+        val boxW = if (maxWidth.isFinite()) maxWidth else kept.maxOfOrNull { intr.inkWidth(it.first, it.third) + intr.indentAt(it.first) } ?: 0f
         val flags = when (intr.style.textDirection) {
             TextDirection.Ltr -> Bidi.DIRECTION_LEFT_TO_RIGHT
             TextDirection.Rtl -> Bidi.DIRECTION_RIGHT_TO_LEFT
@@ -393,29 +570,30 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
             else -> Bidi.DIRECTION_DEFAULT_LEFT_TO_RIGHT
         }
         val forcedRtl = flags == Bidi.DIRECTION_RIGHT_TO_LEFT || flags == Bidi.DIRECTION_DEFAULT_RIGHT_TO_LEFT
-        val lv = if (!forcedRtl && text.none { it >= '֐' }) null else ByteArray(text.length)
+        val lv = if (!forcedRtl && !needsBidi(text)) null else ByteArray(text.length)
         var para: Bidi? = null
         var paraStart = 0
         var paraEnd = 0
         val sideEllipsis = overflow == TextOverflow.StartEllipsis || overflow == TextOverflow.MiddleEllipsis
-        val baseAbove = (lh - content) / 2f + ascent
         var nextTop = 0f
         lines = kept.mapIndexed { i, (s, kEnd, ve) ->
             val last = didExceedMaxLines && i == kept.lastIndex
             val gap = if (last && sideEllipsis && limit == 1 && lv == null) sideGap(s, overflow == TextOverflow.StartEllipsis) else null
             val e = gap?.get(2) ?: kEnd
-            val ellipsize = last && (overflow == TextOverflow.Ellipsis || (sideEllipsis && limit == 1))
+            val ellipsize = last && (overflow == TextOverflow.Ellipsis || sideEllipsis)
             val vEnd = when {
                 gap != null -> gap[3]
                 ellipsize -> ellipsisEnd(s, ve)
                 else -> ve
             }
             val ew = if (gap != null) ellipsisWidth(gapRunOffset(s, gap[0], gap[1])) else if (ellipsize) ellipsisWidth(vEnd) else 0f
-            val w = if (gap != null) intr.width(s, gap[0]) + ew + intr.width(gap[1], vEnd) else intr.width(s, vEnd) + ew
+            val w = if (gap != null) intr.width(s, gap[0]) + ew + intr.inkWidth(gap[1], vEnd) else intr.inkWidth(s, vEnd) + ew
             val top = nextTop
-            val extents = placeholderExtents(s, vEnd, gap, lh, baseAbove)
-            val above = if (extents == null) baseAbove else extents[0]
-            val lineH = if (extents == null) lh else extents[0] + extents[1]
+            val metrics = lineExtents(s, kEnd, i == 0, i == kept.lastIndex)
+            val extents = placeholderExtents(s, vEnd, gap, metrics)
+            var above = extents?.get(0) ?: metrics[0]
+            var lineH = if (extents == null) metrics[0] + metrics[1] else extents[0] + extents[1]
+            shiftExtents(s, vEnd, above, lineH - above)?.let { above = it[0]; lineH = it[0] + it[1] }
             nextTop = top + lineH
             if (lv != null && (para == null || s > paraEnd)) {
                 paraStart = text.lastIndexOf('\n', s - 1) + 1
@@ -424,22 +602,93 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
             }
             val b = para
             val rtl = b != null && !b.baseIsLeftToRight()
+            val indent = intr.indentAt(s)
+            val room = boxW - indent
+            val start = if (rtl) 0f else indent
+            val justify = intr.align == TextAlign.Justify && lv == null && gap == null && !ellipsize && kEnd < text.length && text[kEnd - 1] != '\n'
+            val from = if (justify) firstInk(s, vEnd) else s
+            val spaces = if (justify) justifiable(from, vEnd) else 0
+            val extra = if (spaces > 0 && room > w) (room - w) / spaces else 0f
             val left = when (intr.align) {
-                TextAlign.Center -> (boxW - w) / 2f
-                TextAlign.Right -> boxW - w
-                TextAlign.End -> if (rtl) 0f else boxW - w
-                TextAlign.Left -> 0f
-                else -> if (rtl) boxW - w else 0f
+                TextAlign.Center -> start + (room - w) / 2f
+                TextAlign.Right -> start + room - w
+                TextAlign.End -> if (rtl) start else start + room - w
+                TextAlign.Left -> start
+                else -> if (rtl) start + room - w else start
             }
             val baseline = top + above
-            val line = if (gap != null) Line(s, e, vEnd, top, top + lineH, baseline, max(0f, left), w, true, rtl, gapStart = gap[0], gapEnd = gap[1], gapW = ew)
-            else Line(s, e, vEnd, top, top + lineH, baseline, max(0f, left), w, ellipsize, rtl)
+            val line = if (gap != null) {
+                Line(s, e, vEnd, top, top + lineH, baseline, max(start, left), w, true, rtl, gapStart = gap[0], gapEnd = gap[1], gapW = ew, ascent = metrics[2], descent = metrics[3])
+            } else {
+                Line(
+                    s, e, vEnd, top, top + lineH, baseline, max(start, left), if (extra > 0f) room else w, ellipsize, rtl, extra = extra, justifyFrom = from,
+                    ascent = metrics[2], descent = metrics[3],
+                )
+            }
             if (b == null || lv == null) line else bidiLine(line, b, paraStart, if (ellipsize) vEnd else min(e, paraEnd), ew, lv)
         }
         levels = lv
-        width = if (maxWidth.isFinite()) maxWidth else lines.maxOfOrNull { it.width } ?: 0f
-        height = lines.lastOrNull()?.bottom ?: lh
-        placeholderRects = placeholderRects(ascent, content - ascent)
+        width = if (maxWidth.isFinite()) maxWidth else lines.maxOfOrNull { it.width + intr.indentAt(it.start) } ?: 0f
+        height = lines.lastOrNull()?.bottom ?: intr.lineHeightPx
+        placeholderRects = placeholderRects()
+    }
+
+    private fun needsBidi(text: String): Boolean = text.any { it >= '֐' } && Bidi.requiresBidi(text.toCharArray(), 0, text.length)
+
+    private inline fun forLineRuns(s: Int, e: Int, block: (TextRun) -> Unit) {
+        val runs = intr.runs
+        var k = intr.runIndexAt(s)
+        var any = false
+        while (k < runs.size && runs[k].start < e) {
+            val run = runs[k++]
+            if (run.placeholder == null && run.end > s) {
+                any = true
+                block(run)
+            }
+        }
+        if (!any) block(intr.runAt(s))
+    }
+
+    private fun lineExtents(s: Int, e: Int, first: Boolean, last: Boolean): FloatArray {
+        var above = 0f
+        var below = 0f
+        var fontAscent = 0f
+        var fontDescent = 0f
+        var fitAbove = Float.NEGATIVE_INFINITY
+        var fitBelow = Float.NEGATIVE_INFINITY
+        val spec = intr.lineHeightSpec
+        val ratio = lineStyle.alignment.topRatio
+        forLineRuns(s, e) { run ->
+            val m = run.metrics
+            val a = -m.ascent + m.leading / 2f
+            val d = m.descent + m.leading / 2f
+            above = max(above, a)
+            below = max(below, d)
+            fontAscent = max(fontAscent, -m.ascent)
+            fontDescent = max(fontDescent, m.descent)
+            val h = a + d
+            if (!spec.isNaN() && h > 0f) {
+                fitAbove = max(fitAbove, if (ratio in 0f..1f) a + (spec - h) * ratio else a * spec / h)
+                fitBelow = max(fitBelow, if (ratio in 0f..1f) d + (spec - h) * (1f - ratio) else d * spec / h)
+            }
+        }
+        if (spec.isNaN() || fitAbove == Float.NEGATIVE_INFINITY) {
+            val natural = above + below
+            val half = (round(natural) - natural) / 2f
+            return floatArrayOf(above + half, below + half, fontAscent, fontDescent)
+        }
+        val mode = lineStyle.mode
+        val tall = spec > intr.baseSize
+        val padded = mode != LineHeightStyle.Mode.Tight
+        var top = fitAbove
+        var bottom = fitBelow
+        if (first && (if (tall) lineStyle.trim.trimsFirstLineTop else padded)) top = above
+        if (last && (if (tall) lineStyle.trim.trimsLastLineBottom else padded)) bottom = below
+        if ((mode == LineHeightStyle.Mode.Minimum || mode == LineHeightStyle.Mode.PerLine) && top + bottom < above + below) {
+            top = above
+            bottom = below
+        }
+        return floatArrayOf(top, bottom, fontAscent, fontDescent)
     }
 
     private fun sideGap(s: Int, start: Boolean): IntArray? {
@@ -448,18 +697,18 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
         val end = if (newline < 0) text.length else newline + 1
         var visible = if (newline < 0) text.length else newline
         while (visible > s && text[visible - 1].isWhitespace()) visible--
-        if (intr.width(s, visible) <= maxWidth) return null
+        if (intr.width(s, visible) <= avail(s)) return null
         var a = s
         if (!start) {
             val runFont = intr.runAt(s)
-            val half = (maxWidth - runFont.font.measureTextWidth(ELLIPSIS) * runFont.scaleX) / 2f
+            val half = (avail(s) - runFont.font.measureTextWidth(ELLIPSIS) * runFont.scaleX) / 2f
             while (a < visible) {
                 val next = nextBoundary(a)
                 if (intr.width(s, next) > half) break
                 a = next
             }
         }
-        val available = maxWidth - ellipsisWidth(gapRunOffset(s, a, a)) - intr.width(s, a)
+        val available = avail(s) - ellipsisWidth(gapRunOffset(s, a, a)) - intr.width(s, a)
         var b = a
         while (b < visible && intr.width(b, visible) > available) b = nextBoundary(b)
         return intArrayOf(a, b, end, visible)
@@ -473,14 +722,14 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
 
     private fun gapRunOffset(s: Int, gapStart: Int, gapEnd: Int) = if (gapStart <= s) gapEnd + 1 else gapStart
 
-    private fun placeholderExtents(s: Int, vEnd: Int, gap: IntArray?, lh: Float, baseAbove: Float): FloatArray? {
+    private fun placeholderExtents(s: Int, vEnd: Int, gap: IntArray?, metrics: FloatArray): FloatArray? {
         if (intr.placeholders.isEmpty()) return null
-        var above = baseAbove
-        var below = lh - baseAbove
+        var above = metrics[0]
+        var below = metrics[1]
         var boxed = 0f
         var boxAlign: PlaceholderVerticalAlign? = null
-        val ascent = -intr.runs.minOf { it.metrics.ascent }
-        val descent = intr.runs.maxOf { it.metrics.descent }
+        val ascent = metrics[2]
+        val descent = metrics[3]
         var any = false
         for (p in intr.placeholders) {
             if (!placeholderVisible(p.start, s, vEnd, gap)) continue
@@ -511,10 +760,40 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
         return floatArrayOf(above, below)
     }
 
+    private fun shiftExtents(s: Int, vEnd: Int, above: Float, below: Float): FloatArray? {
+        if (!intr.shifted) return null
+        var a = above
+        var b = below
+        var any = false
+        val runs = intr.runs
+        var k = intr.runIndexAt(s)
+        while (k < runs.size && runs[k].start < vEnd) {
+            val run = runs[k++]
+            if (run.shift == 0f || run.placeholder != null || run.end <= s) continue
+            any = true
+            a = max(a, -run.metrics.ascent - run.shift)
+            b = max(b, run.metrics.descent + run.shift)
+        }
+        return if (any) floatArrayOf(a, b) else null
+    }
+
+    private fun firstInk(s: Int, vEnd: Int): Int {
+        var i = s
+        while (i < vEnd && Character.isWhitespace(text[i])) i++
+        return i
+    }
+
+    private fun justifiable(from: Int, to: Int): Int = intr.spaces(from, to)
+
+    private fun stretched(l: Line, i: Int): Boolean = l.extra != 0f && i >= l.justifyFrom && i < l.visibleEnd && Character.isWhitespace(text[i])
+
+    private fun span(l: Line, a: Int, b: Int): Float =
+        intr.width(a, b) + if (l.extra == 0f || b <= a) 0f else l.extra * justifiable(max(a, l.justifyFrom), min(b, l.visibleEnd))
+
     private fun placeholderVisible(at: Int, s: Int, vEnd: Int, gap: IntArray?): Boolean =
         at in s until vEnd && (gap == null || at < gap[0] || at >= gap[1])
 
-    private fun placeholderRects(ascent: Float, descent: Float): List<Rect?> {
+    private fun placeholderRects(): List<Rect?> {
         val placeholders = intr.placeholders
         if (placeholders.isEmpty()) return emptyList()
         return placeholders.map { p ->
@@ -528,16 +807,16 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
                 PlaceholderVerticalAlign.Top -> l.top
                 PlaceholderVerticalAlign.Bottom -> l.bottom - h
                 PlaceholderVerticalAlign.Center -> (l.top + l.bottom - h) / 2f
-                PlaceholderVerticalAlign.TextTop -> l.baseline - ascent
-                PlaceholderVerticalAlign.TextBottom -> l.baseline + descent - h
-                else -> l.baseline + (descent - ascent) / 2f - h / 2f
+                PlaceholderVerticalAlign.TextTop -> l.baseline - l.ascent
+                PlaceholderVerticalAlign.TextBottom -> l.baseline + l.descent - h
+                else -> l.baseline + (l.descent - l.ascent) / 2f - h / 2f
             }
             Rect(box.left, top, box.right, top + h)
         }
     }
 
     private fun lineX(l: Line, offset: Int): Float = when {
-        l.gapStart < 0 || offset <= l.gapStart -> l.left + intr.width(l.start, offset)
+        l.gapStart < 0 || offset <= l.gapStart -> l.left + span(l, l.start, offset)
         offset < l.gapEnd -> l.left + intr.width(l.start, l.gapStart)
         else -> l.left + intr.width(l.start, l.gapStart) + l.gapW + intr.width(l.gapEnd, offset)
     }
@@ -546,7 +825,9 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
         val s = l.start
         val line = if (limit > s) para.createLineBidi(s - paraStart, limit - paraStart) else null
         if (!l.rtl && (line == null || line.isLeftToRight)) return l
-        if (line == null) return Line(s, l.end, l.visibleEnd, l.top, l.bottom, l.baseline, l.left, l.width, l.ellipsis, true, IntArray(0), FloatArray(0), emptyArray())
+        if (line == null) {
+            return Line(s, l.end, l.visibleEnd, l.top, l.bottom, l.baseline, l.left, l.width, l.ellipsis, true, IntArray(0), FloatArray(0), emptyArray(), ascent = l.ascent, descent = l.descent)
+        }
         val n = line.runCount
         val order = Array<Any>(n) { it }
         Bidi.reorderVisually(ByteArray(n) { line.getRunLevel(it).toByte() }, 0, order, 0, n)
@@ -574,12 +855,12 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
             }
             x += intr.width(rs, re)
         }
-        return Line(s, l.end, l.visibleEnd, l.top, l.bottom, l.baseline, l.left, l.width, l.ellipsis, l.rtl, runs, runX, segs.toTypedArray())
+        return Line(s, l.end, l.visibleEnd, l.top, l.bottom, l.baseline, l.left, l.width, l.ellipsis, l.rtl, runs, runX, segs.toTypedArray(), ascent = l.ascent, descent = l.descent)
     }
 
     private fun layout(): List<Triple<Int, Int, Int>> {
         val out = ArrayList<Triple<Int, Int, Int>>()
-        val it = BreakIterator.getLineInstance().also { b -> b.setText(text) }
+        val it = BreakIterator.getLineInstance(intr.locale).also { b -> b.setText(text) }
         var lineStart = 0
         var lineW = 0f
         var pos = it.first()
@@ -588,19 +869,19 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
         while (next != BreakIterator.DONE) {
             val segW = intr.width(pos, trimmedEnd(pos, next))
             val segFull = intr.width(pos, next)
-            if (lineW + segW > maxWidth + 0.01f && pos > lineStart) {
+            if (lineW + segW > avail(lineStart) + 0.01f && pos > lineStart) {
                 out += Triple(lineStart, pos, trimmedEnd(lineStart, pos))
                 lineStart = pos
                 lineW = 0f
             }
-            if (segW > maxWidth && pos == lineStart) {
+            if (segW > avail(lineStart) && pos == lineStart) {
                 var e = pos
                 var w = 0f
                 while (e < next) {
                     val step = min(next, e + Character.charCount(text.codePointAt(e)))
                     var advance = 0f
                     for (i in e until step) advance += intr.advances[i]
-                    if (w + advance > maxWidth && e > lineStart) {
+                    if (w + advance > avail(lineStart) && e > lineStart) {
                         out += Triple(lineStart, e, e)
                         lineStart = e
                         w = 0f
@@ -622,6 +903,8 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
         return out
     }
 
+    private fun avail(lineStart: Int): Float = maxWidth - intr.indentAt(lineStart)
+
     private fun ellipsisWidth(at: Int) = intr.runAt(max(0, at - 1)).let { it.font.measureTextWidth(ELLIPSIS) * it.scaleX }
 
     private fun ellipsisEnd(start: Int, end: Int): Int {
@@ -635,7 +918,7 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
                 run = r
                 ellipsis = r.font.measureTextWidth(ELLIPSIS) * r.scaleX
             }
-            if (intr.width(start, e) + ellipsis <= maxWidth) break
+            if (intr.inkWidth(start, e) + ellipsis <= avail(start)) break
             e--
         }
         return e
@@ -648,8 +931,14 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
     }
 
     private fun lineFor(offset: Int): Int {
-        for (i in lines.indices) if (offset < lines[i].end) return i
-        return lines.lastIndex.coerceAtLeast(0)
+        var lo = 0
+        var hi = lines.lastIndex
+        if (hi < 0) return 0
+        while (lo < hi) {
+            val mid = (lo + hi) ushr 1
+            if (offset < lines[mid].end) hi = mid else lo = mid + 1
+        }
+        return lo
     }
 
     override val minIntrinsicWidth get() = intr.minIntrinsicWidth
@@ -658,11 +947,8 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
     override val lastBaseline get() = lines.lastOrNull()?.baseline ?: 0f
     override val lineCount get() = lines.size
 
-    private val ascent get() = -intr.runs.minOf { it.metrics.ascent }
-    private val descent get() = intr.runs.maxOf { it.metrics.descent }
-
-    override fun getLineAscent(lineIndex: Int) = -ascent
-    override fun getLineDescent(lineIndex: Int) = descent
+    override fun getLineAscent(lineIndex: Int) = lines[lineIndex].top - lines[lineIndex].baseline
+    override fun getLineDescent(lineIndex: Int) = lines[lineIndex].bottom - lines[lineIndex].baseline
     override fun getLineLeft(lineIndex: Int) = lines[lineIndex].left
     override fun getLineRight(lineIndex: Int) = lines[lineIndex].left + lines[lineIndex].width
     override fun getLineTop(lineIndex: Int) = lines[lineIndex].top
@@ -733,8 +1019,14 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
     }
 
     override fun getLineForVerticalPosition(vertical: Float): Int {
-        for (i in lines.indices) if (vertical < lines[i].bottom) return i
-        return lines.lastIndex.coerceAtLeast(0)
+        var lo = 0
+        var hi = lines.lastIndex
+        if (hi < 0) return 0
+        while (lo < hi) {
+            val mid = (lo + hi) ushr 1
+            if (vertical < lines[mid].bottom) hi = mid else lo = mid + 1
+        }
+        return lo
     }
 
     override fun getOffsetForPosition(position: Offset): Int {
@@ -761,7 +1053,7 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
                 i = max(l.gapEnd, i + 1)
                 continue
             }
-            val a = intr.advances[i]
+            val a = intr.advances[i] + if (stretched(l, i)) l.extra else 0f
             if (a != 0f) {
                 if (position.x < x + a / 2f) return i
                 x += a
@@ -771,10 +1063,59 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
         return if (l === lines.last() || end < l.end) end else max(l.start, end - 1)
     }
 
+    private val charBreaks by lazy { BreakIterator.getCharacterInstance(intr.locale).also { it.setText(text) } }
+    private val wordBreaks by lazy { BreakIterator.getWordInstance(intr.locale).also { it.setText(text) } }
+
+    private fun segmentBounds(l: Line, a: Int, b: Int): Rect {
+        var left = Float.POSITIVE_INFINITY
+        var right = Float.NEGATIVE_INFINITY
+        for (i in a until b) {
+            val box = getBoundingBox(i)
+            if (box.right <= box.left) continue
+            left = min(left, box.left)
+            right = max(right, box.right)
+        }
+        return if (left > right) Rect(l.left, l.top, l.left, l.bottom) else Rect(left, l.top, right, l.bottom)
+    }
+
+    private fun isWord(a: Int, b: Int): Boolean {
+        for (i in a until b) if (Character.isLetterOrDigit(text[i])) return true
+        return false
+    }
+
+    private fun includedSegments(l: Line, rect: Rect, granularity: TextGranularity, inclusion: TextInclusionStrategy): Long {
+        val breaks = if (granularity == TextGranularity.Word) wordBreaks else charBreaks
+        val end = editEnd(l)
+        var first = -1
+        var last = -1
+        synchronized(breaks) {
+            var a = l.start
+            while (a < end) {
+                val next = breaks.following(a)
+                val b = if (next == BreakIterator.DONE) end else min(next, end)
+                if ((granularity != TextGranularity.Word || isWord(a, b)) && inclusion.isIncluded(segmentBounds(l, a, b), rect)) {
+                    if (first < 0) first = a
+                    last = b
+                }
+                a = b
+            }
+        }
+        return if (first < 0) -1L else (first.toLong() shl 32) or last.toLong()
+    }
+
     override fun getRangeForRect(rect: Rect, granularity: TextGranularity, inclusionStrategy: TextInclusionStrategy): TextRange {
-        val a = getOffsetForPosition(rect.topLeft)
-        val b = getOffsetForPosition(rect.bottomRight)
-        return if (a < b) TextRange(a, b) else if (b < a) TextRange(b, a) else TextRange.Zero
+        if (lines.isEmpty()) return TextRange.Zero
+        val from = getLineForVerticalPosition(rect.top)
+        val to = getLineForVerticalPosition(rect.bottom)
+        var start = -1
+        var end = -1
+        for (i in from..to) {
+            val found = includedSegments(lines[i], rect, granularity, inclusionStrategy)
+            if (found < 0L) continue
+            if (start < 0) start = (found ushr 32).toInt()
+            end = found.toInt()
+        }
+        return if (start < 0 || end <= start) TextRange.Zero else TextRange(start, end)
     }
 
     override fun getBoundingBox(offset: Int): Rect {
@@ -788,7 +1129,8 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
         }
         val x = getHorizontalPosition(offset, true)
         val hidden = l.gapStart >= 0 && offset >= l.gapStart && offset < l.gapEnd
-        return Rect(x, l.top, x + (if (hidden) 0f else intr.advances.getOrNull(offset) ?: 0f), l.bottom)
+        val advance = (intr.advances.getOrNull(offset) ?: 0f) + if (stretched(l, offset)) l.extra else 0f
+        return Rect(x, l.top, x + (if (hidden) 0f else advance), l.bottom)
     }
 
     override fun fillBoundingBoxes(range: TextRange, array: FloatArray, arrayStart: Int) {
@@ -800,11 +1142,13 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
     }
 
     override fun getWordBoundary(offset: Int): TextRange {
-        val it = BreakIterator.getWordInstance().also { b -> b.setText(text) }
+        val it = wordBreaks
         val o = offset.coerceIn(0, text.length)
-        val end = if (it.isBoundary(o) && o < text.length) it.following(o) else it.following(o.coerceAtMost(max(0, text.length - 1)))
-        val start = it.preceding(if (end == BreakIterator.DONE) text.length else end)
-        return TextRange(if (start == BreakIterator.DONE) 0 else start, if (end == BreakIterator.DONE) text.length else end)
+        synchronized(it) {
+            val end = if (it.isBoundary(o) && o < text.length) it.following(o) else it.following(o.coerceAtMost(max(0, text.length - 1)))
+            val start = it.preceding(if (end == BreakIterator.DONE) text.length else end)
+            return TextRange(if (start == BreakIterator.DONE) 0 else start, if (end == BreakIterator.DONE) text.length else end)
+        }
     }
 
     override fun getPathForRange(start: Int, end: Int): Path {
@@ -839,19 +1183,34 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
     override fun paint(canvas: Canvas, color: Color, shadow: Shadow?, textDecoration: TextDecoration?) =
         draw(canvas, if (color.isSpecified) color else null, 1f, shadow, textDecoration)
 
-    override fun paint(canvas: Canvas, color: Color, shadow: Shadow?, textDecoration: TextDecoration?, drawStyle: DrawStyle?, blendMode: BlendMode) =
-        draw(canvas, if (color.isSpecified) color else null, 1f, shadow, textDecoration)
+    override fun paint(canvas: Canvas, color: Color, shadow: Shadow?, textDecoration: TextDecoration?, drawStyle: DrawStyle?, blendMode: BlendMode) {
+        val c = if (color.isSpecified) color else null
+        draw(canvas, c, 1f, shadow, textDecoration, style = textPaint(drawStyle as? Stroke, blendMode, c?.alpha ?: 1f))
+    }
 
     override fun paint(canvas: Canvas, brush: Brush, alpha: Float, shadow: Shadow?, textDecoration: TextDecoration?, drawStyle: DrawStyle?, blendMode: BlendMode) {
         val a = if (alpha.isNaN()) 1f else alpha
-        if (brush is ChromaBrush) return drawChroma(canvas, brush, a, shadow, textDecoration)
-        if (brush is SolidColor || brush !is ShaderBrush) return draw(canvas, (brush as? SolidColor)?.value, a, shadow, textDecoration)
+        val stroke = drawStyle as? Stroke
+        if (brush is ChromaBrush) return drawChroma(canvas, brush, a, shadow, textDecoration, TextPaint(stroke, blendMode, a))
+        if (brush is SolidColor || brush !is ShaderBrush) {
+            val c = (brush as? SolidColor)?.value
+            return draw(canvas, c, a, shadow, textDecoration, style = textPaint(stroke, blendMode, (c?.alpha ?: 1f) * a))
+        }
         val shader = brush.createShader(Size(width, height)).platformShader
         val fade = (shader as? GradientShader)?.fade(a, true)
-        if (fade != null) return draw(canvas, Color.White, 1f, shadow, textDecoration, fade)
-        val fill = brushFill(brush, shader) ?: return draw(canvas, (shader as? GradientShader)?.let { Color(it.brush.sample(0.5f)) }, a, shadow, textDecoration)
-        draw(canvas, Color.White, a, shadow, textDecoration, fill = fill)
+        if (fade != null) return draw(canvas, Color.White, 1f, shadow, textDecoration, fade, style = textPaint(stroke, blendMode, a))
+        val fill = brushFill(brush, shader)
+        if (fill == null) {
+            val c = (shader as? GradientShader)?.let { Color(it.brush.sample(0.5f)) }
+            return draw(canvas, c, a, shadow, textDecoration, style = textPaint(stroke, blendMode, (c?.alpha ?: 1f) * a))
+        }
+        draw(canvas, Color.White, a, shadow, textDecoration, fill = fill, style = textPaint(stroke, blendMode, a))
     }
+
+    private class TextPaint(val stroke: Stroke?, val blend: BlendMode, val alpha: Float)
+
+    private fun textPaint(stroke: Stroke?, blend: BlendMode, alpha: Float): TextPaint? =
+        if (stroke == null && blend == BlendMode.SrcOver) null else TextPaint(stroke, blend, alpha)
 
     private var fillBrush: Brush? = null
     private var fillSize = Size.Zero
@@ -867,74 +1226,243 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
         return fill
     }
 
-    private fun draw(canvas: Canvas, color: Color?, alpha: Float, shadow: Shadow?, decoration: TextDecoration?, fade: PolyFade? = null, fill: PolyImageFill? = null) {
+    private fun draw(
+        canvas: Canvas, color: Color?, alpha: Float, shadow: Shadow?, decoration: TextDecoration?, fade: PolyFade? = null, fill: PolyImageFill? = null,
+        style: TextPaint? = null,
+    ) {
         FontManager.observedRevision.intValue
         (canvas as? PolyDrawCanvas)?.polyOp { pc ->
-            val r = pc.renderer
-            if (fill != null) {
-                val t = r as? PolyTessellator ?: return@polyOp drawLines(r, Color(fill.colors[0].argb), alpha, shadow, decoration, PASS_ALL)
-                drawLines(r, color, alpha, shadow, decoration, PASS_UNDER)
-                t.textFill(fill)
-                try {
-                    drawLines(r, color, alpha, shadow, decoration, PASS_OVER)
-                } finally {
-                    t.textFill(null)
-                }
-                return@polyOp
+            val stroke = style?.stroke
+            if (style == null || style.blend == BlendMode.SrcOver) return@polyOp drawStyled(pc.renderer, color, alpha, shadow, decoration, fade, fill, stroke)
+            pc.blendedText(style.blend, style.alpha) { forced ->
+                if (forced == null) drawStyled(pc.renderer, color, alpha, shadow, decoration, fade, fill, stroke)
+                else paintLines(pc.renderer, color, alpha, shadow, decoration, PASS_ALL, stroke, forced)
             }
-            if (fade == null) return@polyOp drawLines(r, color, alpha, shadow, decoration, PASS_ALL)
-            drawLines(r, color, alpha, shadow, decoration, PASS_UNDER)
-            r.saveLayerFade(fade)
-            drawLines(r, color, alpha, shadow, decoration, PASS_OVER)
-            r.restore()
         }
     }
 
-    private fun drawChroma(canvas: Canvas, brush: ChromaBrush, alpha: Float, shadow: Shadow?, decoration: TextDecoration?) {
+    private fun drawStyled(r: PolyRenderer, color: Color?, alpha: Float, shadow: Shadow?, decoration: TextDecoration?, fade: PolyFade?, fill: PolyImageFill?, stroke: Stroke?) {
+        if (fill != null) {
+            val t = r as? PolyTessellator ?: return paintLines(r, Color(fill.colors[0].argb), alpha, shadow, decoration, PASS_ALL, stroke)
+            paintLines(r, color, alpha, shadow, decoration, PASS_UNDER, stroke)
+            t.textFill(fill)
+            try {
+                paintLines(r, color, alpha, shadow, decoration, PASS_OVER, stroke, outer = fill)
+            } finally {
+                t.textFill(null)
+            }
+            return
+        }
+        if (fade == null) return paintLines(r, color, alpha, shadow, decoration, PASS_ALL, stroke)
+        paintLines(r, color, alpha, shadow, decoration, PASS_UNDER, stroke)
+        r.saveLayerFade(fade)
+        paintLines(r, color, alpha, shadow, decoration, PASS_OVER, stroke)
+        r.restore()
+    }
+
+    private fun paintLines(
+        r: PolyRenderer, color: Color?, alpha: Float, shadow: Shadow?, decoration: TextDecoration?, pass: Int, stroke: Stroke?, forced: Int? = null, outer: PolyImageFill? = null,
+    ) {
+        val plain = if (forced == null) r else TextPass(r, null, forced)
+        if (stroke == null) return drawLines(plain, color, alpha, shadow, decoration, pass, outer)
+        if (pass != PASS_OVER) drawLines(plain, color, alpha, shadow, decoration, PASS_UNDER, outer)
+        if (pass != PASS_UNDER) drawLines(TextPass(r, stroke, forced), color, alpha, shadow, decoration, PASS_OVER, outer)
+    }
+
+    private fun drawChroma(canvas: Canvas, brush: ChromaBrush, alpha: Float, shadow: Shadow?, decoration: TextDecoration?, style: TextPaint) {
         val pad = intr.lineHeightPx
         FontManager.observedRevision.intValue
         (canvas as? PolyDrawCanvas)?.polyOp { pc ->
-            pc.renderer.live(-pad, -pad, width + pad * 2f, height + pad * 2f, brush::argb) { r ->
-                drawLines(r, Color(brush.argb()), alpha, shadow, decoration, PASS_ALL)
+            pc.blendedText(style.blend, style.alpha) { forced ->
+                if (forced != null) paintLines(pc.renderer, Color(brush.argb()), alpha, shadow, decoration, PASS_ALL, style.stroke, forced)
+                else pc.renderer.live(-pad, -pad, width + pad * 2f, height + pad * 2f, brush::argb) { r ->
+                    paintLines(r, Color(brush.argb()), alpha, shadow, decoration, PASS_ALL, style.stroke)
+                }
             }
         }
     }
 
-    private fun drawLines(r: PolyRenderer, color: Color?, alpha: Float, shadow: Shadow?, decoration: TextDecoration?, pass: Int) {
-        for (l in lines) {
+    private fun drawLines(
+        r: PolyRenderer, color: Color?, alpha: Float, shadow: Shadow?, decoration: TextDecoration?, pass: Int, outer: PolyImageFill? = null, bake: Shadow? = null,
+    ) {
+        if (pass != PASS_OVER && bake == null) drawBlurredShadows(r, shadow)
+        for (index in lines.indices) {
+            val l = lines[index]
             var x = l.left
-            val segs = l.segs
+            val segs = l.segs ?: if (l.extra != 0f) justifiedSegs[index] else null
             if (segs != null) {
                 for (sg in segs) {
-                    drawRun(r, l, sg.run, sg.str, sg.x, sg.w, color, alpha, shadow, decoration, pass)
+                    drawRun(r, l, sg.run, sg.str, sg.x, sg.w, color, alpha, shadow, decoration, pass, outer, bake)
                     x = max(x, sg.x + sg.w)
                 }
                 if (l.rtl) x = l.left
             } else if (l.gapStart >= 0) {
-                x = drawRange(r, l, l.start, l.gapStart, x, color, alpha, shadow, decoration, pass)
-                if (pass != PASS_UNDER) drawEllipsis(r, l, intr.runAt(max(0, gapRunOffset(l.start, l.gapStart, l.gapEnd) - 1)), x, color, alpha)
-                x = drawRange(r, l, l.gapEnd, l.visibleEnd, x + l.gapW, color, alpha, shadow, decoration, pass)
-            } else x = drawRange(r, l, l.start, l.visibleEnd, x, color, alpha, shadow, decoration, pass)
-            if (l.ellipsis && l.gapStart < 0 && pass != PASS_UNDER) drawEllipsis(r, l, intr.runAt(max(0, l.visibleEnd - 1)), x, color, alpha)
+                x = drawRange(r, l, l.start, l.gapStart, x, color, alpha, shadow, decoration, pass, outer, bake)
+                if (pass == PASS_ALL || pass == PASS_OVER) drawEllipsis(r, l, intr.runAt(max(0, gapRunOffset(l.start, l.gapStart, l.gapEnd) - 1)), x, color, alpha)
+                x = drawRange(r, l, l.gapEnd, l.visibleEnd, x + l.gapW, color, alpha, shadow, decoration, pass, outer, bake)
+            } else x = drawRange(r, l, l.start, l.visibleEnd, x, color, alpha, shadow, decoration, pass, outer, bake)
+            if (l.ellipsis && l.gapStart < 0 && (pass == PASS_ALL || pass == PASS_OVER)) {
+                drawEllipsis(r, l, intr.runAt(max(0, l.visibleEnd - 1)), x - intr.kernAfter(l.visibleEnd - 1), color, alpha)
+            }
         }
     }
 
-    private fun drawRange(r: PolyRenderer, l: Line, from: Int, to: Int, x0: Float, color: Color?, alpha: Float, shadow: Shadow?, decoration: TextDecoration?, pass: Int): Float {
+    private fun drawRange(
+        r: PolyRenderer, l: Line, from: Int, to: Int, x0: Float, color: Color?, alpha: Float, shadow: Shadow?, decoration: TextDecoration?, pass: Int,
+        outer: PolyImageFill?, bake: Shadow?,
+    ): Float {
         var x = x0
         for (run in intr.runs) {
             val s = max(run.start, from)
             val e = min(run.end, to)
             if (s >= e) continue
             val w = intr.width(s, e)
-            drawRun(r, l, run, intr.glyphs.substring(s, e), x, w, color, alpha, shadow, decoration, pass)
+            drawRun(r, l, run, intr.glyphs.substring(s, e), x, w, color, alpha, shadow, decoration, pass, outer, bake)
             x += w
         }
         return x
     }
 
+    private val justifiedSegs: Array<Array<Seg>?> by lazy { Array(lines.size) { i -> lines[i].takeIf { it.extra != 0f }?.let(::justifiedSegs) } }
+
+    private fun justifiedSegs(l: Line): Array<Seg> {
+        val segs = ArrayList<Seg>()
+        var x = l.left
+        for (run in intr.runs) {
+            val s = max(run.start, l.start)
+            val e = min(run.end, l.visibleEnd)
+            if (s >= e) continue
+            var a = s
+            while (a < e) {
+                var b = a
+                while (b < e && !stretched(l, b)) b++
+                if (b < e) b++
+                val w = span(l, a, b)
+                segs += Seg(intr.glyphs.substring(a, b), x, w, run)
+                x += w
+                a = b
+            }
+        }
+        return segs.toTypedArray()
+    }
+
     private fun drawEllipsis(r: PolyRenderer, l: Line, run: TextRun, x: Float, color: Color?, alpha: Float) {
-        val base = run.spanColor.takeIf { it.isSpecified } ?: color ?: run.style.color.takeIf { it.isSpecified } ?: Color.Black
-        runText(r, run, ELLIPSIS, x, l.baseline, base.copy(alpha = base.alpha * alpha).toArgb(), false)
+        val base = runColor(run, color)
+        runText(r, run, ELLIPSIS, x, l.baseline + run.shift, base.copy(alpha = base.alpha * alpha).toArgb(), false)
+    }
+
+    private fun runColor(run: TextRun, color: Color?): Color {
+        val brush = run.spanBrush
+        if (brush != null) {
+            val fallback = when (brush) {
+                is ChromaBrush -> Color(brush.argb())
+                is ShaderBrush -> spanFill(brush)?.let { Color(it.colors[0].argb) }
+                else -> null
+            }
+            if (fallback != null) return fallback.copy(alpha = fallback.alpha * if (run.brushAlpha.isNaN()) 1f else run.brushAlpha.coerceIn(0f, 1f))
+        }
+        return run.spanColor.takeIf { it.isSpecified } ?: color ?: run.style.color.takeIf { it.isSpecified } ?: Color.Black
+    }
+
+    private val spanFills = HashMap<Brush, PolyImageFill>()
+    private var spanFillSize = Size.Zero
+
+    private fun spanFill(brush: ShaderBrush): PolyImageFill? {
+        if (brush is ChromaBrush) return null
+        val size = Size(width, height)
+        synchronized(spanFills) {
+            if (size != spanFillSize) {
+                spanFills.clear()
+                spanFillSize = size
+            }
+            spanFills[brush]?.let { return it }
+        }
+        val fill = ShaderRaster.fill(brush.createShader(size).platformShader, 0f, 0f, width, height, 1f, 1f) ?: return null
+        synchronized(spanFills) { if (size == spanFillSize) spanFills[brush] = fill }
+        return fill
+    }
+
+    private class ShadowBake(val color: Color, val blur: Float, val scale: Float, val revision: Int, val runs: BitSet, val placed: BlurPlacement)
+
+    private val shadowBakes = ArrayList<ShadowBake>()
+    private val bakeMaxLines = maxLines
+    private val bakeOverflow = overflow
+
+    private fun blurredShadow(run: TextRun, shadow: Shadow?): Shadow? {
+        if (run.placeholder != null) return null
+        val sh = run.spanShadow ?: shadow ?: run.style.shadow ?: return null
+        if (McFonts.isMinecraft(run.font.name) && !McGlyphs.available()) return null
+        return sh.takeIf { it.blurRadius > 0f && it.color.alpha > 0f && !McFonts.isShadow(it) }
+    }
+
+    private fun drawBlurredShadows(r: PolyRenderer, shadow: Shadow?) {
+        var done: ArrayList<Shadow>? = null
+        for (run in intr.runs) {
+            val sh = blurredShadow(run, shadow) ?: continue
+            if (done?.contains(sh) == true) continue
+            done = (done ?: ArrayList()).also { it += sh }
+            val p = shadowBake(r, sh, shadow) ?: continue
+            val pw = p.bitmap.width.toFloat()
+            val ph = p.bitmap.height.toFloat()
+            r.image(
+                p.bitmap, p.x + sh.offset.x, p.y + sh.offset.y, p.w, p.h, p.srcX / pw, p.srcY / ph, (p.srcX + p.srcW) / pw, (p.srcY + p.srcH) / ph, -1,
+                FilterQuality.Low,
+            )
+        }
+    }
+
+    private fun selects(runs: BitSet, sh: Shadow, shadow: Shadow?): Boolean {
+        val all = intr.runs
+        for (i in all.indices) if ((blurredShadow(all[i], shadow) == sh) != runs[i]) return false
+        return true
+    }
+
+    private fun selection(sh: Shadow, shadow: Shadow?): BitSet {
+        val all = intr.runs
+        val runs = BitSet(all.size)
+        for (i in all.indices) if (blurredShadow(all[i], shadow) == sh) runs.set(i)
+        return runs
+    }
+
+    private fun shadowBake(r: PolyRenderer, sh: Shadow, shadow: Shadow?): BlurPlacement? {
+        val device = r.deviceScale().takeIf { it.isFinite() && it > 0f } ?: 1f
+        val scale = (device * BAKE_STEPS).roundToInt().coerceIn(1, MAX_BAKE_SCALE * BAKE_STEPS) / BAKE_STEPS.toFloat()
+        val revision = FontManager.revision
+        synchronized(shadowBakes) {
+            shadowBakes.firstOrNull {
+                it.color == sh.color && it.blur == sh.blurRadius && it.scale == scale && it.revision == revision && selects(it.runs, sh, shadow)
+            }?.let { return it.placed }
+        }
+        val runs = selection(sh, shadow)
+        val key = SharedShadowBakes.Key(intr, bakeMaxLines, bakeOverflow, maxWidth, sh.color, sh.blurRadius, runs, scale, revision)
+        SharedShadowBakes.get(key)?.let { shared ->
+            remember(sh, scale, revision, runs, shared)
+            return shared
+        }
+        val pad = max(intr.lineHeightPx, sh.blurRadius * 3f)
+        val w = width + pad * 2f
+        val h = height + pad * 2f
+        if (!(w > 0f && h > 0f) || w.isInfinite() || h.isInfinite()) return null
+        val k = min(scale, sqrt(MAX_BAKE_PIXELS / (w * h)))
+        val bw = ceil(w * k).toInt().coerceAtLeast(1)
+        val bh = ceil(h * k).toInt().coerceAtLeast(1)
+        val image = PolyGraphics.createImageBitmap(bw, bh, ImageBitmapConfig.Argb8888, true, ColorSpaces.Srgb) as PolyImageBitmap
+        val baker = (PolyGraphics.createCanvas(image) as PolyCanvas).renderer
+        baker.scale(k, k)
+        baker.translate(pad, pad)
+        drawLines(baker, null, 1f, shadow, null, PASS_SHADOW, bake = sh)
+        val placed = placeBlur(image.bitmap, sh.blurRadius, 0f, 0f, bw.toFloat(), bh.toFloat(), -pad, -pad, bw / k, bh / k)
+            ?: BlurPlacement(image.bitmap, 0f, 0f, bw.toFloat(), bh.toFloat(), -pad, -pad, bw / k, bh / k)
+        SharedShadowBakes.put(key, placed)
+        remember(sh, scale, revision, runs, placed)
+        return placed
+    }
+
+    private fun remember(sh: Shadow, scale: Float, revision: Int, runs: BitSet, placed: BlurPlacement) {
+        synchronized(shadowBakes) {
+            shadowBakes += ShadowBake(sh.color, sh.blurRadius, scale, revision, runs, placed)
+            if (shadowBakes.size > MAX_SHADOW_BAKES) shadowBakes.removeAt(0)
+        }
     }
 
     private fun runText(r: PolyRenderer, run: TextRun, str: String, x: Float, baseline: Float, color: Int, mcShadow: Boolean) {
@@ -1002,9 +1530,17 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
         if (segStart < str.length) r.text(str.substring(segStart), segX, baseline, color, run.font, tracking, skew)
     }
 
-    private fun drawRun(r: PolyRenderer, l: Line, run: TextRun, str: String, x: Float, w: Float, color: Color?, alpha: Float, shadow: Shadow?, decoration: TextDecoration?, pass: Int) {
+    private fun drawRun(
+        r: PolyRenderer, l: Line, run: TextRun, str: String, x: Float, w: Float, color: Color?, alpha: Float, shadow: Shadow?, decoration: TextDecoration?, pass: Int,
+        outer: PolyImageFill? = null, bake: Shadow? = null,
+    ) {
         if (run.placeholder != null) return
-        val base = run.spanColor.takeIf { it.isSpecified } ?: color ?: run.style.color.takeIf { it.isSpecified } ?: Color.Black
+        val baseline = l.baseline + run.shift
+        if (pass == PASS_SHADOW) {
+            if (bake != null && blurredShadow(run, shadow) == bake) runText(r, run, str, x, baseline, bake.color.toArgb(), false)
+            return
+        }
+        val base = runColor(run, color)
         val c = base.copy(alpha = base.alpha * alpha).toArgb()
         val sh = run.spanShadow ?: shadow ?: run.style.shadow
         val mcShadow = McFonts.isShadow(sh)
@@ -1013,19 +1549,29 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
             if (run.style.background.isSpecified && run.style.background.alpha > 0f) r.rect(x, l.top, w, l.bottom - l.top, run.style.background.toArgb(), 0f)
             val o = McFonts.scale(run.font)
             when {
-                mcShadow && mc -> if (pass == PASS_UNDER) runText(r, run, str, x + o, l.baseline + o, McFonts.shadowArgb(c), false)
-                mcShadow -> runText(r, run, str, x + o, l.baseline + o, McFonts.shadowArgb(c), false)
-                sh != null && sh != Shadow.None && sh.color.alpha > 0f -> runText(r, run, str, x + sh.offset.x, l.baseline + sh.offset.y, sh.color.toArgb(), false)
+                mcShadow && mc -> if (pass == PASS_UNDER) runText(r, run, str, x + o, baseline + o, McFonts.shadowArgb(c), false)
+                mcShadow -> runText(r, run, str, x + o, baseline + o, McFonts.shadowArgb(c), false)
+                sh != null && sh != Shadow.None && sh.color.alpha > 0f && blurredShadow(run, shadow) == null ->
+                    runText(r, run, str, x + sh.offset.x, baseline + sh.offset.y, sh.color.toArgb(), false)
             }
         }
         if (pass == PASS_UNDER) return
-        runText(r, run, str, x, l.baseline, c, mc && mcShadow && pass == PASS_ALL)
-        val deco = run.spanDecoration ?: decoration ?: run.style.textDecoration
-        if (deco != null) {
-            val m = run.metrics
-            val t = max(1f, m.underlineThickness)
-            if (TextDecoration.Underline in deco) r.rect(x, l.baseline + m.underlinePosition, w, t, c, 0f)
-            if (TextDecoration.LineThrough in deco) r.rect(x, l.baseline + m.strikeoutPosition, w, max(1f, m.strikeoutThickness), c, 0f)
+        val brush = run.spanBrush
+        val t = tessellatorOf(r)
+        val fill = if (t != null && brush is ShaderBrush) spanFill(brush) else null
+        val ink = if (fill == null) c else Color.White.copy(alpha = alpha * if (run.brushAlpha.isNaN()) 1f else run.brushAlpha.coerceIn(0f, 1f)).toArgb()
+        if (fill != null) t?.textFill(fill)
+        try {
+            runText(r, run, str, x, baseline, ink, mc && mcShadow && pass == PASS_ALL)
+            val deco = run.spanDecoration ?: decoration ?: run.style.textDecoration
+            if (deco != null) {
+                val m = run.metrics
+                val th = max(1f, m.underlineThickness)
+                if (TextDecoration.Underline in deco) r.rect(x, baseline + m.underlinePosition, w, th, ink, 0f)
+                if (TextDecoration.LineThrough in deco) r.rect(x, baseline + m.strikeoutPosition, w, max(1f, m.strikeoutThickness), ink, 0f)
+            }
+        } finally {
+            if (fill != null) t?.textFill(outer)
         }
     }
 
@@ -1055,6 +1601,11 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
         const val PASS_ALL = 0
         const val PASS_UNDER = 1
         const val PASS_OVER = 2
+        const val PASS_SHADOW = 3
+        const val BAKE_STEPS = 4
+        const val MAX_BAKE_SCALE = 8
+        const val MAX_BAKE_PIXELS = 1048576f
+        const val MAX_SHADOW_BAKES = 4
         const val ELLIPSIS = "…"
         const val OPAQUE = -0x1000000
     }

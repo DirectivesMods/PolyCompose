@@ -21,6 +21,7 @@ object McFontService {
     fun init() {
         installEngines()
         //? if >= 1.21.11 {
+        McResourceFont.initGlyphs()
         McFontQueue.measureWidth = { text, scale -> Minecraft.getInstance().font.width(text) * scale }
         McFontQueue.measureLiteralWidth = { text, scale ->
             Minecraft.getInstance().font.width(FormattedCharSequence.forward(text, Style.EMPTY)) * scale

@@ -116,6 +116,7 @@ internal object McResourceFont {
 
     @Volatile private var font: Font? = null
     @Volatile private var requested = -1
+    @Volatile private var wanted = false
     private val generation = AtomicInteger()
 
     fun init() {
@@ -125,6 +126,17 @@ internal object McResourceFont {
         HostEvents.onResourcesReloaded(::reload)
         // vanilla applies font option changes without a resource reload
         HostEvents.onClientTick { if (requested != fontOptions()) reload() }
+    }
+
+    fun initGlyphs() {
+        McGlyphs.source = { cp -> font?.glyph(cp) ?: demand() }
+        HostEvents.onResourcesReloaded { if (wanted) reload() }
+        HostEvents.onClientTick { if (wanted && requested != fontOptions()) reload() }
+    }
+
+    private fun demand(): McGlyph? {
+        if (!wanted) wanted = true
+        return null
     }
 
     private fun reload() {
