@@ -99,7 +99,7 @@ import org.polyfrost.compose.minecraft.mixin.render.GuiRendererAccessor
 
 //? if = 1.8.9 {
 /*import net.minecraft.client.render.Window
-import org.lwjgl.opengl.GL30
+import net.minecraft.client.render.platform.GLX
 *///?}
 
 //? if > 1.8.9 {
@@ -460,13 +460,7 @@ object GlHost {
     }
 
     //? if = 1.8.9 {
-    /*fun mainDrawFbo(): Int {
-        val previous = GL11.glGetInteger(GL30.GL_FRAMEBUFFER_BINDING)
-        client.mainRenderTarget.bindWrite(false)
-        val fbo = GL11.glGetInteger(GL30.GL_FRAMEBUFFER_BINDING)
-        if (fbo != previous) GlFbo.bind(GL30.GL_FRAMEBUFFER, previous)
-        return fbo
-    }
+    /*fun mainDrawFbo(): Int = if (GLX.useFbo()) client.mainRenderTarget.frameBufferId else 0
 
     fun flushLegacyBatches() {
         GlStateManager.pushMatrix()
