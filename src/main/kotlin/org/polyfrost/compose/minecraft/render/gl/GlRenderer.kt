@@ -703,7 +703,7 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
 
         fun segments(lives: List<Live>): List<GlProgram.Segment> {
             if (lives.isEmpty()) return emptyList()
-            return (liveRenderer ?: GlRenderer(true).also { liveRenderer = it }).replay(lives)
+            return (liveRenderer?.takeIf { it.matches() } ?: GlRenderer(true).also { liveRenderer = it }).replay(lives)
         }
 
         private val transientGroups = ArrayList<Group>()
