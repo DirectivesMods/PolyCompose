@@ -449,9 +449,10 @@ private object Intrinsics {
         text: String, style: TextStyle, annotations: List<AnnotatedString.Range<out AnnotatedString.Annotation>>,
         placeholders: List<AnnotatedString.Range<Placeholder>>, density: Density, resolver: FontFamily.Resolver,
     ): PolyIntrinsics {
-        val key = Key(text, style, annotations, placeholders, density, resolver, FontManager.revision)
+        val fixed = Density(density.density, density.fontScale)
+        val key = Key(text, style, annotations, placeholders, fixed, resolver, FontManager.revision)
         synchronized(cache) { cache[key] }?.let { return it }
-        val made = PolyIntrinsics(text, style, annotations, placeholders, density, resolver)
+        val made = PolyIntrinsics(text, style, annotations, placeholders, fixed, resolver)
         synchronized(cache) { cache[key] = made }
         return made
     }
