@@ -87,6 +87,15 @@ kotlin {
     }
 }
 
+tasks.named("checkKotlinAbi") {
+    // otherwise the compile finalizer fails the build before updateKotlinAbi gets to run
+    mustRunAfter("updateKotlinAbi")
+}
+
+tasks.named<KotlinCompile>("compileKotlin") {
+    finalizedBy("checkKotlinAbi")
+}
+
 tasks.named<KotlinCompile>("compileTestKotlin") {
     compilerOptions.freeCompilerArgs.add("-Xjspecify-annotations=ignore")
 }
