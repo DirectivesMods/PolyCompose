@@ -8,6 +8,7 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 //? if > 1.8.9 {
@@ -21,6 +22,8 @@ import org.polyfrost.compose.backend.drawPoly
 import org.polyfrost.compose.composables.NodeCanvas
 import org.polyfrost.compose.composables.PolyModifier
 import org.polyfrost.compose.composables.size
+import org.polyfrost.compose.host.LocalContentScale
+import org.polyfrost.compose.minecraft.platform.McWindow
 import org.polyfrost.compose.render.RenderContext
 
 object McItemIcons {
@@ -47,6 +50,12 @@ object McItemIcons {
     @JvmStatic
     fun requestAvailability() {
         McItemAtlas.requestAvailability()
+    }
+
+    /** Renders icons needed by HUD consumers before the HUD dirty gate. */
+    @JvmStatic
+    fun renderPending() {
+        McItemAtlas.renderAll()
     }
 
     @JvmStatic
@@ -88,6 +97,8 @@ fun McItemIcon(
     alpha: Float = 1f,
 ) {
     val handle = rememberItemIconHandle(stack, decorations)
+    val density = LocalDensity.current
+    SideEffect { McItemAtlas.requestSize(handle, with(density) { size.toPx() }) }
     Box(
         modifier
             .size(size)
@@ -129,6 +140,8 @@ fun NodeMcItemIcon(
     alpha: Float = 1f,
 ) {
     val handle = rememberItemIconHandle(stack, decorations)
+    val scale = LocalContentScale.current
+    SideEffect { McItemAtlas.requestSize(handle, size * McWindow.guiScale() * scale) }
     val revision = handle.revision
     val available = McItemIcons.available
     val onDraw: RenderContext.(Float, Float, Float, Float) -> Unit = remember(handle, revision, available, decorations, countOverride, alpha) {
