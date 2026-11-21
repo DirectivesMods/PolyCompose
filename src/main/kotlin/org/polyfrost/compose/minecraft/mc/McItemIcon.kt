@@ -131,7 +131,7 @@ fun NodeMcItemIcon(
     val handle = rememberItemIconHandle(stack, decorations)
     val revision = handle.revision
     val available = McItemIcons.available
-    val onDraw: RenderContext.(Float, Float, Float, Float) -> Unit = remember(handle, revision, available, decorations, countOverride, alpha) {
+    val onDraw: RenderContext.(Float, Float, Float, Float) -> Unit = remember(handle, stack, revision, available, decorations, countOverride, alpha) {
         { x, y, w, h ->
             if (available) {
                 handle.draw(this, x, y, w, h, alpha)
