@@ -12,8 +12,7 @@ internal object MinecraftKeyboardAdapter {
     fun keyLocation(bindingKey: Int): Int = when (bindingKey) {
         InputConstants.KEY_RSHIFT, InputConstants.KEY_RCONTROL, InputConstants.KEY_RALT, McKeys.RIGHT_SUPER -> KeyEvent.KEY_LOCATION_RIGHT
         InputConstants.KEY_LSHIFT, InputConstants.KEY_LCONTROL, InputConstants.KEY_LALT, McKeys.LEFT_SUPER -> KeyEvent.KEY_LOCATION_LEFT
-        InputConstants.KEY_NUMPADENTER -> KeyEvent.KEY_LOCATION_NUMPAD
-        else -> KeyEvent.KEY_LOCATION_STANDARD
+        else -> if (McKeys.isNumpad(bindingKey)) KeyEvent.KEY_LOCATION_NUMPAD else KeyEvent.KEY_LOCATION_STANDARD
     }
 
     fun isModifier(bindingKey: Int): Boolean = keyLocation(bindingKey).let {
@@ -43,6 +42,19 @@ internal object MinecraftKeyboardAdapter {
         SDLK_LGUI, SDLK_RGUI -> KeyEvent.VK_META
         SDLK_LALT, SDLK_RALT -> KeyEvent.VK_ALT
         in SDLK_F1..SDLK_F12 -> KeyEvent.VK_F1 + (shortcutKey - SDLK_F1)
+        in SDLK_F13..SDLK_F24 -> KeyEvent.VK_F13 + (shortcutKey - SDLK_F13)
+        in SDLK_KP_1..SDLK_KP_9 -> KeyEvent.VK_NUMPAD1 + (shortcutKey - SDLK_KP_1)
+        SDLK_KP_0 -> KeyEvent.VK_NUMPAD0
+        SDLK_KP_PERIOD -> KeyEvent.VK_DECIMAL
+        SDLK_KP_DIVIDE -> KeyEvent.VK_DIVIDE
+        SDLK_KP_MULTIPLY -> KeyEvent.VK_MULTIPLY
+        SDLK_KP_MINUS -> KeyEvent.VK_SUBTRACT
+        SDLK_KP_PLUS -> KeyEvent.VK_ADD
+        SDLK_KP_EQUALS -> KeyEvent.VK_EQUALS
+        SDLK_PRINTSCREEN -> KeyEvent.VK_PRINTSCREEN
+        SDLK_SCROLLLOCK -> KeyEvent.VK_SCROLL_LOCK
+        SDLK_NUMLOCKCLEAR -> KeyEvent.VK_NUM_LOCK
+        SDLK_PAUSE -> KeyEvent.VK_PAUSE
         else -> if ((shortcutKey and (SDLK_SCANCODE_MASK or SDLK_EXTENDED_MASK)) == 0) {
             KeyEvent.getExtendedKeyCodeForChar(shortcutKey)
         } else {
@@ -71,7 +83,7 @@ internal object MinecraftKeyboardAdapter {
         in InputConstants.KEY_F1..InputConstants.KEY_F12 -> KeyEvent.VK_F1 + (shortcutKey - InputConstants.KEY_F1)
         in InputConstants.KEY_0..InputConstants.KEY_9 -> KeyEvent.VK_0 + (shortcutKey - InputConstants.KEY_0)
         in InputConstants.KEY_A..InputConstants.KEY_Z -> KeyEvent.VK_A + (shortcutKey - InputConstants.KEY_A)
-        else -> KeyEvent.VK_UNDEFINED
+        else -> GlfwKeyTable.toAwt(shortcutKey)
         *///?}
     }
 }

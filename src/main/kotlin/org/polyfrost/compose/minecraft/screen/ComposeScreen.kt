@@ -18,20 +18,15 @@ import androidx.compose.ui.input.key.KeyEvent as ComposeKeyEvent
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.pointer.PointerButton
 import androidx.compose.ui.input.pointer.PointerEventType
-import androidx.compose.ui.platform.ClipEntry
-import androidx.compose.ui.platform.Clipboard
-import androidx.compose.ui.platform.ClipboardManager
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.scene.ComposeScene
-import androidx.compose.ui.text.AnnotatedString
 import com.mojang.blaze3d.platform.InputConstants
 //? if >= 26.3
 import org.lwjgl.sdl.SDLKeyboard.SDL_GetKeyFromScancode
 import java.awt.Component
-import java.awt.datatransfer.StringSelection
-import java.awt.datatransfer.Transferable
 import java.awt.event.InputEvent
 import java.awt.event.KeyEvent
 import java.util.Collections
@@ -51,16 +46,17 @@ import org.polyfrost.compose.host.HostErrors
 import org.polyfrost.compose.host.KeyState
 import org.polyfrost.compose.host.LocalUiOversample
 import org.polyfrost.compose.host.LocalComposeOptions
-import org.polyfrost.compose.host.LocalWheelRouter
 import org.polyfrost.compose.host.SceneKind
-import org.polyfrost.compose.host.WheelRouter
 import org.polyfrost.compose.minecraft.compat.controlify.ControllerBridge
 import org.polyfrost.compose.minecraft.compat.controlify.FieldPreview
 import org.polyfrost.compose.minecraft.compat.controlify.KeyboardPreview
 import org.polyfrost.compose.minecraft.compat.controlify.SceneFocus
 import org.polyfrost.compose.minecraft.compat.controlify.SceneSemantics
-import org.polyfrost.compose.minecraft.platform.HostClipboard
 import org.polyfrost.compose.minecraft.platform.HostEvents
+import org.polyfrost.compose.minecraft.platform.HostUriHandler
+import org.polyfrost.compose.minecraft.platform.SystemClipboard
+import org.polyfrost.compose.minecraft.platform.SystemClipboardManager
+import org.polyfrost.compose.minecraft.platform.McKeys
 import org.polyfrost.compose.minecraft.platform.McScreens
 import org.polyfrost.compose.minecraft.platform.McWindow
 import org.polyfrost.compose.minecraft.platform.OperatingSystem
@@ -115,55 +111,6 @@ import org.polyfrost.compose.minecraft.render.gl.StoredGLState
 *///?}
 
 private val LOGGER = LogManager.getLogger("PolyCompose/Compose")
-
-@Suppress("DEPRECATION")
-private object SystemClipboardManager : ClipboardManager {
-    override fun getText(): AnnotatedString? {
-        return try {
-            val data = HostClipboard.getString() ?: return null
-            AnnotatedString(data)
-        } catch (t: Throwable) {
-            HostErrors.warn("Failed to read the clipboard", t, LOGGER)
-            null
-        }
-    }
-
-    override fun setText(annotatedString: AnnotatedString) {
-        try {
-            HostClipboard.setString(annotatedString.text)
-        } catch (t: Throwable) {
-            HostErrors.warn("Failed to write the clipboard", t, LOGGER)
-        }
-    }
-
-    override fun hasText(): Boolean {
-        return true
-    }
-}
-
-private object SystemClipboard : Clipboard {
-    @Suppress("OVERRIDE_DEPRECATION")
-    override val nativeClipboard: Any = Unit
-
-    @OptIn(ExperimentalComposeUiApi::class)
-    override suspend fun getClipEntry(): ClipEntry? {
-        val text = HostClipboard.getString() ?: return null
-        return ClipEntry(StringSelection(text))
-    }
-
-    @OptIn(ExperimentalComposeUiApi::class)
-    override suspend fun setClipEntry(clipEntry: ClipEntry?) {
-        if (clipEntry == null) return
-        try {
-            val transferable = clipEntry.nativeClipEntry as? Transferable
-            if (transferable != null) {
-                HostClipboard.setTransferable(transferable)
-            }
-        } catch (t: Throwable) {
-            HostErrors.warn("Failed to write the clipboard", t, LOGGER)
-        }
-    }
-}
 
 @OptIn(InternalComposeUiApi::class)
 abstract class ComposeScreen(
@@ -289,7 +236,7 @@ abstract class ComposeScreen(
     }
 
     private fun createScene(): SceneHandle {
-        val sceneContext = SceneContext { showing }
+        val sceneContext = SceneContext({ showing }, ::scaledDensity)
         val semantics = if (ControllerBridge.tracksSemantics) SceneSemantics() else null
         val handle = SceneHandle.create(semantics?.wrap(sceneContext) ?: sceneContext, options, frames.onInvalidation) { sceneDirty = true }
         sceneContextOrNull = sceneContext
@@ -379,9 +326,9 @@ abstract class ComposeScreen(
             CompositionLocalProvider(
                 LocalClipboardManager provides SystemClipboardManager,
                 LocalClipboard provides SystemClipboard,
+                LocalUriHandler provides HostUriHandler,
                 LocalUiOversample provides uiOversample.floatValue,
-                scrollConfig.provided(),
-                LocalWheelRouter provides wheelRouter,
+                *wheel.provided(),
                 LocalComposeOptions provides options,
                 LocalTickActivity provides tickActivity,
             ) {
@@ -532,11 +479,28 @@ abstract class ComposeScreen(
         return held
     }
 
+    private var openingLink = false
+
+    internal fun openCovered(open: () -> Unit) {
+        if (!showing || McScreens.current() !== this) {
+            open()
+            return
+        }
+        openingLink = true
+        try {
+            open()
+        } finally {
+            openingLink = false
+        }
+        val overlay = McScreens.current()
+        if (overlay != null && overlay !== this && showing) coverWith(overlay)
+    }
+
     override fun removed() {
         val cover = pendingCover
         if (cover != null && showing) {
             coverWith(cover)
-        } else {
+        } else if (!(openingLink && showing)) {
             uncover()
             hide()
         }
@@ -551,8 +515,8 @@ abstract class ComposeScreen(
         showing = false
         sceneContextOrNull?.sync()
         ComposeSceneContextImpl.resetPointerIcon()
-        wheelRouter.stopFallback()
-        releaseHeldButtons()
+        wheel.stop()
+        releaseHeldInput()
         consumedButtons.clear()
         pointerInside = false
         PolyGlassLight.reset()
@@ -565,8 +529,8 @@ abstract class ComposeScreen(
         //? if > 1.8.9 && < 1.21.11
         //GlHost.coverScreen = overlay
         ComposeSceneContextImpl.resetPointerIcon()
-        wheelRouter.stopFallback()
-        releaseHeldButtons()
+        wheel.stop()
+        releaseHeldInput()
         if (coverWatch == null) coverWatch = HostEvents.onClientTick { checkCover() }
     }
 
@@ -677,7 +641,7 @@ abstract class ComposeScreen(
         val metricsChanged = syncSceneMetrics()
 
         val focused = (McWindow.isActive() || testPointer != null) && coveredBy == null
-        if (wasFocused && !focused) releaseHeldButtons()
+        if (wasFocused && !focused) releaseHeldInput()
         wasFocused = focused
         if (focused) {
             val pointerPosition = pointerPosition()
@@ -697,7 +661,7 @@ abstract class ComposeScreen(
             withScene { it.invalidatePositionInWindow() }
         }
 
-        wheelRouter.glideFrame(glideStep)
+        withScene { wheel.frame(it, scaledDensity(), wheelPointer) }
 
         tickActivity.resume()
         val profile = if (FrameProfiler.enabled) profileHost() else null
@@ -736,7 +700,12 @@ abstract class ComposeScreen(
 
     private fun trackPointer(pointer: Offset) {
         val inside = pointer.x >= 0f && pointer.y >= 0f && pointer.x < lastSceneW && pointer.y < lastSceneH
-        if (inside) notifyPointer(pointer) else if (pointerInside) notifyPointer(null)
+        if (inside) {
+            notifyPointer(pointer)
+        } else if (pointerInside) {
+            notifyPointer(null)
+            withScene { it.sendPointerEvent(PointerEventType.Exit, pointer) }
+        }
         pointerInside = inside
     }
 
@@ -941,6 +910,23 @@ abstract class ComposeScreen(
 
     private var wasFocused = true
 
+    private fun releaseHeldInput() {
+        releaseHeldButtons()
+        if (hasLastPointer) {
+            val pointer = lastPointer
+            withScene { it.sendPointerEvent(PointerEventType.Exit, pointer) }
+            hasLastPointer = false
+        }
+        releaseHeldKeys()
+    }
+
+    private fun releaseHeldKeys() {
+        if (sentKeys.isEmpty()) return
+        val held = sentKeys.toList()
+        sentKeys.clear()
+        for ((bindingKey, shortcutKey) in held) sendKeyReleasedEvent(bindingKey, shortcutKey, 0)
+    }
+
     private fun releaseHeldButtons() {
         withScene { it.cancelPointerInput() }
         tapClean = false
@@ -949,6 +935,8 @@ abstract class ComposeScreen(
         sendMouseButtonEvent(PointerEventType.Release, InputConstants.MOUSE_BUTTON_LEFT)
         sendMouseButtonEvent(PointerEventType.Release, InputConstants.MOUSE_BUTTON_RIGHT)
         sendMouseButtonEvent(PointerEventType.Release, InputConstants.MOUSE_BUTTON_MIDDLE)
+        sendMouseButtonEvent(PointerEventType.Release, McKeys.MOUSE_BACK)
+        sendMouseButtonEvent(PointerEventType.Release, McKeys.MOUSE_FORWARD)
     }
 
     private fun sendMouseButtonEvent(type: PointerEventType, button: Int) {
@@ -956,30 +944,16 @@ abstract class ComposeScreen(
             InputConstants.MOUSE_BUTTON_LEFT -> PointerButton.Primary
             InputConstants.MOUSE_BUTTON_RIGHT -> PointerButton.Secondary
             InputConstants.MOUSE_BUTTON_MIDDLE -> PointerButton.Tertiary
+            McKeys.MOUSE_BACK -> PointerButton.Back
+            McKeys.MOUSE_FORWARD -> PointerButton.Forward
             else -> return
         }
-        if (type == PointerEventType.Press) wheelRouter.stopFallback()
+        if (type == PointerEventType.Press) wheel.stop()
         withScene { it.sendPointerEvent(type, button = pointerButton, position = pointerPosition()) }
     }
 
-    private val wheelRouter = WheelRouter { options.reducedMotion }
-    private val scrollConfig = FixedScrollConfig(wheelRouter)
-    private var glideAnchor = Offset.Zero
-    private var glideCarry = Offset.Zero
-
-    private val glideStep: (Offset) -> Unit = { step ->
-        glideCarry += step
-        val density = scaledDensity()
-        if (abs(glideCarry.x * density) >= 1f || abs(glideCarry.y * density) >= 1f) {
-            val carried = glideCarry
-            glideCarry = Offset.Zero
-            val pointer = pointerPosition()
-            withScene {
-                it.sendPointerEvent(PointerEventType.Scroll, glideAnchor, scrollDelta = carried)
-                if (pointer != glideAnchor) it.sendPointerEvent(PointerEventType.Move, pointer)
-            }
-        }
-    }
+    private val wheel = SceneWheel(options, SceneKind.Screen)
+    private val wheelPointer: () -> Offset = ::pointerPosition
 
     private var lastPreciseScrollNanos = 0L
 
@@ -997,24 +971,18 @@ abstract class ComposeScreen(
         //~ if !sdl 'takeScroll(rawX, rawY)' -> 'readScroll()'
         val macPrecise = if (OperatingSystem.isMac) MacScrollEvent.takeScroll(rawX, rawY) else null
         val precise = !discrete && isPreciseScroll(rawX, rawY, now, macPrecise)
-        val scrollScale = if (precise) PRECISE_UNIT_DP else WHEEL_UNIT_DP
+        val shift = isKeyDown(InputConstants.KEY_LSHIFT) || isKeyDown(InputConstants.KEY_RSHIFT)
 
-        //~ if = 1.8.9 '(-scrollX * scrollScale).toFloat()' -> '0f'
-        val delta = Offset((-scrollX * scrollScale).toFloat(), (-scrollY * scrollScale).toFloat())
+        //~ if = 1.8.9 'ScrollMath.notches(scrollX)' -> '0f'
+        val notchX = ScrollMath.notches(scrollX)
+        val notchY = ScrollMath.notches(scrollY)
+        val sceneDelta = Offset(ScrollMath.horizontal(shift, notchX, notchY), ScrollMath.vertical(shift, notchY))
         val position = pointerPosition()
-        val dispatch: () -> Unit = {
+        wheel.dispatch(position, sceneDelta, precise) {
             withScene {
                 it.sendPointerEvent(PointerEventType.Move, position)
-                it.sendPointerEvent(PointerEventType.Scroll, position, scrollDelta = delta)
+                SceneWheel.send(it, position, sceneDelta, precise)
             }
-        }
-        if (precise) {
-            wheelRouter.stopFallback()
-            dispatch()
-        } else {
-            glideAnchor = position
-            glideCarry = Offset.Zero
-            wheelRouter.route(delta, dispatch)
         }
     }
 
@@ -1101,6 +1069,7 @@ abstract class ComposeScreen(
     }
 
     private val consumedKeys = HashSet<Int>()
+    private val sentKeys = HashMap<Int, Int>()
 
     private val navigationKeys = intArrayOf(
         InputConstants.KEY_TAB, InputConstants.KEY_UP, InputConstants.KEY_DOWN, InputConstants.KEY_LEFT, InputConstants.KEY_RIGHT,
@@ -1222,6 +1191,7 @@ abstract class ComposeScreen(
     ): Boolean {
         val awtCode = MinecraftKeyboardAdapter.toAwtKeyCode(shortcutKey)
         val eventLocation = MinecraftKeyboardAdapter.keyLocation(bindingKey)
+        if (type == KeyEventType.KeyDown) sentKeys[bindingKey] = shortcutKey else sentKeys.remove(bindingKey)
         return sendKeyEventSafely {
             ComposeKeyEvent(
                 key = Key(awtCode, eventLocation),
@@ -1290,7 +1260,7 @@ abstract class ComposeScreen(
         if (w <= 0 || h <= 0) return false
         val applied = withScene { sceneHandle?.resize(w, h, scaledDensity()) }
         if (applied == null) return false
-        ComposeSceneContextImpl.updateContainerSize(w, h)
+        sceneContextOrNull?.updateContainerSize(w, h, scaledDensity())
         val changed = w != lastSceneW || h != lastSceneH
         val fbW = McWindow.viewportWidth()
         val fbH = McWindow.viewportHeight()
@@ -1369,10 +1339,10 @@ abstract class ComposeScreen(
         if (delta == Offset.Zero || !showing) return
         val pointer = pointerPosition()
         val anchor = withScene { it.focusManager.getFocusRect(false)?.center } ?: pointer
-        wheelRouter.stopFallback()
+        wheel.stop()
         withScene {
             it.sendPointerEvent(PointerEventType.Move, anchor)
-            it.sendPointerEvent(PointerEventType.Scroll, anchor, scrollDelta = delta)
+            SceneWheel.scrollDirect(it, anchor, delta)
             if (anchor != pointer) it.sendPointerEvent(PointerEventType.Move, pointer)
         }
     }
@@ -1404,12 +1374,6 @@ abstract class ComposeScreen(
 
     private companion object {
         const val SETTLE_FRAMES = 4
-
-        const val WHEEL_NOTCH_DP = 150f
-
-        val WHEEL_UNIT_DP = if (OperatingSystem.isMac) 50f else WHEEL_NOTCH_DP
-
-        val PRECISE_UNIT_DP = if (OperatingSystem.isWindows) WHEEL_NOTCH_DP else 10f
 
         const val PRECISE_SCROLL_HOLD_NANOS = 250_000_000L
 

@@ -10,19 +10,20 @@ import androidx.compose.ui.input.pointer.PointerButton
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.scene.ComposeScene
 import androidx.compose.ui.scene.PointerEventResult
-import kotlin.math.abs
+import com.mojang.blaze3d.platform.InputConstants
 import net.minecraft.client.gui.screens.ChatScreen
 import org.polyfrost.compose.effect.PolyGlassLight
 import org.polyfrost.compose.host.ComposeHost
 import org.polyfrost.compose.host.ComposeOptions
 import org.polyfrost.compose.host.HostCallbacks
-import org.polyfrost.compose.host.WheelRouter
+import org.polyfrost.compose.host.SceneKind
 import org.polyfrost.compose.minecraft.platform.HostEvents
 import org.polyfrost.compose.minecraft.platform.McScreens
 import org.polyfrost.compose.minecraft.platform.McWindow
-import org.polyfrost.compose.minecraft.platform.OperatingSystem
 import org.polyfrost.compose.minecraft.screen.ComposeSceneContextImpl
-import org.polyfrost.compose.minecraft.screen.FixedScrollConfig
+import org.polyfrost.compose.minecraft.screen.SceneWheel
+import org.polyfrost.compose.minecraft.screen.ScrollMath
+import org.polyfrost.compose.minecraft.screen.isKeyDown
 
 //? if > 1.8.9 {
 import net.minecraft.client.Minecraft
@@ -53,34 +54,15 @@ internal interface HudInputTarget {
 }
 
 internal class HudPointerRouter(private val options: ComposeOptions) {
-    val wheelRouter = WheelRouter { options.reducedMotion }
+    val wheel = SceneWheel(options, SceneKind.HudLayer)
     private var reported: Offset? = null
-    val scrollConfig = FixedScrollConfig(wheelRouter)
 
     var active = false
         private set
 
     private var lastPointer = Offset.Zero
     private var hasLastPointer = false
-    private var glideAnchor = Offset.Zero
-    private var glideCarry = Offset.Zero
-    private var glideScene: ComposeScene? = null
-    private var glidePointer = Offset.Zero
-    private var glideDensity = 1f
-
-    private val glideStep: (Offset) -> Unit = { step ->
-        val scene = glideScene
-        if (scene != null) {
-            glideCarry += step
-            val scale = glideDensity
-            if (abs(glideCarry.x * scale) >= 1f || abs(glideCarry.y * scale) >= 1f) {
-                val carried = glideCarry
-                glideCarry = Offset.Zero
-                scene.sendPointerEvent(PointerEventType.Scroll, glideAnchor, scrollDelta = carried)
-                if (glidePointer != glideAnchor) scene.sendPointerEvent(PointerEventType.Move, glidePointer)
-            }
-        }
-    }
+    private val wheelPointer: () -> Offset = { lastPointer }
 
     fun route(scene: ComposeScene, enabled: Boolean, density: Float) {
         if (!enabled) {
@@ -99,14 +81,7 @@ internal class HudPointerRouter(private val options: ComposeOptions) {
             hasLastPointer = true
             scene.sendPointerEvent(PointerEventType.Move, pointer)
         }
-        glideScene = scene
-        glidePointer = pointer
-        glideDensity = density
-        try {
-            wheelRouter.glideFrame(glideStep)
-        } finally {
-            glideScene = null
-        }
+        wheel.frame(scene, density, wheelPointer)
     }
 
     private fun report(position: Offset?) {
@@ -116,8 +91,7 @@ internal class HudPointerRouter(private val options: ComposeOptions) {
     }
 
     fun stop(scene: ComposeScene?) {
-        wheelRouter.stopFallback()
-        glideCarry = Offset.Zero
+        wheel.stop()
         if (!active) return
         active = false
         HudPointer.routerStopped()
@@ -133,32 +107,29 @@ internal class HudPointerRouter(private val options: ComposeOptions) {
     }
 
     fun scroll(scene: ComposeScene, x: Double, y: Double): Boolean {
-        val delta = Offset((-x * HudPointer.WHEEL_UNIT_DP).toFloat(), (-y * HudPointer.WHEEL_UNIT_DP).toFloat())
+        val shift = isKeyDown(InputConstants.KEY_LSHIFT) || isKeyDown(InputConstants.KEY_RSHIFT)
+        val notchX = ScrollMath.notches(x)
+        val notchY = ScrollMath.notches(y)
+        val sceneDelta = Offset(ScrollMath.horizontal(shift, notchX, notchY), ScrollMath.vertical(shift, notchY))
         val position = HudPointer.position()
-        var hit = false
-        wheelRouter.stopFallback()
-        glideAnchor = position
-        glideCarry = Offset.Zero
-        wheelRouter.route(delta) {
+        var consumed = false
+        val handled = wheel.dispatch(position, sceneDelta, false) {
             lastPointer = position
             hasLastPointer = true
             scene.sendPointerEvent(PointerEventType.Move, position)
-            val result = scene.sendPointerEvent(PointerEventType.Scroll, position, scrollDelta = delta)
-            hit = result in HudPointer.CONSUMED_RESULTS || wheelRouter.lastRouteHandled
+            consumed = SceneWheel.send(scene, position, sceneDelta, false) in HudPointer.CONSUMED_RESULTS
         }
-        return hit
+        return consumed || handled
     }
 
     fun button(scene: ComposeScene, type: PointerEventType, button: PointerButton): Boolean {
-        if (type == PointerEventType.Press) wheelRouter.stopFallback()
+        if (type == PointerEventType.Press) wheel.stop()
         return scene.sendPointerEvent(type, HudPointer.position(), button = button) in HudPointer.CONSUMED_RESULTS
     }
 }
 
 internal object HudPointer {
     const val INPUT_STALE_NANOS = 250_000_000L
-
-    val WHEEL_UNIT_DP = if (OperatingSystem.isMac) 50f else 150f
 
     val CONSUMED_RESULTS: Set<PointerEventResult> = listOf(false, true).map { moved ->
         PointerEventResult(

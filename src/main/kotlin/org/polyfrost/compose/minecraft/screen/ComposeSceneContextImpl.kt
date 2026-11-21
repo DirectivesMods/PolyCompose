@@ -11,11 +11,16 @@ import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.PointerKeyboardModifiers
 import androidx.compose.ui.platform.PlatformContext
 import androidx.compose.ui.platform.PlatformScreenReader
+import androidx.compose.ui.platform.ViewConfiguration
 import androidx.compose.ui.platform.WindowInfo
 import androidx.compose.ui.scene.ComposeSceneContext
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.dp
 import com.mojang.blaze3d.platform.InputConstants
+import java.awt.Cursor
 import net.minecraft.client.Minecraft
+import org.polyfrost.compose.minecraft.platform.HostEvents
 import org.polyfrost.compose.minecraft.platform.McKeys
 import org.polyfrost.compose.minecraft.platform.McWindow
 
@@ -81,23 +86,93 @@ internal fun isWindowFocused(): Boolean {
     //return McWindow.isActive()
 }
 
+private fun readKeyboardModifiers() = PointerKeyboardModifiers(
+    isCtrlPressed = isKeyDown(InputConstants.KEY_LCONTROL) || isKeyDown(InputConstants.KEY_RCONTROL),
+    isShiftPressed = isKeyDown(InputConstants.KEY_LSHIFT) || isKeyDown(InputConstants.KEY_RSHIFT),
+    isAltPressed = isKeyDown(InputConstants.KEY_LALT) || isKeyDown(InputConstants.KEY_RALT),
+    isCapsLockOn = isKeyDown(InputConstants.KEY_CAPSLOCK),
+    isScrollLockOn = isKeyDown(InputConstants.KEY_SCROLLLOCK),
+    isNumLockOn = isKeyDown(InputConstants.KEY_NUMLOCK),
+    isMetaPressed = isKeyDown(McKeys.LEFT_SUPER) || isKeyDown(McKeys.RIGHT_SUPER),
+)
+
 @ExperimentalComposeUiApi
-private class WindowInfoImpl : WindowInfo {
+internal class WindowInfoImpl : WindowInfo {
+    private var refreshedFrame = -1L
+
     override var containerSize: IntSize by mutableStateOf(IntSize(McWindow.windowWidth(), McWindow.windowHeight()))
 
-    override val keyboardModifiers: PointerKeyboardModifiers
-        get() = PointerKeyboardModifiers(
-            isCtrlPressed = isKeyDown(InputConstants.KEY_LCONTROL) || isKeyDown(InputConstants.KEY_RCONTROL),
-            isShiftPressed = isKeyDown(InputConstants.KEY_LSHIFT) || isKeyDown(InputConstants.KEY_RSHIFT),
-            isAltPressed = isKeyDown(InputConstants.KEY_LALT) || isKeyDown(InputConstants.KEY_RALT),
-            isCapsLockOn = isKeyDown(InputConstants.KEY_CAPSLOCK),
-            isScrollLockOn = isKeyDown(InputConstants.KEY_SCROLLLOCK),
-            isNumLockOn = isKeyDown(InputConstants.KEY_NUMLOCK),
-            isMetaPressed = isKeyDown(McKeys.LEFT_SUPER) || isKeyDown(McKeys.RIGHT_SUPER),
-        )
+    override var containerDpSize: DpSize by mutableStateOf(DpSize.Unspecified)
 
-    override val isWindowFocused: Boolean
-        get() = McWindow.isActive()
+    override var keyboardModifiers: PointerKeyboardModifiers by mutableStateOf(readKeyboardModifiers())
+        private set
+
+    override var isWindowFocused: Boolean by mutableStateOf(McWindow.isActive())
+        private set
+
+    fun update(width: Int, height: Int, density: Float) {
+        if (containerSize.width != width || containerSize.height != height) {
+            containerSize = IntSize(width, height)
+        }
+        val dpSize = DpSize((width / density).dp, (height / density).dp)
+        if (containerDpSize != dpSize) containerDpSize = dpSize
+        refresh()
+    }
+
+    private fun refresh() {
+        val frame = HostEvents.frame
+        if (frame == refreshedFrame) return
+        refreshedFrame = frame
+        val focused = McWindow.isActive()
+        if (focused != isWindowFocused) isWindowFocused = focused
+        val modifiers = readKeyboardModifiers()
+        if (modifiers != keyboardModifiers) keyboardModifiers = modifiers
+    }
+}
+
+@OptIn(InternalComposeUiApi::class)
+internal class ScaledViewConfiguration(
+    private val density: () -> Float,
+) : ViewConfiguration by PlatformContext.DefaultViewConfiguration {
+    override val touchSlop: Float get() = TOUCH_SLOP_DP * density()
+
+    private companion object {
+        const val TOUCH_SLOP_DP = 18f
+    }
+}
+
+private enum class CursorShape {
+    Arrow, Hand, Text, Crosshair, Wait, Move, ResizeHorizontal, ResizeVertical, ResizeNwse, ResizeNesw
+}
+
+private fun cursorShape(icon: PointerIcon): CursorShape = when (icon) {
+    PointerIcon.Default -> CursorShape.Arrow
+    PointerIcon.Hand -> CursorShape.Hand
+    PointerIcon.Text -> CursorShape.Text
+    PointerIcon.Crosshair -> CursorShape.Crosshair
+    else -> awtCursorShape(icon)
+}
+
+private fun awtCursorShape(icon: PointerIcon): CursorShape {
+    val type = try {
+        (icon.javaClass.getMethod("getCursor").invoke(icon) as Cursor).type
+    } catch (_: ReflectiveOperationException) {
+        return CursorShape.Arrow
+    } catch (_: ClassCastException) {
+        return CursorShape.Arrow
+    }
+    return when (type) {
+        Cursor.HAND_CURSOR -> CursorShape.Hand
+        Cursor.TEXT_CURSOR -> CursorShape.Text
+        Cursor.CROSSHAIR_CURSOR -> CursorShape.Crosshair
+        Cursor.WAIT_CURSOR -> CursorShape.Wait
+        Cursor.MOVE_CURSOR -> CursorShape.Move
+        Cursor.E_RESIZE_CURSOR, Cursor.W_RESIZE_CURSOR -> CursorShape.ResizeHorizontal
+        Cursor.N_RESIZE_CURSOR, Cursor.S_RESIZE_CURSOR -> CursorShape.ResizeVertical
+        Cursor.NW_RESIZE_CURSOR, Cursor.SE_RESIZE_CURSOR -> CursorShape.ResizeNwse
+        Cursor.NE_RESIZE_CURSOR, Cursor.SW_RESIZE_CURSOR -> CursorShape.ResizeNesw
+        else -> CursorShape.Arrow
+    }
 }
 
 @OptIn(InternalComposeUiApi::class, ExperimentalComposeUiApi::class)
@@ -111,24 +186,17 @@ private class PlatformImpl : PlatformContext by PlatformContext.Empty() {
     override val windowInfo: WindowInfoImpl = WindowInfoImpl()
     override val screenReader: PlatformScreenReader = PlatformScreenReaderImpl()
     override val inputModeManager: InputModeManager = InputModeManagerImpl()
-
-    //? if sdl {
-    private val handCursor = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER)
-    private val textCursor = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_TEXT)
-    private val moveCursor = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_CROSSHAIR)
-    //?} else {
-    /*private val handCursor = glfwCreateStandardCursor(GLFW_HAND_CURSOR)
-    private val textCursor = glfwCreateStandardCursor(GLFW_IBEAM_CURSOR)
-    private val moveCursor = glfwCreateStandardCursor(GLFW_CROSSHAIR_CURSOR)
-    *///?}
+    override val viewConfiguration: ViewConfiguration = ScaledViewConfiguration { 1f }
 
     private val handle = McWindow.handle()
+
+    private val cursors = HashMap<CursorShape, Long>()
 
     override fun setPointerIcon(pointerIcon: PointerIcon) {
         if (pointerIcon != PointerIcon.Default && !allowCursorChanges()) {
             return
         }
-        applyPointerIcon(pointerIcon)
+        applyPointerIcon(cursorShape(pointerIcon))
     }
 
     fun resetPointerIcon() {
@@ -139,22 +207,44 @@ private class PlatformImpl : PlatformContext by PlatformContext.Empty() {
         *///?}
     }
 
-    private fun applyPointerIcon(pointerIcon: PointerIcon) {
+    private fun cursorFor(shape: CursorShape): Long = cursors.getOrPut(shape) {
         //? if sdl {
-        SDL_SetCursor(when (pointerIcon) {
-            PointerIcon.Default -> SDL_GetDefaultCursor()
-            PointerIcon.Hand -> handCursor
-            PointerIcon.Text -> textCursor
-            PointerIcon.Crosshair -> moveCursor
-            else -> SDL_GetDefaultCursor()
-        })
+        SDL_CreateSystemCursor(
+            when (shape) {
+                CursorShape.Arrow -> SDL_SYSTEM_CURSOR_DEFAULT
+                CursorShape.Hand -> SDL_SYSTEM_CURSOR_POINTER
+                CursorShape.Text -> SDL_SYSTEM_CURSOR_TEXT
+                CursorShape.Crosshair -> SDL_SYSTEM_CURSOR_CROSSHAIR
+                CursorShape.Wait -> SDL_SYSTEM_CURSOR_WAIT
+                CursorShape.Move -> SDL_SYSTEM_CURSOR_MOVE
+                CursorShape.ResizeHorizontal -> SDL_SYSTEM_CURSOR_EW_RESIZE
+                CursorShape.ResizeVertical -> SDL_SYSTEM_CURSOR_NS_RESIZE
+                CursorShape.ResizeNwse -> SDL_SYSTEM_CURSOR_NWSE_RESIZE
+                CursorShape.ResizeNesw -> SDL_SYSTEM_CURSOR_NESW_RESIZE
+            },
+        )
         //?} else {
-        /*when (pointerIcon) {
-            PointerIcon.Default -> glfwSetCursor(handle, 0L)
-            PointerIcon.Hand -> glfwSetCursor(handle, handCursor)
-            PointerIcon.Text -> glfwSetCursor(handle, textCursor)
-            PointerIcon.Crosshair -> glfwSetCursor(handle, moveCursor)
-        }
+        /*glfwCreateStandardCursor(
+            when (shape) {
+                CursorShape.Hand -> GLFW_HAND_CURSOR
+                CursorShape.Text -> GLFW_IBEAM_CURSOR
+                CursorShape.Crosshair -> GLFW_CROSSHAIR_CURSOR
+                CursorShape.Move -> GLFW_RESIZE_ALL_CURSOR
+                CursorShape.ResizeHorizontal -> GLFW_RESIZE_EW_CURSOR
+                CursorShape.ResizeVertical -> GLFW_RESIZE_NS_CURSOR
+                CursorShape.ResizeNwse -> GLFW_RESIZE_NWSE_CURSOR
+                CursorShape.ResizeNesw -> GLFW_RESIZE_NESW_CURSOR
+                CursorShape.Arrow, CursorShape.Wait -> GLFW_ARROW_CURSOR
+            },
+        )
+        *///?}
+    }
+
+    private fun applyPointerIcon(shape: CursorShape) {
+        //? if sdl {
+        SDL_SetCursor(if (shape == CursorShape.Arrow) SDL_GetDefaultCursor() else cursorFor(shape))
+        //?} else {
+        /*glfwSetCursor(handle, if (shape == CursorShape.Arrow) 0L else cursorFor(shape))
         *///?}
     }
 
@@ -173,9 +263,21 @@ private class PlatformImpl : PlatformContext by PlatformContext.Empty() {
 }
 
 @OptIn(InternalComposeUiApi::class, ExperimentalComposeUiApi::class)
+internal open class ScenePlatformContext : PlatformContext by ComposeSceneContextImpl.platformContext {
+    final override val windowInfo: WindowInfoImpl = WindowInfoImpl()
+
+    fun updateContainerSize(width: Int, height: Int, density: Float) {
+        windowInfo.update(width, height, density)
+    }
+}
+
+@OptIn(InternalComposeUiApi::class, ExperimentalComposeUiApi::class)
 internal class SceneContext(
     private val isShowing: () -> Boolean,
-) : PlatformContext by ComposeSceneContextImpl.platformContext {
+    density: () -> Float,
+) : ScenePlatformContext() {
+    override val viewConfiguration: ViewConfiguration = ScaledViewConfiguration(density)
+
     //? if >= 26.1 || = 1.8.9 {
     private var sessions = 0
     private var inputActive = false
@@ -218,13 +320,5 @@ object ComposeSceneContextImpl : ComposeSceneContext {
 
     fun resetPointerIcon() {
         platform.resetPointerIcon()
-    }
-
-    fun updateContainerSize(width: Int, height: Int) {
-        val info = platform.windowInfo
-        val size = info.containerSize
-        if (size.width != width || size.height != height) {
-            info.containerSize = IntSize(width, height)
-        }
     }
 }

@@ -699,6 +699,7 @@ public class org/polyfrost/compose/host/ComposeOptions {
 	public fun Decorate (Ljava/lang/Object;Lkotlin/jvm/functions/Function2;Landroidx/compose/runtime/Composer;I)V
 	public fun consumeEscape (Ljava/lang/Object;)Z
 	public fun consumeMouse (Ljava/lang/Object;IZ)Z
+	public fun createWheelHandler (Lorg/polyfrost/compose/host/SceneKind;)Lorg/polyfrost/compose/host/WheelHandler;
 	public fun getAnimationScale ()F
 	public fun getMessages ()Lorg/polyfrost/compose/host/HostMessages;
 	public fun getReducedMotion ()Z
@@ -832,22 +833,32 @@ public final class org/polyfrost/compose/host/SceneKind : java/lang/Enum {
 	public static fun values ()[Lorg/polyfrost/compose/host/SceneKind;
 }
 
-public final class org/polyfrost/compose/host/WheelRouter {
-	public static final field $stable I
-	public fun <init> ()V
-	public fun <init> (Lkotlin/jvm/functions/Function0;)V
-	public synthetic fun <init> (Lkotlin/jvm/functions/Function0;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
-	public final fun defersWheelScroll ()Z
-	public final fun getLastRouteHandled ()Z
-	public final fun glideFrame (Lkotlin/jvm/functions/Function1;)V
-	public final fun route-3MmeM6k (JLkotlin/jvm/functions/Function0;)V
-	public final fun stopFallback ()V
+public abstract interface class org/polyfrost/compose/host/WheelHandler {
+	public fun dispatch-9KIMszo (JZLkotlin/jvm/functions/Function0;)Z
+	public fun frame (Lkotlin/jvm/functions/Function1;)V
+	public fun scrollOffset-48PGBU8 (Landroidx/compose/ui/unit/Density;Landroidx/compose/ui/input/pointer/PointerEvent;J)Landroidx/compose/ui/geometry/Offset;
+	public fun stop ()V
 }
 
-public final class org/polyfrost/compose/host/WheelScrollKt {
-	public static final fun getLocalWheelRouter ()Landroidx/compose/runtime/ProvidableCompositionLocal;
-	public static final fun wheelScroll (Landroidx/compose/ui/Modifier;Landroidx/compose/foundation/gestures/ScrollableState;Landroidx/compose/foundation/gestures/Orientation;Lkotlin/jvm/functions/Function0;)Landroidx/compose/ui/Modifier;
-	public static synthetic fun wheelScroll$default (Landroidx/compose/ui/Modifier;Landroidx/compose/foundation/gestures/ScrollableState;Landroidx/compose/foundation/gestures/Orientation;Lkotlin/jvm/functions/Function0;ILjava/lang/Object;)Landroidx/compose/ui/Modifier;
+public final class org/polyfrost/compose/host/WheelHandler$DefaultImpls {
+	public static fun dispatch-9KIMszo (Lorg/polyfrost/compose/host/WheelHandler;JZLkotlin/jvm/functions/Function0;)Z
+	public static fun frame (Lorg/polyfrost/compose/host/WheelHandler;Lkotlin/jvm/functions/Function1;)V
+	public static fun scrollOffset-48PGBU8 (Lorg/polyfrost/compose/host/WheelHandler;Landroidx/compose/ui/unit/Density;Landroidx/compose/ui/input/pointer/PointerEvent;J)Landroidx/compose/ui/geometry/Offset;
+	public static fun stop (Lorg/polyfrost/compose/host/WheelHandler;)V
+}
+
+public final class org/polyfrost/compose/host/WheelHandlerKt {
+	public static final fun getLocalWheelHandler ()Landroidx/compose/runtime/ProvidableCompositionLocal;
+	public static final fun getWheelInput (Landroidx/compose/ui/input/pointer/PointerEvent;)Lorg/polyfrost/compose/host/WheelInput;
+}
+
+public final class org/polyfrost/compose/host/WheelInput : java/lang/Enum {
+	public static final field Direct Lorg/polyfrost/compose/host/WheelInput;
+	public static final field Notched Lorg/polyfrost/compose/host/WheelInput;
+	public static final field Precise Lorg/polyfrost/compose/host/WheelInput;
+	public static fun getEntries ()Lkotlin/enums/EnumEntries;
+	public static fun valueOf (Ljava/lang/String;)Lorg/polyfrost/compose/host/WheelInput;
+	public static fun values ()[Lorg/polyfrost/compose/host/WheelInput;
 }
 
 public final class org/polyfrost/compose/layout/ExtensionsKt {

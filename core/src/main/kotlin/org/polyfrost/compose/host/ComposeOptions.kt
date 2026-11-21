@@ -33,6 +33,8 @@ public open class ComposeOptions {
 
     public open fun consumeMouse(owner: Any, button: Int, pressed: Boolean): Boolean = false
 
+    public open fun createWheelHandler(kind: SceneKind): WheelHandler? = null
+
     public companion object {
         @JvmField
         public val Default: ComposeOptions = ComposeOptions()

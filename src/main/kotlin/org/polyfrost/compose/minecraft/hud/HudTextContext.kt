@@ -4,19 +4,24 @@ package org.polyfrost.compose.minecraft.hud
 
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.InternalComposeUiApi
-import androidx.compose.ui.platform.PlatformContext
 import androidx.compose.ui.platform.PlatformTextInputMethodRequest
+import androidx.compose.ui.platform.ViewConfiguration
 import kotlinx.coroutines.awaitCancellation
 import net.minecraft.client.gui.screens.ChatScreen
 import org.polyfrost.compose.minecraft.platform.McScreens
 import org.polyfrost.compose.minecraft.platform.TextInput
-import org.polyfrost.compose.minecraft.screen.ComposeSceneContextImpl
+import org.polyfrost.compose.minecraft.screen.ScaledViewConfiguration
+import org.polyfrost.compose.minecraft.screen.ScenePlatformContext
 
-internal class HudTextContext : PlatformContext by ComposeSceneContextImpl.platformContext {
+internal class HudTextContext : ScenePlatformContext() {
     var sessions = 0
         private set
 
     private var inputActive = false
+
+    var density = 1f
+
+    override val viewConfiguration: ViewConfiguration = ScaledViewConfiguration { density }
 
     override val isClearFocusOnMouseDownEnabled: Boolean
         get() = true

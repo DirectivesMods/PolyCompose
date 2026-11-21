@@ -10,6 +10,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.pointer.PointerButton
 import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalUriHandler
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.Logger
 import org.polyfrost.compose.backend.PolyCanvas
@@ -18,8 +21,10 @@ import org.polyfrost.compose.host.ComposeOptions
 import org.polyfrost.compose.host.HostCallbacks
 import org.polyfrost.compose.host.LocalComposeOptions
 import org.polyfrost.compose.host.SceneKind
+import org.polyfrost.compose.minecraft.platform.HostUriHandler
 import org.polyfrost.compose.minecraft.platform.McWindow
-import org.polyfrost.compose.minecraft.screen.ComposeSceneContextImpl
+import org.polyfrost.compose.minecraft.platform.SystemClipboard
+import org.polyfrost.compose.minecraft.platform.SystemClipboardManager
 import org.polyfrost.compose.minecraft.screen.SceneFrames
 import org.polyfrost.compose.minecraft.screen.SceneHandle
 import org.polyfrost.compose.profile.FrameProfiler
@@ -39,6 +44,7 @@ internal abstract class HudSceneBase(private val key: String, protected val opti
     protected var lastDrawn = 0L
     protected var appliedRatio = 0f
     private var profile: ProfileHost? = null
+    private var wasRouting = false
 
     val drawnAt: Long
         get() = lastDrawn
@@ -94,11 +100,14 @@ internal abstract class HudSceneBase(private val key: String, protected val opti
             if (handle.resize(w, h, sceneDensity)) dirty = true
             val now = System.nanoTime()
             prepare(sceneDensity, now)
-            ComposeSceneContextImpl.updateContainerSize(w, h)
+            text.updateContainerSize(w, h, sceneDensity)
             lastDrawn = now
             val routing = routesInput && HudPointer.inputAllowedThisFrame()
+            if (wasRouting && !routing) HudInput.releaseHeldKeys(this)
+            wasRouting = routing
             pointer.route(scene, routing, sceneDensity)
             if (!routing && text.sessions > 0) scene.focusManager.releaseFocus()
+            text.density = sceneDensity
             text.sync(routing)
             val ratio = (McWindow.viewportWidth().toFloat() / w).coerceAtLeast(MIN_RATIO)
             if (ratio != appliedRatio) {
@@ -122,7 +131,15 @@ internal abstract class HudSceneBase(private val key: String, protected val opti
             builtAt = System.nanoTime()
             dirty = true
             HudInput.register(this)
-            created.scene.setContent { CompositionLocalProvider(LocalComposeOptions provides options) { content() } }
+            created.scene.setContent {
+                @Suppress("DEPRECATION")
+                CompositionLocalProvider(
+                    LocalComposeOptions provides options,
+                    LocalClipboardManager provides SystemClipboardManager,
+                    LocalClipboard provides SystemClipboard,
+                    LocalUriHandler provides HostUriHandler,
+                ) { content() }
+            }
             created
         } catch (t: Throwable) {
             fail(t)

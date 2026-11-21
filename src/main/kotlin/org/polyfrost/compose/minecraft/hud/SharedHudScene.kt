@@ -13,7 +13,6 @@ import java.util.IdentityHashMap
 import org.polyfrost.compose.backend.PolyCanvas
 import org.polyfrost.compose.host.ComposeOptions
 import org.polyfrost.compose.host.HostErrors
-import org.polyfrost.compose.host.LocalWheelRouter
 import org.polyfrost.compose.minecraft.canvas.InlineCanvasSurface
 import org.polyfrost.compose.minecraft.platform.HostEvents
 import org.polyfrost.compose.minecraft.screen.ComposeSupport
@@ -285,7 +284,7 @@ internal class SharedHudScene private constructor(options: ComposeOptions) :
         handle?.let { return it }
         if (!ComposeSupport.isAvailable) return null
         return openScene {
-            CompositionLocalProvider(pointer.scrollConfig.provided(), LocalWheelRouter provides pointer.wheelRouter) {
+            CompositionLocalProvider(*pointer.wheel.provided()) {
                 for (slot in slots.sortedWith(slotOrder)) {
                     key(slot) { slot.host() }
                 }

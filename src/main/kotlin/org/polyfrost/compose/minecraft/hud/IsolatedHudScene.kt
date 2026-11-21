@@ -7,7 +7,6 @@ import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.InternalComposeUiApi
 import org.polyfrost.compose.backend.PolyCanvas
 import org.polyfrost.compose.host.HostErrors
-import org.polyfrost.compose.host.LocalWheelRouter
 import org.polyfrost.compose.minecraft.canvas.InlineCanvasSurface
 import org.polyfrost.compose.minecraft.screen.ComposeSupport
 import org.polyfrost.compose.minecraft.screen.SceneHandle
@@ -61,8 +60,7 @@ internal class IsolatedHudScene(private val layer: HudLayer) : HudSceneBase("hud
         if (!ComposeSupport.isAvailable) return null
         return openScene {
             CompositionLocalProvider(
-                pointer.scrollConfig.provided(),
-                LocalWheelRouter provides pointer.wheelRouter,
+                *pointer.wheel.provided(),
                 LocalTickActivity provides tickActivity,
             ) {
                 layer.layerContent()

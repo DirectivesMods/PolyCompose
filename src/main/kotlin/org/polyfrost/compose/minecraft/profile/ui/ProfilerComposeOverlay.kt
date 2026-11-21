@@ -9,18 +9,19 @@ import androidx.compose.ui.input.pointer.PointerButton
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.scene.ComposeScene
 import androidx.compose.ui.scene.SingleComposeSceneRenderingScope
-import com.mojang.blaze3d.platform.InputConstants
 import org.apache.logging.log4j.LogManager
 import org.polyfrost.compose.backend.PolyCanvas
 import org.polyfrost.compose.host.ComposeOptions
 import org.polyfrost.compose.host.GameInputLayer
 import org.polyfrost.compose.host.HostErrors
 import org.polyfrost.compose.host.OverlayRenderer
+import org.polyfrost.compose.minecraft.hud.HudInput
 import org.polyfrost.compose.minecraft.platform.McScreens
 import org.polyfrost.compose.minecraft.platform.McWindow
 import org.polyfrost.compose.minecraft.screen.ComposeSceneContextImpl
 import org.polyfrost.compose.minecraft.screen.ComposeSupport
 import org.polyfrost.compose.minecraft.screen.SceneHandle
+import org.polyfrost.compose.minecraft.screen.ScenePlatformContext
 import org.polyfrost.compose.profile.FrameProfiler
 import org.polyfrost.compose.profile.ProfileHost
 import org.polyfrost.compose.profile.within
@@ -50,6 +51,7 @@ internal class ProfilerComposeOverlay(private val sampler: LiveSampler) : Overla
     @JvmField
     var panelBottom = 0f
 
+    private val platform = ScenePlatformContext()
     private var handle: SceneHandle? = null
     private var scope: SingleComposeSceneRenderingScope? = null
     private var profile: ProfileHost? = null
@@ -109,7 +111,7 @@ internal class ProfilerComposeOverlay(private val sampler: LiveSampler) : Overla
     private fun step(handle: SceneHandle, w: Int, h: Int): Boolean {
         val density = McWindow.guiScale().toFloat().coerceAtLeast(1f)
         if (handle.resize(w, h, density)) dirty = true
-        ComposeSceneContextImpl.updateContainerSize(w, h)
+        platform.updateContainerSize(w, h, density)
         sampler.refreshIfDue(System.nanoTime())
         routePointer(handle.scene)
         val nanos = System.nanoTime()
@@ -129,7 +131,7 @@ internal class ProfilerComposeOverlay(private val sampler: LiveSampler) : Overla
         if (failed || System.nanoTime() - retryAt < 0L || !ComposeSupport.isAvailable) return null
         return try {
             val newScope = SingleComposeSceneRenderingScope { dirty = true }
-            val created = SceneHandle.create(ComposeSceneContextImpl.platformContext, ComposeOptions.Default, newScope::onSceneInvalidation) { dirty = true }
+            val created = SceneHandle.create(platform, ComposeOptions.Default, newScope::onSceneInvalidation) { dirty = true }
             handle = created
             scope = newScope
             dirty = true
@@ -197,12 +199,7 @@ internal class ProfilerComposeOverlay(private val sampler: LiveSampler) : Overla
     private fun route(button: Int, pressed: Boolean): Boolean {
         if (!shown) return false
         val scene = handle?.scene ?: return false
-        val pointer = when (button) {
-            InputConstants.MOUSE_BUTTON_LEFT -> PointerButton.Primary
-            InputConstants.MOUSE_BUTTON_RIGHT -> PointerButton.Secondary
-            InputConstants.MOUSE_BUTTON_MIDDLE -> PointerButton.Tertiary
-            else -> return false
-        }
+        val pointer = HudInput.pointerButtonOf(button) ?: return false
         val bit = 1 shl pointer.index
         val p = pointerPosition()
         if (!pressed) {

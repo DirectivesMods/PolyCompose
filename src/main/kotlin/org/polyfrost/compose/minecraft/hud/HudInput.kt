@@ -3,12 +3,12 @@ package org.polyfrost.compose.minecraft.hud
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.pointer.PointerButton
 import com.mojang.blaze3d.platform.InputConstants
-import java.util.BitSet
 import java.util.Collections
 import java.util.WeakHashMap
 import org.polyfrost.compose.host.BackStack
 import org.polyfrost.compose.host.KeyState
 import org.polyfrost.compose.minecraft.platform.GameKeyRouter
+import org.polyfrost.compose.minecraft.platform.McKeys
 import org.polyfrost.compose.minecraft.platform.McScreens
 import org.polyfrost.compose.minecraft.platform.McWindow
 import org.polyfrost.compose.minecraft.screen.ComposeScreen
@@ -25,7 +25,7 @@ object HudInput {
     private val candidates = ArrayList<HudLayer>()
     private val sceneBuffer = ArrayList<HudInputTarget>()
     private val tried = ArrayList<HudInputTarget>()
-    private val heldKeys = BitSet()
+    private val heldKeys = HashMap<Int, HudInputTarget>()
     private var escapeConsumed = false
     private var drawSeq = 0L
 
@@ -65,10 +65,12 @@ object HudInput {
         return press.consumed
     }
 
-    private fun pointerButtonOf(button: Int): PointerButton? = when (button) {
+    internal fun pointerButtonOf(button: Int): PointerButton? = when (button) {
         InputConstants.MOUSE_BUTTON_LEFT -> PointerButton.Primary
         InputConstants.MOUSE_BUTTON_RIGHT -> PointerButton.Secondary
         InputConstants.MOUSE_BUTTON_MIDDLE -> PointerButton.Tertiary
+        McKeys.MOUSE_BACK -> PointerButton.Back
+        McKeys.MOUSE_FORWARD -> PointerButton.Forward
         else -> null
     }
 
@@ -121,15 +123,17 @@ object HudInput {
 
     @JvmStatic
     fun consumeKey(key: Int, state: KeyState): Boolean {
-        if (state == KeyState.Released && key >= 0 && heldKeys[key]) {
-            heldKeys.clear(key)
-            if (key != InputConstants.KEY_ESCAPE) focusedScene()?.sendKey(HudKeys.key(KeyEventType.KeyUp, key))
-            return true
+        if (state == KeyState.Released && key >= 0) {
+            val owner = heldKeys.remove(key)
+            if (owner != null) {
+                if (key != InputConstants.KEY_ESCAPE) owner.sendKey(HudKeys.key(KeyEventType.KeyUp, key))
+                return true
+            }
         }
         val focused = if (state == KeyState.Released) null else focusedScene()
         if (focused != null) {
             typeInto(focused, key, state)
-            if (key >= 0) heldKeys.set(key)
+            if (key >= 0) heldKeys[key] = focused
             return true
         }
         if (key != InputConstants.KEY_ESCAPE) return false
@@ -140,6 +144,17 @@ object HudInput {
             }
             KeyState.Repeated -> escapeConsumed
             KeyState.Released -> escapeConsumed.also { escapeConsumed = false }
+        }
+    }
+
+    internal fun releaseHeldKeys(scene: HudInputTarget) {
+        if (heldKeys.isEmpty()) return
+        val iterator = heldKeys.entries.iterator()
+        while (iterator.hasNext()) {
+            val (key, owner) = iterator.next()
+            if (owner !== scene) continue
+            iterator.remove()
+            if (key != InputConstants.KEY_ESCAPE) scene.sendKey(HudKeys.key(KeyEventType.KeyUp, key))
         }
     }
 
