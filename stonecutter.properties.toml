@@ -23,8 +23,8 @@ deps.errorprone = "2.52.0"
 
 loomx.loom_version = "1.19-SNAPSHOT"
 
-publish.modrinth = ""
-publish.curseforge = ""
+publish.modrinth = "eHe8QhtD"
+publish.curseforge = "1569167"
 
 ["1.8.9"]
 mod.mc_compat = ">=1.8.9 <=1.8.9"
