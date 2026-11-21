@@ -358,6 +358,7 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
 
     override fun mcText(text: String, x: Float, y: Float, color: Int, shadow: Boolean, scale: Float, literal: Boolean, snapX: Boolean) {
         if (state.proj != null) return projectedText(text, x, y, mulAlpha(color, state.alpha), shadow, scale, literal, false)
+        if (!finiteText(x, y, scale)) return
         flush()
         val c = mulAlpha(color, state.alpha)
         if (c ushr 24 == 0) return
@@ -384,6 +385,7 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
         if (!keepVertices || state.proj != null || '§' in text || Language.getInstance().isDefaultRightToLeft) {
             return live { it.mcText(text, x, y, color(), shadow, scale, literal) }
         }
+        if (!finiteText(x, y, scale)) return
         flush()
         val alpha = state.alpha
         val scissor = state.clip?.let { rectGui(it[0], it[1], it[2], it[3]) ?: return }
@@ -422,6 +424,11 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
         return b
     }
 
+    private fun finiteText(x: Float, y: Float, scale: Float): Boolean {
+        val s = state
+        return (x * s.sx + s.tx).isFinite() && (y * s.sy + s.ty).isFinite() && (s.sx * scale).isFinite() && (s.sy * scale).isFinite()
+    }
+
     private fun lineMatrix(x: Float, y: Float, index: Int, lineHeight: Int, scale: Float, snapX: Boolean): Matrix3x2f =
         guiPose()
             .translate((x * state.sx + state.tx).let { if (snapX) snap(it) else it }, snap(y * state.sy + state.ty) + snap(index * lineHeight * scale * state.sy))
@@ -438,6 +445,7 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
 
     override fun mcTextOutline(text: String, x: Float, y: Float, color: Int, outlineColor: Int, scale: Float, literal: Boolean, snapX: Boolean) {
         if (state.proj != null) return projectedOutline(text, x, y, color, outlineColor, scale, literal)
+        if (!finiteText(x, y, scale)) return
         val a = mulAlpha(outlineColor, state.alpha) ushr 24
         val clip = state.clip
         val scissor = clip?.let { rectGui(it[0], it[1], it[2], it[3]) }
@@ -477,7 +485,7 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
     }
 
     private fun projectedText(text: String, x: Float, y: Float, color: Int, shadow: Boolean, scale: Float, literal: Boolean, flat: Boolean) {
-        if (color ushr 24 == 0) return
+        if (color ushr 24 == 0 || !finiteText(x, y, scale)) return
         val font = Minecraft.getInstance().font
         val s = state
         val cap = GlyphCapture()
