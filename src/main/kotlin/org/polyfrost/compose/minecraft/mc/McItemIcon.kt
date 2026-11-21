@@ -87,6 +87,7 @@ private fun drawFadedDecorations(
     }
 }
 
+@Deprecated("Kept for binary compatibility", level = DeprecationLevel.HIDDEN)
 @Composable
 fun McItemIcon(
     stack: ItemStack,
@@ -96,9 +97,22 @@ fun McItemIcon(
     countOverride: String? = null,
     alpha: Float = 1f,
 ) {
+    McItemIcon(stack, modifier, size, decorations, countOverride, alpha, maxScale = 1f)
+}
+
+@Composable
+fun McItemIcon(
+    stack: ItemStack,
+    modifier: Modifier = Modifier,
+    size: Dp = 16.dp,
+    decorations: Boolean = true,
+    countOverride: String? = null,
+    alpha: Float = 1f,
+    maxScale: Float = 1f,
+) {
     val handle = rememberItemIconHandle(stack, decorations)
     val density = LocalDensity.current
-    SideEffect { McItemAtlas.requestSize(handle, with(density) { size.toPx() }) }
+    SideEffect { handle.setBaseSize(with(density) { size.toPx() }, maxScale) }
     Box(
         modifier
             .size(size)
@@ -130,6 +144,7 @@ fun McItemIcon(
     McItemIcon(stack, modifier, size, decorations = false, alpha = alpha)
 }
 
+@Deprecated("Kept for binary compatibility", level = DeprecationLevel.HIDDEN)
 @Composable
 fun NodeMcItemIcon(
     stack: ItemStack,
@@ -139,9 +154,22 @@ fun NodeMcItemIcon(
     countOverride: String? = null,
     alpha: Float = 1f,
 ) {
+    NodeMcItemIcon(stack, size, modifier, decorations, countOverride, alpha, maxScale = 1f)
+}
+
+@Composable
+fun NodeMcItemIcon(
+    stack: ItemStack,
+    size: Float = McItemIcons.ITEM_SIZE,
+    modifier: PolyModifier = PolyModifier,
+    decorations: Boolean = true,
+    countOverride: String? = null,
+    alpha: Float = 1f,
+    maxScale: Float = 1f,
+) {
     val handle = rememberItemIconHandle(stack, decorations)
     val scale = LocalContentScale.current
-    SideEffect { McItemAtlas.requestSize(handle, size * McWindow.guiScale() * scale) }
+    SideEffect { handle.setBaseSize(size * McWindow.guiScale() * scale, maxScale) }
     val revision = handle.revision
     val available = McItemIcons.available
     val onDraw: RenderContext.(Float, Float, Float, Float) -> Unit = remember(handle, revision, available, decorations, countOverride, alpha) {

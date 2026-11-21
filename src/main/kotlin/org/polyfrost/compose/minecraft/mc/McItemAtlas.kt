@@ -125,6 +125,8 @@ interface McItemIconHandle : AutoCloseable {
 
     fun drawDecorations(ctx: RenderContext, x: Float, y: Float, size: Float, countOverride: String? = null)
 
+    fun setBaseSize(devicePx: Float, maxScale: Float = 1f)
+
     override fun close()
 }
 
@@ -223,6 +225,9 @@ internal object McItemAtlas {
     private class IconEntry(override var stack: ItemStack) : McItemIconHandle {
         val revisionState = mutableIntStateOf(0)
         var requestedSizePx = 0
+        var baseSizePx = 0
+        var reservedMultiple = 1
+        var shrinkSinceNs = 0L
         var closedFlag = false
         var slot = 0
         var x = 0
@@ -269,6 +274,40 @@ internal object McItemAtlas {
             ensureHooks()
         }
 
+        private fun pageFor(drawnPx: Int): Int {
+            val drawn = drawnPx.coerceIn(1, MAX_CELL_PX)
+            val base = baseSizePx
+            if (base <= 0) return pageSizeFor(drawn)
+            val page = base * maxOf(reservedMultiple, (drawn + base - 1) / base)
+            return if (page <= MAX_CELL_PX) page else pageSizeFor(drawn)
+        }
+
+        fun drawnAt(drawnPx: Int) {
+            val page = pageFor(drawnPx)
+            if (page >= requestedSizePx) {
+                shrinkSinceNs = 0L
+                if (page > requestedSizePx) setRenderSizePx(page)
+                return
+            }
+            val now = System.nanoTime()
+            if (shrinkSinceNs == 0L) shrinkSinceNs = now
+            else if (now - shrinkSinceNs >= SHRINK_DELAY_NS) {
+                shrinkSinceNs = 0L
+                setRenderSizePx(page)
+            }
+        }
+
+        override fun setBaseSize(devicePx: Float, maxScale: Float) {
+            if (closedFlag || !devicePx.isFinite() || devicePx <= 0f) return
+            baseSizePx = pageSizeFor(renderPx(devicePx).coerceIn(1, MAX_CELL_PX))
+            reservedMultiple = if (maxScale.isFinite() && maxScale > 1f) ceil(maxScale - 0.01f).toInt() else 1
+            val reserved = pageFor(baseSizePx)
+            if (requestedSizePx < reserved) {
+                shrinkSinceNs = 0L
+                setRenderSizePx(reserved)
+            }
+        }
+
         override fun update(stack: ItemStack) {
             synchronized(lock) {
                 if (closedFlag || this.stack === stack) return
@@ -286,7 +325,7 @@ internal object McItemAtlas {
         override fun draw(ctx: RenderContext, x: Float, y: Float, w: Float, h: Float, alpha: Float): Boolean {
             if (closedFlag || w <= 0f || h <= 0f) return false
             revisionState.intValue
-            setRenderSizePx(renderPx(ctx, maxOf(w, h)))
+            drawnAt(renderPx(ctx, maxOf(w, h)))
             if (!available.value) return false
             val state = readyAtlas(this) ?: return false
             val src = atlasSource
@@ -341,6 +380,7 @@ internal object McItemAtlas {
     private const val MAX_CELL_PX = 512
     private const val MAX_FAILED_VARIANTS = 256
     private const val PAGE_STEP_PX = 16
+    private const val SHRINK_DELAY_NS = 1_000_000_000L
 
     private fun pageSizeFor(size: Int) = ((size + PAGE_STEP_PX - 1) / PAGE_STEP_PX * PAGE_STEP_PX).coerceAtMost(MAX_CELL_PX)
 
@@ -382,11 +422,6 @@ internal object McItemAtlas {
     private fun renderPx(ctx: RenderContext, size: Float): Int = renderPx(size * ctx.deviceScale())
 
     private fun renderPx(devicePx: Float): Int = ceil(devicePx - 0.01f).toInt().coerceAtLeast(1)
-
-    fun requestSize(handle: McItemIconHandle, devicePx: Float) {
-        val entry = handle as? IconEntry ?: return
-        if (entry.requestedSizePx == 0) entry.setRenderSizePx(renderPx(devicePx))
-    }
 
     private fun ensureHooks() {
         if (frameHook == null) frameHook = McFrameHooks.beforeUi(::renderAll)
