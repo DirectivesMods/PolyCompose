@@ -29,8 +29,9 @@ internal object ClassWarmup {
     )
 
     private val SKIPPED = arrayOf(
-        "/awt/", "/window/", "/skia/", "/swing/", "/a11y/", "/l10n/", "/draganddrop/", "/viewinterop/", "/autofill/",
-        "/tooling/", "/text/input/", "/text/selection/", "/contextmenu/", "/handwriting/", "/pager/", "/lazy/grid/",
+        "/awt/", "/window/", "/skia/", "/skiko/", "scene/ComposeSceneMediator.class", "/swing/", "/a11y/", "/l10n/",
+        "/draganddrop/", "/viewinterop/", "/autofill/", "/tooling/", "/text/input/", "/text/selection/",
+        "/contextmenu/", "/handwriting/", "/pager/", "/lazy/grid/",
         "/lazy/staggeredgrid/", "foundation/style/", "kotlinx/coroutines/debug/", "kotlinx/coroutines/future/",
         "kotlinx/coroutines/stream/", "kotlinx/coroutines/time/", "org/polyfrost/compose/minecraft/",
     )
@@ -100,11 +101,9 @@ internal object ClassWarmup {
     private fun load(name: String, loader: ClassLoader?): String? = try {
         Class.forName(name, false, loader)
         null
-    } catch (e: ClassNotFoundException) {
+    } catch (e: Exception) {
         e.javaClass.simpleName
     } catch (e: LinkageError) {
-        e.javaClass.simpleName
-    } catch (e: SecurityException) {
         e.javaClass.simpleName
     }
 }
