@@ -1,11 +1,14 @@
 package org.polyfrost.compose.render
 
 import java.util.WeakHashMap
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import org.jetbrains.annotations.ApiStatus
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
@@ -32,6 +35,8 @@ public object PolyGlyphPage {
 
         public fun advance(glyph: Int): Float
 
+        public fun kern(left: Int, right: Int): Float = 0f
+
         public fun raster(glyph: Int, pixelSize: Float): Raster?
 
         public fun raster(glyph: Int, pixelSize: Float, shiftX: Float): Raster? = raster(glyph, pixelSize)
@@ -44,7 +49,7 @@ public object PolyGlyphPage {
         public fun v(t: Float): Float = v0 + (v1 - v0) * t
     }
 
-    public class Page internal constructor() {
+    public class Page internal constructor(private val shared: Boolean = true) {
         @JvmField
         public val pixels: IntArray = IntArray(SIZE * SIZE).also { px ->
             for (y in 0 until WHITE) for (x in 0 until WHITE) px[(PAD + y) * SIZE + PAD + x] = -1
@@ -62,7 +67,7 @@ public object PolyGlyphPage {
         private val rowVersions = IntArray(SIZE).also { it.fill(1, PAD, PAD + WHITE) }
 
         init {
-            revision++
+            if (shared) revision++
         }
 
         /** The rows written to since [version] was [since], so only those need uploading again. Empty if there are none. */
@@ -90,7 +95,7 @@ public object PolyGlyphPage {
             penY = y
             rowH = max(row, h)
             version++
-            revision++
+            if (shared) revision++
             rowVersions.fill(version, y, y + h)
             return (x shl 16) or y
         }
@@ -127,7 +132,9 @@ public object PolyGlyphPage {
         }
     }
 
-    public class Atlas internal constructor(internal val face: Face, internal val bucket: Int, internal val lum: Int, internal val outline: Int) {
+    public class Atlas internal constructor(
+        internal val face: Face, internal val bucket: Int, internal val lum: Int, internal val outline: Int, internal val ring: Boolean = false,
+    ) {
         private var keys = IntArray(INITIAL_SLOTS).also { it.fill(-1) }
         private var values = arrayOfNulls<Any>(INITIAL_SLOTS)
         private var size = 0
@@ -135,7 +142,7 @@ public object PolyGlyphPage {
         internal var placed: Int = 0
             private set
 
-        internal fun matches(f: Face, b: Int, l: Int, o: Int): Boolean = bucket == b && lum == l && outline == o && face == f
+        internal fun matches(f: Face, b: Int, l: Int, o: Int, r: Boolean = false): Boolean = bucket == b && lum == l && outline == o && ring == r && face == f
 
         internal fun find(slot: Int): Int {
             val mask = keys.size - 1
@@ -201,7 +208,9 @@ public object PolyGlyphPage {
     private const val INITIAL_SLOTS = 32
     private const val MAX_PAGES = 4
     private const val MAX_RASTERS = 512
+    private const val KERN_LIMIT = 0x0590
     private const val RECENT_ATLASES = 4
+    private const val DENSE_RADIUS = 4
 
     private const val MOTION_GAP_NANOS = 8_000_000L
     private const val MOTION_WINDOW_NANOS = 300_000_000L
@@ -248,14 +257,18 @@ public object PolyGlyphPage {
         return find(face, bucket, -1, if (round) q else -q)
     }
 
-    private fun find(face: Face, bucket: Int, lum: Int, outline: Int): Atlas {
+    internal fun ringAtlas(face: Face, bucket: Int, radiusPx: Float): Atlas = find(face, bucket, -1, quarters(radiusPx), true)
+
+    private fun quarters(px: Float): Int = max(1, (px * 4f).roundToInt())
+
+    private fun find(face: Face, bucket: Int, lum: Int, outline: Int, ring: Boolean = false): Atlas {
         applyInvalidations()
-        for (a in recent) if (a != null && a.matches(face, bucket, lum, outline)) return a
+        for (a in recent) if (a != null && a.matches(face, bucket, lum, outline, ring)) return a
         val list = atlases.getOrPut(face) { ArrayList(4) }
         var hit: Atlas? = null
-        for (a in list) if (a.matches(face, bucket, lum, outline)) { hit = a; break }
+        for (a in list) if (a.matches(face, bucket, lum, outline, ring)) { hit = a; break }
         if (hit == null) {
-            hit = Atlas(face, bucket, lum, outline)
+            hit = Atlas(face, bucket, lum, outline, ring)
             if (outline == 0 && list.none { it.bucket == bucket && it.outline == 0 }) moved(face, bucket)
             list += hit
         }
@@ -325,6 +338,9 @@ public object PolyGlyphPage {
     @JvmStatic
     public fun isIgnorable(cp: Int): Boolean = cp == 0x200D || cp in 0xFE00..EMOJI_VARIATION || cp in 0xE0001..0xE007F
 
+    @JvmStatic
+    public fun kernable(cp: Int): Boolean = cp < KERN_LIMIT && !Character.isWhitespace(cp)
+
     private fun joins(cp: Int): Boolean =
         cp == 0x200D || cp == EMOJI_VARIATION || cp == 0x20E3 || cp in 0x1F3FB..0x1F3FF || cp in 0xE0020..0xE007F || cp in REGIONAL
 
@@ -368,6 +384,9 @@ public object PolyGlyphPage {
     public fun invalidate(face: Face) {
         invalidated.add(face)
         invalidatedPending = true
+        cpuInvalidated.add(face)
+        cpuEpoch.incrementAndGet()
+        cpuInvalidatedPending = true
     }
 
     private val invalidated = ConcurrentHashMap.newKeySet<Face>()
@@ -408,13 +427,15 @@ public object PolyGlyphPage {
         val slot = id * SUBPIXELS + phase
         val i = atlas.find(slot)
         if (i >= 0) return atlas.glyphAt(i)
-        return newGlyph(face, bucket, id, outlinePx, round, phase, lum).also { atlas.put(slot, it) }
+        return newGlyph(face, bucket, id, outlinePx, round, phase, lum, atlas.ring).also { atlas.put(slot, it) }
     }
 
-    private fun newGlyph(face: Face, bucket: Int, id: Int, outlinePx: Float, round: Boolean, phase: Int, lum: Int): Glyph? {
+    private fun newGlyph(face: Face, bucket: Int, id: Int, outlinePx: Float, round: Boolean, phase: Int, lum: Int, ring: Boolean): Glyph? {
         if (outlinePx > 0f) {
             val r = raster(face, bucket, id, phase) ?: return null
-            return if (r.color) null else place(dilate(r, max(1, (outlinePx * 4f).roundToInt()) / 4f, round))
+            if (r.color) return if (ring) place(r) else null
+            if (!fits(r, quarters(outlinePx) / 4f)) return null
+            return place(if (ring) hollow(r, quarters(outlinePx) / 4f) else dilate(r, quarters(outlinePx) / 4f, round))
         }
         val key = Prekey(face, bucket, id * SUBPIXELS + phase)
         val r = rasters.getOrPut(key) {
@@ -425,15 +446,84 @@ public object PolyGlyphPage {
         return place(if (lum < 0 || r.color) r else PolyMaskGamma.apply(r, lum))
     }
 
-    private fun dilate(r: Raster, radius: Float, round: Boolean): Raster {
+    private fun kernel(radius: Float, e: Int, round: Boolean): FloatArray = FloatArray((e * 2 + 1) * (e * 2 + 1)) { k ->
+        val dx = abs(k % (e * 2 + 1) - e).toFloat()
+        val dy = abs(k / (e * 2 + 1) - e).toFloat()
+        (radius + 1f - if (round) sqrt(dx * dx + dy * dy) else max(dx, dy)).coerceIn(0f, 1f)
+    }
+
+    private class Spans(radius: Float, val e: Int, round: Boolean) {
+        val span = e * 2 + 1
+        val weights = kernel(radius, e, round)
+        val flatLo = IntArray(span)
+        val flatHi = IntArray(span)
+        val outerLo = IntArray(span)
+        val outerHi = IntArray(span)
+        val fringe: IntArray
+        val fringeWeights: FloatArray
+
+        init {
+            var n = 0
+            for (ky in 0 until span) {
+                flatLo[ky] = span; flatHi[ky] = -1; outerLo[ky] = span; outerHi[ky] = -1
+                for (kx in 0 until span) {
+                    val w = weights[ky * span + kx]
+                    if (w <= 0f) continue
+                    outerLo[ky] = min(outerLo[ky], kx); outerHi[ky] = kx
+                    if (w >= 1f) { flatLo[ky] = min(flatLo[ky], kx); flatHi[ky] = kx } else n++
+                }
+            }
+            fringe = IntArray(n)
+            fringeWeights = FloatArray(n)
+            var i = 0
+            for (k in weights.indices) {
+                val w = weights[k]
+                if (w > 0f && w < 1f) { fringe[i] = k; fringeWeights[i++] = w }
+            }
+        }
+    }
+
+    private class RangeMax(values: IntArray, private val w: Int, h: Int) {
+        private val area = w * h
+        private val table: IntArray
+
+        init {
+            var levels = 1
+            while (1 shl levels <= w) levels++
+            table = IntArray(area * levels)
+            values.copyInto(table)
+            for (k in 1 until levels) {
+                val half = 1 shl (k - 1)
+                val at = k * area
+                val prev = at - area
+                for (y in 0 until h) {
+                    val row = y * w
+                    for (x in 0..w - (1 shl k)) table[at + row + x] = max(table[prev + row + x], table[prev + row + x + half])
+                }
+            }
+        }
+
+        fun query(y: Int, l: Int, r: Int): Int {
+            val k = 31 - Integer.numberOfLeadingZeros(r - l + 1)
+            val at = k * area + y * w
+            return max(table[at + l], table[at + r - (1 shl k) + 1])
+        }
+    }
+
+    private fun fits(r: Raster, radius: Float): Boolean {
+        val e = ceil(radius).toInt()
+        return r.w + e * 2 + PAD * 2 <= SIZE && r.h + e * 2 + PAD * 2 <= SIZE
+    }
+
+    private fun dilate(r: Raster, radius: Float, round: Boolean): Raster = if (ceil(radius).toInt() > DENSE_RADIUS) spanDilate(r, radius, round) else denseDilate(r, radius, round)
+
+    private fun hollow(r: Raster, radius: Float): Raster = if (ceil(radius).toInt() > DENSE_RADIUS) spanHollow(r, radius) else denseHollow(r, radius)
+
+    private fun denseDilate(r: Raster, radius: Float, round: Boolean): Raster {
         val e = ceil(radius).toInt()
         val w = r.w + e * 2
         val h = r.h + e * 2
-        val weights = FloatArray((e * 2 + 1) * (e * 2 + 1)) { k ->
-            val dx = abs(k % (e * 2 + 1) - e).toFloat()
-            val dy = abs(k / (e * 2 + 1) - e).toFloat()
-            (radius + 1f - if (round) sqrt(dx * dx + dy * dy) else max(dx, dy)).coerceIn(0f, 1f)
-        }
+        val weights = kernel(radius, e, round)
         val out = ByteArray(w * h)
         for (y in 0 until h) for (x in 0 until w) {
             var a = 0f
@@ -452,10 +542,111 @@ public object PolyGlyphPage {
         return Raster(r.offX - e, r.offY - e, w, h, out)
     }
 
+    private fun denseHollow(r: Raster, radius: Float): Raster {
+        val outer = dilate(r, radius, true)
+        val e = ceil(radius).toInt()
+        val span = e * 2 + 1
+        val weights = kernel(radius, e, true)
+        val out = outer.coverage
+        for (y in 0 until r.h) for (x in 0 until r.w) {
+            var gap = 0f
+            for (ky in 0 until span) {
+                val sy = y + ky - e
+                for (kx in 0 until span) {
+                    val sx = x + kx - e
+                    val c = if (sy in 0 until r.h && sx in 0 until r.w) r.coverage[sy * r.w + sx].toInt() and 0xFF else 0
+                    val v = (255 - c) * weights[ky * span + kx]
+                    if (v > gap) gap = v
+                }
+            }
+            val o = (y + e) * outer.w + x + e
+            out[o] = max(0, (out[o].toInt() and 0xFF) - (255f - gap).roundToInt()).toByte()
+        }
+        return outer
+    }
+
+    private fun spanDilate(r: Raster, radius: Float, round: Boolean): Raster {
+        val k = Spans(radius, ceil(radius).toInt(), round)
+        val e = k.e
+        val span = k.span
+        val w = r.w + e * 2
+        val h = r.h + e * 2
+        val out = ByteArray(w * h)
+        if (r.w <= 0 || r.h <= 0) return Raster(r.offX - e, r.offY - e, w, h, out)
+        val rows = RangeMax(IntArray(r.w * r.h) { r.coverage[it].toInt() and 0xFF }, r.w, r.h)
+        for (y in 0 until h) for (x in 0 until w) {
+            var flat = 0
+            var outer = 0
+            for (ky in max(0, y - r.h + 1)..min(span - 1, y)) {
+                val sy = y - ky
+                val oL = max(0, x - k.outerHi[ky])
+                val oR = min(r.w - 1, x - k.outerLo[ky])
+                if (oL > oR) continue
+                outer = max(outer, rows.query(sy, oL, oR))
+                val fL = max(0, x - k.flatHi[ky])
+                val fR = min(r.w - 1, x - k.flatLo[ky])
+                if (fL <= fR) flat = max(flat, rows.query(sy, fL, fR))
+            }
+            var a = flat.toFloat()
+            if (outer > flat) {
+                for (i in k.fringe.indices) {
+                    val sy = y - k.fringe[i] / span
+                    val sx = x - k.fringe[i] % span
+                    if (sy !in 0 until r.h || sx !in 0 until r.w) continue
+                    val v = (r.coverage[sy * r.w + sx].toInt() and 0xFF) * k.fringeWeights[i]
+                    if (v > a) a = v
+                }
+            }
+            out[y * w + x] = a.roundToInt().toByte()
+        }
+        return Raster(r.offX - e, r.offY - e, w, h, out)
+    }
+
+    private fun spanHollow(r: Raster, radius: Float): Raster {
+        val outer = dilate(r, radius, true)
+        if (r.w <= 0 || r.h <= 0) return outer
+        val k = Spans(radius, ceil(radius).toInt(), true)
+        val e = k.e
+        val span = k.span
+        val gaps = RangeMax(IntArray(r.w * r.h) { 255 - (r.coverage[it].toInt() and 0xFF) }, r.w, r.h)
+        val out = outer.coverage
+        for (y in 0 until r.h) for (x in 0 until r.w) {
+            var flat = 0
+            var wide = 0
+            for (ky in 0 until span) {
+                if (k.outerLo[ky] > k.outerHi[ky]) continue
+                val sy = y + ky - e
+                val inside = sy in 0 until r.h
+                val oL = x + k.outerLo[ky] - e
+                val oR = x + k.outerHi[ky] - e
+                wide = max(wide, if (inside && oL >= 0 && oR < r.w) gaps.query(sy, oL, oR) else 255)
+                if (k.flatLo[ky] > k.flatHi[ky]) continue
+                val fL = x + k.flatLo[ky] - e
+                val fR = x + k.flatHi[ky] - e
+                flat = max(flat, if (inside && fL >= 0 && fR < r.w) gaps.query(sy, fL, fR) else 255)
+                if (flat == 255) break
+            }
+            var gap = flat.toFloat()
+            if (wide > flat) {
+                for (i in k.fringe.indices) {
+                    val sy = y + k.fringe[i] / span - e
+                    val sx = x + k.fringe[i] % span - e
+                    val c = if (sy in 0 until r.h && sx in 0 until r.w) r.coverage[sy * r.w + sx].toInt() and 0xFF else 0
+                    val v = (255 - c) * k.fringeWeights[i]
+                    if (v > gap) gap = v
+                }
+            }
+            val o = (y + e) * outer.w + x + e
+            out[o] = max(0, (out[o].toInt() and 0xFF) - (255f - gap).roundToInt()).toByte()
+        }
+        return outer
+    }
+
     private const val BITMAP_MAX = 256
     private const val BITMAP_AREA = SIZE * SIZE * 2
 
     private val bitmaps = WeakHashMap<PolyBitmap, Glyph>()
+    private val placedLineages = WeakHashMap<Any, Boolean>()
     private var bitmapArea = 0
     private var placedSince = 0L
     private var placed = 0
@@ -464,6 +655,8 @@ public object PolyGlyphPage {
     public fun bitmap(b: PolyBitmap): Glyph? {
         bitmaps[b]?.let { return it }
         if (b.width > BITMAP_MAX || b.height > BITMAP_MAX) return null
+        val lineage = b.lineage
+        if (lineage != null && placedLineages.containsKey(lineage)) return null
         val now = System.nanoTime()
         if (now - placedSince > 1_000_000_000L) { placedSince = now; placed = 0 }
         if (++placed > 128) return null
@@ -475,6 +668,7 @@ public object PolyGlyphPage {
         val g = current().place(b) ?: newPage().place(b) ?: return null
         bitmapArea += area
         bitmaps[b] = g
+        if (lineage != null) placedLineages[lineage] = true
         return g
     }
 
@@ -515,5 +709,133 @@ public object PolyGlyphPage {
         val placements = bitmaps.values.iterator()
         while (placements.hasNext()) if (placements.next().page === page) placements.remove()
         bitmapArea = bitmapArea()
+    }
+
+    private const val MAX_CPU_PAGES = 2
+    private const val MAX_CPU_PAGES_GROWN = 8
+    private const val GHOST_SHARE = 8
+
+    private data class CpuKey(var face: Face?, var bucket: Int, var lum: Int, var outline: Int, var slot: Int, var ring: Boolean)
+
+    private val cpuGlyphs = ConcurrentHashMap<CpuKey, Any>()
+    private val cpuProbe = ThreadLocal.withInitial { CpuKey(null, 0, 0, 0, 0, false) }
+    private val cpuLock = Any()
+    private val cpuPages = ArrayList<Page>(MAX_CPU_PAGES_GROWN)
+    private val cpuPending = HashMap<CpuKey, CompletableFuture<Glyph?>>()
+    private val cpuGhosts = HashSet<CpuKey>()
+    private var cpuGhostHits = 0
+    private var cpuPageLimit = MAX_CPU_PAGES
+    private val cpuEpoch = AtomicLong()
+
+    @Volatile
+    private var cpuCurrent: Page? = null
+
+    private val cpuInvalidated = ConcurrentHashMap.newKeySet<Face>()
+
+    @Volatile
+    private var cpuInvalidatedPending = false
+
+    internal fun cpuWhite(): Page = cpuCurrent ?: synchronized(cpuLock) { cpuCurrent ?: cpuNewPage() }
+
+    internal fun cpuGlyph(face: Face, bucket: Int, id: Int, outlinePx: Float, round: Boolean, phase: Int, lum: Int, ring: Boolean = false): Glyph? {
+        if (cpuInvalidatedPending) cpuApplyInvalidations()
+        val q = if (outlinePx <= 0f) 0 else quarters(outlinePx)
+        val probe = cpuProbe.get()
+        probe.face = face; probe.bucket = bucket; probe.lum = if (q == 0) lum else -1
+        probe.outline = if (round || ring) q else -q; probe.slot = id * SUBPIXELS + phase; probe.ring = ring && q != 0
+        cpuGlyphs[probe]?.let { probe.face = null; return it as? Glyph }
+        val key = probe.copy()
+        probe.face = null
+        val mine = CompletableFuture<Glyph?>()
+        val other: CompletableFuture<Glyph?>?
+        val epoch: Long
+        synchronized(cpuLock) {
+            cpuGlyphs[key]?.let { return it as? Glyph }
+            other = cpuPending[key]
+            if (other == null) {
+                cpuPending[key] = mine
+                if (cpuGhosts.remove(key)) cpuGhostHits++
+            }
+            epoch = cpuEpoch.get()
+        }
+        if (other != null) return other.join()
+        var g: Glyph? = null
+        var published = false
+        try {
+            g = cpuPublish(key, mine, cpuRaster(face, bucket, id, outlinePx, round, phase, lum, ring), epoch)
+            published = true
+        } finally {
+            if (!published) synchronized(cpuLock) { cpuPending.remove(key, mine) }
+            mine.complete(g)
+        }
+        return g
+    }
+
+    private fun cpuPublish(key: CpuKey, pending: CompletableFuture<Glyph?>, r: Raster?, epoch: Long): Glyph? = synchronized(cpuLock) {
+        cpuPending.remove(key, pending)
+        val g = r?.let(::cpuPlace)
+        if (cpuEpoch.get() == epoch) cpuGlyphs[key] = g ?: NONE
+        g
+    }
+
+    private fun cpuRaster(face: Face, bucket: Int, id: Int, outlinePx: Float, round: Boolean, phase: Int, lum: Int, ring: Boolean): Raster? {
+        val r = raster(face, bucket, id, phase) ?: return null
+        if (outlinePx > 0f) {
+            if (r.color) return if (ring) r else null
+            if (!fits(r, quarters(outlinePx) / 4f)) return null
+            return if (ring) hollow(r, quarters(outlinePx) / 4f) else dilate(r, quarters(outlinePx) / 4f, round)
+        }
+        return if (lum < 0 || r.color) r else PolyMaskGamma.apply(r, lum)
+    }
+
+    private fun cpuPlace(r: Raster): Glyph? {
+        val edge = if (r.color) PAD + 1 else PAD
+        if (r.w <= 0 || r.h <= 0 || r.w + edge * 2 > SIZE || r.h + edge * 2 > SIZE) return null
+        return (cpuCurrent ?: cpuNewPage()).place(r) ?: cpuNewPage().place(r)
+    }
+
+    private fun cpuNewPage(): Page {
+        if (cpuPages.size >= cpuPageLimit) {
+            val thrashing = cpuGhosts.isNotEmpty() && cpuGhostHits * GHOST_SHARE >= cpuGhosts.size
+            if (thrashing && cpuPageLimit < MAX_CPU_PAGES_GROWN) {
+                cpuPageLimit++
+            } else {
+                if (!thrashing && cpuPageLimit > MAX_CPU_PAGES) cpuPageLimit--
+                cpuGhosts.clear()
+                while (cpuPages.size >= cpuPageLimit) cpuEvict(cpuPages.removeAt(0))
+            }
+            cpuGhostHits = 0
+        }
+        return Page(false).also {
+            cpuPages += it
+            cpuCurrent = it
+        }
+    }
+
+    private fun cpuEvict(page: Page) {
+        val entries = cpuGlyphs.entries.iterator()
+        while (entries.hasNext()) {
+            val e = entries.next()
+            val g = e.value
+            if (g is Glyph && g.page === page) {
+                cpuGhosts += e.key
+                entries.remove()
+            }
+        }
+    }
+
+    private fun cpuApplyInvalidations() {
+        synchronized(cpuLock) {
+            if (!cpuInvalidatedPending) return
+            cpuInvalidatedPending = false
+            val faces = cpuInvalidated.iterator()
+            while (faces.hasNext()) {
+                val face = faces.next()
+                faces.remove()
+                cpuGlyphs.keys.removeIf { it.face === face }
+                cpuGhosts.removeIf { it.face === face }
+                cpuPending.keys.removeIf { it.face === face }
+            }
+        }
     }
 }

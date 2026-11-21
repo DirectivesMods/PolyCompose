@@ -12,6 +12,7 @@ import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Canvas
 import androidx.compose.ui.graphics.ClipOp
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.ImageBitmap
@@ -26,6 +27,7 @@ import androidx.compose.ui.graphics.StampedPathEffectStyle
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.TileMode
+import androidx.compose.ui.graphics.VertexMode
 import androidx.compose.ui.graphics.Vertices
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
@@ -36,13 +38,16 @@ import androidx.compose.ui.unit.IntSize
 import org.polyfrost.compose.render.PolyBitmap
 import org.polyfrost.compose.render.ChromaShader
 import org.polyfrost.compose.render.PolyColor
+import org.polyfrost.compose.render.PolyEffectChain
 import org.polyfrost.compose.render.PolyFade
 import org.polyfrost.compose.render.PolyGradient
+import org.polyfrost.compose.render.PolyImageFill
 import org.polyfrost.compose.render.PolyPath
 import org.polyfrost.compose.render.PolyRenderer
 import org.polyfrost.compose.render.PolyShadow
 import org.polyfrost.compose.render.RenderContext
 import org.polyfrost.compose.render.placeBlur
+import org.polyfrost.compose.skiko.colorFilterEffect
 import java.util.WeakHashMap
 import kotlin.math.abs
 import kotlin.math.atan2
@@ -76,27 +81,30 @@ private val tintCache = WeakHashMap<PolyBitmap, LinkedHashMap<Long, PolyBitmap>>
 private val WHITEN = ColorMatrix(floatArrayOf(0f, 0f, 0f, 0f, 255f, 0f, 0f, 0f, 0f, 255f, 0f, 0f, 0f, 0f, 255f, 0f, 0f, 0f, 1f, 0f))
 
 // tinted images are usually already white masks, which SrcIn and multiplying treat the same, so those skip recoloring
-private fun isWhite(bitmap: PolyBitmap): Boolean = synchronized(whiteCache) {
-    whiteCache.getOrPut(bitmap) {
+private fun isWhite(bitmap: PolyBitmap): Boolean {
+    synchronized(whiteCache) { whiteCache[bitmap] }?.let { return it }
+    val made = run {
         val px = bitmap.pixels
         (px.indices step 4).all { o -> px[o + 3].toInt() == 0 || px[o].toInt() == -1 && px[o + 1].toInt() == -1 && px[o + 2].toInt() == -1 }
     }
+    synchronized(whiteCache) { whiteCache[bitmap] = made }
+    return made
 }
 
-private fun isOpaque(bitmap: PolyBitmap): Boolean = synchronized(opaqueCache) {
-    opaqueCache.getOrPut(bitmap) {
+private fun isOpaque(bitmap: PolyBitmap): Boolean {
+    synchronized(opaqueCache) { opaqueCache[bitmap] }?.let { return it }
+    val made = run {
         val px = bitmap.pixels
         (px.indices step 4).all { o -> px[o + 3].toInt() == -1 }
     }
+    synchronized(opaqueCache) { opaqueCache[bitmap] = made }
+    return made
 }
 
-private fun tinted(bitmap: PolyBitmap, color: Int, mode: BlendMode): PolyBitmap = synchronized(tintCache) {
-    val kept = tintCache.getOrPut(bitmap) {
-        object : LinkedHashMap<Long, PolyBitmap>(RECOLORS_KEPT + 1, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, PolyBitmap>) = size > RECOLORS_KEPT
-        }
-    }
-    kept.getOrPut((color.toLong() shl 32) or (mode.hashCode().toLong() and 0xFFFFFFFFL)) {
+private fun tinted(bitmap: PolyBitmap, color: Int, mode: BlendMode): PolyBitmap {
+    val key = (color.toLong() shl 32) or (mode.hashCode().toLong() and 0xFFFFFFFFL)
+    synchronized(tintCache) { tintCache[bitmap]?.get(key) }?.let { return it }
+    val made = run {
         val src = bitmap.pixels
         val out = ByteArray(src.size)
         for (o in src.indices step 4) {
@@ -106,9 +114,23 @@ private fun tinted(bitmap: PolyBitmap, color: Int, mode: BlendMode): PolyBitmap 
         }
         PolyBitmap(bitmap.width, bitmap.height, out)
     }
+    return synchronized(tintCache) {
+        val kept = tintCache.getOrPut(bitmap) {
+            object : LinkedHashMap<Long, PolyBitmap>(RECOLORS_KEPT + 1, 0.75f, true) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, PolyBitmap>) = size > RECOLORS_KEPT
+            }
+        }
+        kept.getOrPut(key) { made }
+    }
 }
 
-internal var imageBlur = 0f
+private val imageBlurs = ThreadLocal.withInitial { FloatArray(1) }
+
+internal var imageBlur: Float
+    get() = imageBlurs.get()[0]
+    set(value) {
+        imageBlurs.get()[0] = value
+    }
 
 /**
  * A blurred copy of a bitmap, [scaleX] by [scaleY] times smaller and padded by [padX] and [padY] of its own pixels on
@@ -125,16 +147,13 @@ private const val MAX_BLUR_PIXELS = 4_000_000L
 
 private val blurCache = WeakHashMap<PolyBitmap, LinkedHashMap<Long, Blurred>>()
 
-internal fun blurred(bitmap: PolyBitmap, sigmaX: Float, sigmaY: Float): Blurred? = synchronized(blurCache) {
+internal fun blurred(bitmap: PolyBitmap, sigmaX: Float, sigmaY: Float): Blurred? {
     val keyX = (sigmaX * 4f).toInt().coerceIn(0, MAX_BLUR_KEY)
     val keyY = (sigmaY * 4f).toInt().coerceIn(0, MAX_BLUR_KEY)
     if (keyX <= 0 && keyY <= 0) return null
-    val kept = blurCache.getOrPut(bitmap) {
-        object : LinkedHashMap<Long, Blurred>(BLURS_KEPT + 1, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, Blurred>) = size > BLURS_KEPT
-        }
-    }
-    kept.getOrPut((keyX.toLong() shl 32) or keyY.toLong()) {
+    val key = (keyX.toLong() shl 32) or keyY.toLong()
+    synchronized(blurCache) { blurCache[bitmap]?.get(key) }?.let { return it }
+    val made = run {
         val fullX = keyX / 4f
         val fullY = keyY / 4f
         // a wide blur hides detail anyway, so blurring a smaller copy looks the same for a fraction of the work
@@ -189,6 +208,14 @@ internal fun blurred(bitmap: PolyBitmap, sigmaX: Float, sigmaY: Float): Blurred?
         }
         Blurred(PolyBitmap(w, h, out), scaleX, scaleY, padX, padY)
     }
+    return synchronized(blurCache) {
+        val kept = blurCache.getOrPut(bitmap) {
+            object : LinkedHashMap<Long, Blurred>(BLURS_KEPT + 1, 0.75f, true) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, Blurred>) = size > BLURS_KEPT
+            }
+        }
+        kept.getOrPut(key) { made }
+    }
 }
 
 /** One box blur along [len] samples of each line, where the window reaches [r] samples each side with the last one weighted by its fraction */
@@ -211,14 +238,10 @@ private fun boxBlur(src: FloatArray, dst: FloatArray, len: Int, lines: Int, r: F
     }
 }
 
-private fun recolored(bitmap: PolyBitmap, matrix: ColorMatrix): PolyBitmap = synchronized(recolorCache) {
+private fun recolored(bitmap: PolyBitmap, matrix: ColorMatrix): PolyBitmap {
     val m = matrix.values
-    val kept = recolorCache.getOrPut(bitmap) {
-        object : LinkedHashMap<MatrixKey, PolyBitmap>(RECOLORS_KEPT + 1, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<MatrixKey, PolyBitmap>) = size > RECOLORS_KEPT
-        }
-    }
-    kept[MatrixKey(m)] ?: kept.getOrPut(MatrixKey(m.copyOf())) {
+    synchronized(recolorCache) { recolorCache[bitmap]?.get(MatrixKey(m)) }?.let { return it }
+    val made = run {
         val src = bitmap.pixels
         val out = ByteArray(src.size)
         for (o in src.indices step 4) {
@@ -233,11 +256,54 @@ private fun recolored(bitmap: PolyBitmap, matrix: ColorMatrix): PolyBitmap = syn
         }
         PolyBitmap(bitmap.width, bitmap.height, out)
     }
+    return synchronized(recolorCache) {
+        val kept = recolorCache.getOrPut(bitmap) {
+            object : LinkedHashMap<MatrixKey, PolyBitmap>(RECOLORS_KEPT + 1, 0.75f, true) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<MatrixKey, PolyBitmap>) = size > RECOLORS_KEPT
+            }
+        }
+        kept.getOrPut(MatrixKey(m.copyOf())) { made }
+    }
 }
 
 private fun Paint.fadeMask(): PolyFade? = (shader?.platformShader as? GradientShader)?.fade(alpha, blendMode == BlendMode.Modulate)
 
 private fun Paint.masks() = blendMode == BlendMode.DstIn || blendMode == BlendMode.Modulate
+
+private const val BLEND_IMAGE = 0
+private const val BLEND_STROKE = 1
+private const val BLEND_FILL = 2
+
+internal fun blendOf(mode: BlendMode): Int = when (mode) {
+    BlendMode.SrcOver -> PolyRenderer.BLEND_SRC_OVER
+    BlendMode.Src -> PolyRenderer.BLEND_SRC
+    BlendMode.DstOut -> PolyRenderer.BLEND_DST_OUT
+    BlendMode.DstIn -> PolyRenderer.BLEND_DST_IN
+    BlendMode.Plus -> PolyRenderer.BLEND_PLUS
+    BlendMode.SrcIn -> PolyRenderer.BLEND_SRC_IN
+    BlendMode.SrcOut -> PolyRenderer.BLEND_SRC_OUT
+    BlendMode.SrcAtop -> PolyRenderer.BLEND_SRC_ATOP
+    BlendMode.DstOver -> PolyRenderer.BLEND_DST_OVER
+    BlendMode.DstAtop -> PolyRenderer.BLEND_DST_ATOP
+    BlendMode.Xor -> PolyRenderer.BLEND_XOR
+    BlendMode.Modulate -> PolyRenderer.BLEND_MODULATE
+    BlendMode.Screen -> PolyRenderer.BLEND_SCREEN
+    else -> -1
+}
+
+internal fun layerBlendOf(mode: BlendMode): Int = if (mode == BlendMode.Clear) PolyRenderer.BLEND_SRC else blendOf(mode).coerceAtLeast(PolyRenderer.BLEND_SRC_OVER)
+
+internal fun layerAlphaOf(mode: BlendMode, alpha: Float): Float = if (mode == BlendMode.Clear || mode == BlendMode.Dst) 0f else alpha
+
+private val PORTABLE_BLENDS = setOf(BlendMode.SrcOver, BlendMode.Clear, BlendMode.Dst, BlendMode.Src, BlendMode.DstOut, BlendMode.DstIn, BlendMode.Plus)
+
+internal fun isPortableBlend(mode: BlendMode): Boolean = mode in PORTABLE_BLENDS
+
+private fun PolyPaint.solid(alpha: Float): PolyPaint = copy().also {
+    it.color = Color.Black.copy(alpha = alpha.coerceIn(0f, 1f))
+    it.shader = null
+    it.colorFilter = null
+}
 
 private class MaskOp(val fade: PolyFade) : (PolyCanvas) -> Unit {
     override fun invoke(c: PolyCanvas) = c.renderer.restore()
@@ -251,16 +317,17 @@ public fun DrawScope.drawPoly(block: (RenderContext) -> Unit): Unit = drawIntoCa
     (c as? PolyDrawCanvas)?.polyOp(DynamicOp(block))
 }
 
-internal fun PolyRenderer.clipTo(path: Path) {
+internal fun PolyRenderer.clipTo(path: Path, difference: Boolean = false) {
     val p = path as PolyComposePath
+    val rect = p.plainRect
+    if (difference) {
+        if (rect != null) return clipOutRect(rect.left, rect.top, rect.width, rect.height)
+        return clipPath(p.polyPath(), true)
+    }
     val rr = p.roundRect
     if (rr != null && rr.isSimple) return clipRRect(rr.left, rr.top, rr.width, rr.height, rr.topLeftCornerRadius.x)
-    val contours = p.allContours()
-    when {
-        // Paths with several contours are only clipped to their bounds
-        p.plainRect != null || contours.size != 1 -> p.getBounds().let { clipRect(it.left, it.top, it.width, it.height) }
-        else -> clipPolygon(contours[0])
-    }
+    if (rect != null) return clipRect(rect.left, rect.top, rect.width, rect.height)
+    clipPath(p.polyPath(), false)
 }
 
 public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
@@ -276,7 +343,26 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
     override fun save(): Unit = r.save()
     override fun restore(): Unit = r.restore()
 
-    override fun saveLayer(bounds: Rect, paint: Paint): Unit = r.saveLayerAlpha(paint.alpha)
+    private var layerFilter: ColorFilter? = null
+    private var layerChain: PolyEffectChain? = null
+
+    override fun saveLayer(bounds: Rect, paint: Paint) {
+        val mode = layerBlendOf(paint.blendMode)
+        val alpha = layerAlphaOf(paint.blendMode, paint.alpha)
+        val finite = bounds.isFinite
+        val chain = if (finite && r.effectSupport() and PolyRenderer.EFFECT_LAYER != 0) paint.colorFilter?.let(::filterChain) else null
+        if (chain != null) r.saveLayerEffect(bounds.left, bounds.top, bounds.width, bounds.height, 0f, chain, alpha, mode)
+        else r.saveLayerBlend(alpha, mode)
+        if (finite) r.clipRect(bounds.left, bounds.top, bounds.width, bounds.height)
+    }
+
+    private fun filterChain(filter: ColorFilter): PolyEffectChain? {
+        if (filter == layerFilter) return layerChain
+        val chain = colorFilterEffect(filter)?.let { PolyEffectChain(listOf(it)) }
+        layerFilter = filter
+        layerChain = chain
+        return chain
+    }
 
     override fun translate(dx: Float, dy: Float): Unit = r.translate(dx, dy)
     override fun scale(sx: Float, sy: Float): Unit = r.scale(sx, sy)
@@ -303,21 +389,21 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
     override fun clipRect(left: Float, top: Float, right: Float, bottom: Float, clipOp: ClipOp): Unit =
         if (clipOp == ClipOp.Intersect) r.clipRect(left, top, right - left, bottom - top) else r.clipOutRect(left, top, right - left, bottom - top)
 
-    override fun clipPath(path: Path, clipOp: ClipOp) {
-        // shortcut: clipping out a path is ignored; Compose itself only clips out rectangles (through clipRect),
-        // so only custom drawing is affected, and supporting it needs path clipping in the renderers
-        if (clipOp == ClipOp.Intersect) return r.clipTo(path)
-        (path as PolyComposePath).plainRect?.let { r.clipOutRect(it.left, it.top, it.width, it.height) }
-    }
+    override fun clipPath(path: Path, clipOp: ClipOp): Unit = r.clipTo(path, clipOp == ClipOp.Difference)
 
-    override fun drawLine(p1: Offset, p2: Offset, paint: Paint) {
-        val pp = paint as PolyPaint
+    override fun drawLine(p1: Offset, p2: Offset, paint: Paint): Unit = blended(paint, BLEND_STROKE) { line(p1, p2, it) }
+
+    private fun line(p1: Offset, p2: Offset, pp: PolyPaint) {
         if (chromaOf(pp) != null) {
-            val sw = pp.strokeWidth.coerceAtLeast(1f)
+            val sw = strokeWidthOf(pp)
             return chromaLive(pp, min(p1.x, p2.x) - sw, min(p1.y, p2.y) - sw, abs(p1.x - p2.x) + sw * 2f, abs(p1.y - p2.y) + sw * 2f) { c, tp -> c.segment(p1.x, p1.y, p2.x, p2.y, tp) }
         }
         segment(p1.x, p1.y, p2.x, p2.y, pp)
     }
+
+    private fun strokeWidthOf(paint: PolyPaint): Float = if (paint.strokeWidth > 0f) paint.strokeWidth else r.hairlineWidth()
+
+    private fun strokeWidthOf(paint: PolyPaint, dx: Float, dy: Float): Float = if (paint.strokeWidth > 0f) paint.strokeWidth else r.hairlineWidth(dx, dy)
 
     private fun chromaOf(paint: PolyPaint): ChromaShader? = paint.shader?.platformShader as? ChromaShader
 
@@ -337,7 +423,7 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
 
     private fun segment(x1: Float, y1: Float, x2: Float, y2: Float, paint: PolyPaint) {
         if (paint.strokeCap == StrokeCap.Butt && !paint.pathEffect.reshapes(true) && paint.shader == null) {
-            return r.line(x1, y1, x2, y2, paint.argb(), paint.strokeWidth.coerceAtLeast(1f))
+            return r.line(x1, y1, x2, y2, paint.argb(), strokeWidthOf(paint, x2 - x1, y2 - y1))
         }
         strokeContours(listOf(floatArrayOf(x1, y1, x2, y2)), OPEN, paint)
     }
@@ -354,14 +440,15 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
         }
         if (cs.isEmpty()) return
         val color = paint.argb()
-        val sw = paint.strokeWidth.coerceAtLeast(1f)
+        val sw = strokeWidthOf(paint)
         val cap = when (paint.strokeCap) { StrokeCap.Round -> PolyRenderer.CAP_ROUND; StrokeCap.Square -> PolyRenderer.CAP_SQUARE; else -> PolyRenderer.CAP_BUTT }
-        val join = if (paint.strokeJoin == StrokeJoin.Round) PolyRenderer.JOIN_ROUND else PolyRenderer.JOIN_MITER
+        val join = when (paint.strokeJoin) { StrokeJoin.Round -> PolyRenderer.JOIN_ROUND; StrokeJoin.Bevel -> PolyRenderer.JOIN_BEVEL; else -> PolyRenderer.JOIN_MITER }
+        val miter = paint.strokeMiterLimit
         val box = if (paint.shader == null) Rect.Zero else bounds(cs).inflate(sw / 2f)
         shaded(paint, box.left, box.top, box.width, box.height) { g ->
             for (i in cs.indices) {
-                if (g == null) r.strokePolyline(cs[i], cl[i], color, sw, cap, join)
-                else r.strokePolylineGradient(cs[i], cl[i], box.left, box.top, box.width, box.height, g, sw, cap, join)
+                if (g == null) r.strokePolyline(cs[i], cl[i], color, sw, cap, join, miter)
+                else r.strokePolylineGradient(cs[i], cl[i], box.left, box.top, box.width, box.height, g, sw, cap, join, miter)
             }
         }
     }
@@ -389,29 +476,29 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
         if (s == null || s is ChromaShader) return draw(null)
         if (paint.alpha < 1f) r.saveLayerAlpha(paint.alpha) else r.save()
         fadePushed = false
-        val brush = shaderBrush(s, x, y, w, h)
+        val brush = shaderBrush(s, x, y, w, h, paint.colorFilter)
         val faded = fadePushed
         if (brush != null) draw(brush)
         if (faded) r.restore()
         r.restore()
     }
 
-    private fun shaderBrush(s: PlatformShader, x: Float, y: Float, w: Float, h: Float): PolyGradient? {
+    private fun shaderBrush(s: PlatformShader, x: Float, y: Float, w: Float, h: Float, filter: ColorFilter?): PolyGradient? {
         when (s) {
-            is GradientShader -> if (s.tile == TileMode.Clamp || s.tile == TileMode.Decal && decalClip(s, x, y, w, h)) return s.brushFor(x, y, w, h)
+            is GradientShader -> if (s.tile == TileMode.Clamp || s.tile == TileMode.Decal && decalClip(s, x, y, w, h)) return s.brushFor(x, y, w, h, filter)
             is MaskedShader -> {
                 r.saveLayerFade(s.mask)
                 fadePushed = true
-                return s.color.brushFor(x, y, w, h)
+                return s.color.brushFor(x, y, w, h, filter)
             }
-            is ImageShader -> if (s.direct) {
+            is ImageShader -> if (s.direct && filter == null) {
                 val b = s.bitmap() ?: return null
                 if (imageDecalClip(s, b, x, y, w, h)) return s.fill(b)
             }
             is ClearShader -> return null
         }
         val k = r.deviceScale().coerceIn(MIN_RASTER_SCALE, MAX_RASTER_SCALE)
-        return ShaderRaster.fill(s, x, y, w, h, k, k)
+        return ShaderRaster.fill(s, x, y, w, h, k, k, filter)
     }
 
     private fun decalClip(s: GradientShader, x: Float, y: Float, w: Float, h: Float): Boolean {
@@ -473,28 +560,83 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
     }
 
     override fun drawRect(left: Float, top: Float, right: Float, bottom: Float, paint: Paint): Unit =
-        clearing(paint) { shape(left, top, right - left, bottom - top, 0f, paint as PolyPaint) }
+        blended(paint, kindOf(paint)) { shape(left, top, right - left, bottom - top, 0f, it) }
 
-    private inline fun clearing(paint: Paint, draw: () -> Unit) {
-        if (paint.blendMode != BlendMode.Clear) return draw()
-        // Only image bitmaps can be cleared; Compose clears them before redrawing cached content
-        val bitmap = r as? BitmapRenderer ?: return
-        bitmap.erasing = true
-        try { draw() } finally { bitmap.erasing = false }
+    private fun kindOf(paint: Paint) = if (paint.style == PaintingStyle.Fill) BLEND_FILL else BLEND_STROKE
+
+    private inline fun blended(paint: Paint, kind: Int, draw: (PolyPaint) -> Unit) {
+        val p = paint as PolyPaint
+        if (p.isAntiAlias) return blendedByMode(p, kind, draw)
+        r.antiAlias(false)
+        try {
+            blendedByMode(p, kind, draw)
+        } finally {
+            r.antiAlias(true)
+        }
     }
 
-    override fun drawRoundRect(left: Float, top: Float, right: Float, bottom: Float, radiusX: Float, radiusY: Float, paint: Paint): Unit =
-        clearing(paint) { shape(left, top, right - left, bottom - top, radiusX, paint as PolyPaint) }
+    private inline fun blendedByMode(p: PolyPaint, kind: Int, draw: (PolyPaint) -> Unit) {
+        val mode = p.blendMode
+        if (mode == BlendMode.SrcOver) return draw(p)
+        when (mode) {
+            BlendMode.Dst -> return
+            BlendMode.Clear -> return blendedWith(PolyRenderer.BLEND_DST_OUT, p.solid(1f), draw)
+            BlendMode.Src -> if (kind == BLEND_FILL && r.blend(PolyRenderer.BLEND_PLUS) && r.blend(PolyRenderer.BLEND_DST_OUT)) {
+                try {
+                    draw(p.solid(1f))
+                    r.blend(PolyRenderer.BLEND_PLUS)
+                    draw(p)
+                } finally {
+                    r.blend(PolyRenderer.BLEND_SRC_OVER)
+                }
+                return
+            }
+            BlendMode.DstIn -> if (kind != BLEND_IMAGE && p.shader == null) {
+                return blendedWith(PolyRenderer.BLEND_DST_OUT, p.solid(1f - (p.argb() ushr 24) / 255f), draw)
+            }
+        }
+        val m = blendOf(mode)
+        if (m >= 0 && r.blend(m)) return blendedWith(m, p, draw)
+        r.blend(PolyRenderer.BLEND_SRC_OVER)
+        if (!p.masks()) draw(p)
+    }
+
+    internal fun blendedText(mode: BlendMode, alpha: Float, draw: (Int?) -> Unit) {
+        if (mode == BlendMode.SrcOver) return draw(null)
+        val p = PolyPaint().also {
+            it.color = Color.Black.copy(alpha = alpha.coerceIn(0f, 1f))
+            it.blendMode = mode
+        }
+        blended(p, BLEND_FILL) { q -> draw(if (q === p) null else q.argb()) }
+    }
+
+    private inline fun blendedWith(mode: Int, paint: PolyPaint, draw: (PolyPaint) -> Unit) {
+        if (!r.blend(mode)) return
+        try {
+            draw(paint)
+        } finally {
+            r.blend(PolyRenderer.BLEND_SRC_OVER)
+        }
+    }
+
+    override fun drawRoundRect(left: Float, top: Float, right: Float, bottom: Float, radiusX: Float, radiusY: Float, paint: Paint) {
+        if (radiusX <= 0f || radiusY <= 0f) return blended(paint, kindOf(paint)) { shape(left, top, right - left, bottom - top, 0f, it) }
+        if (abs(radiusX - radiusY) > ELLIPTICAL_EPSILON) {
+            val corners = RoundRect(Rect(left, top, right, bottom), CornerRadius(radiusX, radiusY))
+            return drawPath(PolyComposePath().apply { addRoundRect(corners, Path.Direction.Clockwise) }, paint)
+        }
+        blended(paint, kindOf(paint)) { shape(left, top, right - left, bottom - top, radiusX, it) }
+    }
 
     override fun drawOval(left: Float, top: Float, right: Float, bottom: Float, paint: Paint) {
         val w = right - left
         val h = bottom - top
-        if (abs(w - h) < 0.5f) clearing(paint) { shape(left, top, w, h, min(w, h) / 2f, paint as PolyPaint) }
+        if (abs(w - h) < 0.5f) blended(paint, kindOf(paint)) { shape(left, top, w, h, min(w, h) / 2f, it) }
         else drawPath(ovalPath(left, top, right, bottom), paint)
     }
 
     override fun drawCircle(center: Offset, radius: Float, paint: Paint): Unit =
-        clearing(paint) { shape(center.x - radius, center.y - radius, radius * 2f, radius * 2f, radius, paint as PolyPaint) }
+        blended(paint, kindOf(paint)) { shape(center.x - radius, center.y - radius, radius * 2f, radius * 2f, radius, it) }
 
     private val arcKey = FloatArray(6)
     private var arcCenter = false
@@ -512,7 +654,7 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
         drawPath(p, paint)
     }
 
-    override fun drawPath(path: Path, paint: Paint): Unit = clearing(paint) { fillOrStroke(path as PolyComposePath, paint as PolyPaint) }
+    override fun drawPath(path: Path, paint: Paint): Unit = blended(paint, kindOf(paint)) { fillOrStroke(path as PolyComposePath, it) }
 
     private fun fillOrStroke(p: PolyComposePath, pp: PolyPaint) {
         val stroke = pp.style == PaintingStyle.Stroke
@@ -524,7 +666,7 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
         }
         if (chromaOf(pp) != null) {
             val b = p.getBounds()
-            val sw = if (stroke) pp.strokeWidth.coerceAtLeast(1f) else 0f
+            val sw = if (stroke) strokeWidthOf(pp) else 0f
             val copy = PolyComposePath().also { it.fillType = p.fillType; it.addPath(p, Offset.Zero) }
             return chromaLive(pp, b.left - sw, b.top - sw, b.width + sw * 2f, b.height + sw * 2f) { c, tp -> c.fillOrStroke(copy, tp) }
         }
@@ -541,7 +683,7 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
     }
 
     private fun shape(x: Float, y: Float, w: Float, h: Float, radius: Float, paint: PolyPaint) {
-        if (w <= 0f || h <= 0f || paint.masks()) return
+        if (w <= 0f || h <= 0f) return
         val blur = if (paint.blur > 0f) paint.blur
         else if (imageBlur > 0.5f && paint.style == PaintingStyle.Fill && paint.shader == null) (imageBlur - 0.5f) / 0.57735f
         else 0f
@@ -554,10 +696,11 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
         if (paint.pathEffect.reshapes(stroke)) return fillOrStroke(outline(x, y, w, h, radius), paint)
         if (stroke) {
             val s = paint.shader?.platformShader
-            if (s != null && !(s is GradientShader && s.tile == TileMode.Clamp) && s !is MaskedShader) {
+            val cutCorners = radius <= 0f && (paint.strokeJoin != StrokeJoin.Miter || paint.strokeMiterLimit * paint.strokeMiterLimit < 2f)
+            if (cutCorners || (s != null && !(s is GradientShader && s.tile == TileMode.Clamp) && s !is MaskedShader)) {
                 return strokeContours(outline(x, y, w, h, radius).allContours(), CLOSED, paint)
             }
-            val sw = paint.strokeWidth.coerceAtLeast(1f)
+            val sw = strokeWidthOf(paint)
             return shaded(paint, x, y, w, h) { g ->
                 if (g == null) r.rectStroke(x, y, w, h, paint.argb(), sw, radius)
                 else r.rectStrokeGradient(x, y, w, h, g, sw, radius)
@@ -568,7 +711,7 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
 
     private fun chromaShape(x: Float, y: Float, w: Float, h: Float, radius: Float, paint: PolyPaint, color: PolyColor) {
         val stroke = paint.style == PaintingStyle.Stroke
-        val sw = paint.strokeWidth.coerceAtLeast(1f)
+        val sw = strokeWidthOf(paint)
         val alpha = paint.alpha
         fun tinted(): Int {
             val c = color.argb
@@ -579,12 +722,21 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
         }
     }
 
-    override fun drawImage(image: ImageBitmap, topLeftOffset: Offset, paint: Paint): Unit =
-        image(image, 0f, 0f, image.width.toFloat(), image.height.toFloat(), topLeftOffset.x, topLeftOffset.y, image.width.toFloat(), image.height.toFloat(), paint as PolyPaint)
+    override fun drawImage(image: ImageBitmap, topLeftOffset: Offset, paint: Paint) {
+        val w = image.width.toFloat()
+        val h = image.height.toFloat()
+        if (paint.blendMode == BlendMode.Clear) return drawRect(topLeftOffset.x, topLeftOffset.y, topLeftOffset.x + w, topLeftOffset.y + h, paint)
+        blended(paint, BLEND_IMAGE) { image(image, 0f, 0f, w, h, topLeftOffset.x, topLeftOffset.y, w, h, it) }
+    }
 
-    override fun drawImageRect(image: ImageBitmap, srcOffset: IntOffset, srcSize: IntSize, dstOffset: IntOffset, dstSize: IntSize, paint: Paint): Unit =
-        image(image, srcOffset.x.toFloat(), srcOffset.y.toFloat(), srcSize.width.toFloat(), srcSize.height.toFloat(),
-            dstOffset.x.toFloat(), dstOffset.y.toFloat(), dstSize.width.toFloat(), dstSize.height.toFloat(), paint as PolyPaint)
+    override fun drawImageRect(image: ImageBitmap, srcOffset: IntOffset, srcSize: IntSize, dstOffset: IntOffset, dstSize: IntSize, paint: Paint) {
+        val x = dstOffset.x.toFloat()
+        val y = dstOffset.y.toFloat()
+        if (paint.blendMode == BlendMode.Clear) return drawRect(x, y, x + dstSize.width, y + dstSize.height, paint)
+        blended(paint, BLEND_IMAGE) {
+            image(image, srcOffset.x.toFloat(), srcOffset.y.toFloat(), srcSize.width.toFloat(), srcSize.height.toFloat(), x, y, dstSize.width.toFloat(), dstSize.height.toFloat(), it)
+        }
+    }
 
     private fun image(image: ImageBitmap, srcX: Float, srcY: Float, srcW: Float, srcH: Float, dstX: Float, dstY: Float, dstW: Float, dstH: Float, paint: PolyPaint) {
         var bmp = (image as? PolyImageBitmap)?.bitmap ?: return
@@ -639,15 +791,16 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
         drawRawPoints(pointMode, raw, paint)
     }
 
-    override fun drawRawPoints(pointMode: PointMode, points: FloatArray, paint: Paint) {
-        val pp = paint as PolyPaint
-        val sw = pp.strokeWidth.coerceAtLeast(1f)
+    override fun drawRawPoints(pointMode: PointMode, points: FloatArray, paint: Paint): Unit = blended(paint, BLEND_STROKE) { rawPoints(pointMode, points, it) }
+
+    private fun rawPoints(pointMode: PointMode, points: FloatArray, pp: PolyPaint) {
+        val sw = strokeWidthOf(pp)
         if (chromaOf(pp) != null) {
             var l = Float.MAX_VALUE; var t = Float.MAX_VALUE; var rt = -Float.MAX_VALUE; var b = -Float.MAX_VALUE
             for (k in 0 until points.size - 1 step 2) { l = min(l, points[k]); rt = max(rt, points[k]); t = min(t, points[k + 1]); b = max(b, points[k + 1]) }
             if (l > rt) return
             val copy = points.copyOf()
-            return chromaLive(pp, l - sw, t - sw, rt - l + sw * 2f, b - t + sw * 2f) { c, tp -> c.drawRawPoints(pointMode, copy, tp) }
+            return chromaLive(pp, l - sw, t - sw, rt - l + sw * 2f, b - t + sw * 2f) { c, tp -> c.rawPoints(pointMode, copy, tp) }
         }
         val c = pp.argb()
         when (pointMode) {
@@ -657,10 +810,53 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
         }
     }
 
-    override fun drawVertices(vertices: Vertices, blendMode: BlendMode, paint: Paint) {}
+    override fun drawVertices(vertices: Vertices, blendMode: BlendMode, paint: Paint) {
+        val pp = paint as PolyPaint
+        val order = triangleOrder(vertices)
+        if (order.size < 3) return
+        val positions = vertices.positions
+        val coords = vertices.textureCoordinates.takeIf { it.size == positions.size } ?: positions
+        val shader = pp.shader?.platformShader?.takeIf { blendMode != BlendMode.Dst && it !is ChromaShader }
+        val image = (shader as? ImageShader)?.takeIf { it.direct && pp.colorFilter == null }
+        val fill = when {
+            shader == null -> null
+            image != null -> image.bitmap()?.let { image.fill(it) }
+            else -> shaderFill(shader, coords, pp.colorFilter)
+        }
+        if (shader != null && fill == null) return
+        val bitmap = fill?.bitmap
+        val uvs = fill?.let { f -> FloatArray(coords.size) { if (it % 2 == 0) f.u(coords[it], coords[it + 1]) else f.v(coords[it - 1], coords[it]) } }
+        val decalU = image?.tileX == TileMode.Decal
+        val decalV = image?.tileY == TileMode.Decal
+        val count = positions.size / 2
+        val fallback = if (shader != null) -1 else pp.color.toArgb() or -0x1000000
+        val shaderOnly = shader != null && blendMode == BlendMode.Src
+        blended(paint, BLEND_STROKE) { tp ->
+            val colors = IntArray(count) { withAlpha(if (shaderOnly) -1 else vertices.colors.getOrElse(it) { fallback }, tp.alpha) }
+            if (uvs != null && (decalU || decalV)) {
+                val mesh = decalClipped(positions, colors, uvs, order, decalU, decalV)
+                if (mesh.indices.size >= 3) r.triangles(mesh.positions, mesh.colors, mesh.indices, bitmap, mesh.uvs)
+            } else {
+                r.triangles(positions, colors, order, bitmap, uvs)
+            }
+        }
+    }
+
+    private fun shaderFill(shader: PlatformShader, coords: FloatArray, filter: ColorFilter?): PolyImageFill? {
+        var l = Float.MAX_VALUE; var t = Float.MAX_VALUE; var rt = -Float.MAX_VALUE; var b = -Float.MAX_VALUE
+        for (k in 0 until coords.size - 1 step 2) { l = min(l, coords[k]); rt = max(rt, coords[k]); t = min(t, coords[k + 1]); b = max(b, coords[k + 1]) }
+        if (l > rt) return null
+        val k = r.deviceScale().coerceIn(MIN_RASTER_SCALE, MAX_RASTER_SCALE)
+        val w = rt - l
+        val h = b - t
+        return ShaderRaster.fill(shader, if (w > 0f) l else l - 0.5f, if (h > 0f) t else t - 0.5f, if (w > 0f) w else 1f, if (h > 0f) h else 1f, k, k, filter)
+    }
+
     override fun enableZ() {}
     override fun disableZ() {}
 }
+
+private const val ELLIPTICAL_EPSILON = 0.01f
 
 private const val MIN_RASTER_SCALE = 0.25f
 
@@ -673,8 +869,8 @@ private val OPEN = listOf(false)
 private val CLOSED = listOf(true)
 
 private fun outline(x: Float, y: Float, w: Float, h: Float, radius: Float): PolyComposePath = PolyComposePath().apply {
-    if (radius > 0f) addRoundRect(RoundRect(Rect(x, y, x + w, y + h), CornerRadius(radius)), Path.Direction.CounterClockwise)
-    else addRect(Rect(x, y, x + w, y + h), Path.Direction.CounterClockwise)
+    if (radius > 0f) addRoundRect(RoundRect(Rect(x, y, x + w, y + h), CornerRadius(radius)), Path.Direction.Clockwise)
+    else addRect(Rect(x, y, x + w, y + h), Path.Direction.Clockwise)
 }
 
 private class Effected(val contours: List<FloatArray>, val closed: List<Boolean>, val filled: Boolean)
@@ -795,8 +991,65 @@ private fun posTan(c: FloatArray, n: Int, cum: FloatArray, segs: Int, d: Float, 
     out[0] = ax + tx * t; out[1] = ay + ty * t; out[2] = tx; out[3] = ty
 }
 
+private class Corner(val x: Float, val y: Float, val u: Float, val v: Float, val color: Int)
+
+private class VertexMesh(val positions: FloatArray, val colors: IntArray, val uvs: FloatArray, val indices: IntArray)
+
+private fun decalClipped(positions: FloatArray, colors: IntArray, uvs: FloatArray, order: IntArray, decalU: Boolean, decalV: Boolean): VertexMesh {
+    val xy = FloatArrayList()
+    val st = FloatArrayList()
+    val argb = ArrayList<Int>()
+    val out = ArrayList<Int>()
+    for (t in 0 until order.size / 3) {
+        var poly = List(3) {
+            val i = order[t * 3 + it]
+            Corner(positions[i * 2], positions[i * 2 + 1], uvs[i * 2], uvs[i * 2 + 1], colors[i])
+        }
+        if (decalU) poly = clipCorners(clipCorners(poly, 0f, true) { it.u }, 1f, false) { it.u }
+        if (decalV) poly = clipCorners(clipCorners(poly, 0f, true) { it.v }, 1f, false) { it.v }
+        if (poly.size < 3) continue
+        val base = argb.size
+        for (c in poly) {
+            xy.add(c.x, c.y)
+            st.add(c.u, c.v)
+            argb += c.color
+        }
+        for (k in 1 until poly.size - 1) { out += base; out += base + k; out += base + k + 1 }
+    }
+    return VertexMesh(xy.toArray(), argb.toIntArray(), st.toArray(), out.toIntArray())
+}
+
+private inline fun clipCorners(poly: List<Corner>, bound: Float, keepAbove: Boolean, value: (Corner) -> Float): List<Corner> {
+    if (poly.size < 3) return poly
+    val sign = if (keepAbove) 1f else -1f
+    val out = ArrayList<Corner>(poly.size + 1)
+    for (i in poly.indices) {
+        val a = poly[i]
+        val b = poly[(i + 1) % poly.size]
+        val da = (value(a) - bound) * sign
+        val db = (value(b) - bound) * sign
+        if (da >= 0f) out += a
+        if ((da > 0f && db < 0f) || (da < 0f && db > 0f)) {
+            val f = da / (da - db)
+            out += Corner(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f, a.u + (b.u - a.u) * f, a.v + (b.v - a.v) * f, PolyGradient.lerpArgb(a.color, b.color, f))
+        }
+    }
+    return out
+}
+
+private fun triangleOrder(v: Vertices): IntArray {
+    val seq = if (v.indices.isEmpty()) IntArray(v.positions.size / 2) { it } else IntArray(v.indices.size) { v.indices[it].toInt() and 0xFFFF }
+    val n = seq.size
+    if (n < 3) return IntArray(0)
+    return when (v.vertexMode) {
+        VertexMode.TriangleStrip -> IntArray((n - 2) * 3) { seq[it / 3 + it % 3] }
+        VertexMode.TriangleFan -> IntArray((n - 2) * 3) { if (it % 3 == 0) seq[0] else seq[it / 3 + it % 3] }
+        else -> IntArray(n / 3 * 3) { seq[it] }
+    }
+}
+
 private fun ovalPath(left: Float, top: Float, right: Float, bottom: Float): PolyComposePath =
-    PolyComposePath().apply { addOval(Rect(left, top, right, bottom), Path.Direction.CounterClockwise) }
+    PolyComposePath().apply { addOval(Rect(left, top, right, bottom), Path.Direction.Clockwise) }
 
 private fun arcPath(left: Float, top: Float, right: Float, bottom: Float, startAngle: Float, sweepAngle: Float, useCenter: Boolean): PolyComposePath {
     val p = PolyComposePath()
@@ -822,6 +1075,7 @@ private fun dashes(c: FloatArray, closed: Boolean, e: DashEffect): List<FloatArr
     while (pos > iv[k]) { pos -= iv[k]; k = (k + 1) % iv.size }
     var rem = iv[k] - pos
     var on = k % 2 == 0
+    val startsOn = on
     val out = ArrayList<FloatArray>()
     var cur = FloatArrayList()
     if (on) cur.add(c[0], c[1])
@@ -843,7 +1097,13 @@ private fun dashes(c: FloatArray, closed: Boolean, e: DashEffect): List<FloatArr
         rem -= len - t
         if (on) cur.add(bx, by)
     }
-    if (on && cur.size >= 4) out += cur.toArray()
+    if (on && cur.size >= 4) {
+        if (closed && startsOn && out.isNotEmpty()) {
+            val head = out.removeAt(0)
+            for (i in 1 until head.size / 2) cur.add(head[i * 2], head[i * 2 + 1])
+        }
+        out += cur.toArray()
+    }
     return out
 }
 
@@ -882,7 +1142,7 @@ public class RecordingCanvas : PolyDrawCanvas {
     override fun clipPath(path: Path, clipOp: ClipOp) { val p = path.copyPath(); polyOp { it.clipPath(p, clipOp) } }
     override fun drawLine(p1: Offset, p2: Offset, paint: Paint) { val p = paint.snap(); polyOp { it.drawLine(p1, p2, p) } }
     override fun drawRect(left: Float, top: Float, right: Float, bottom: Float, paint: Paint) {
-        if (paint.masks()) { paint.fadeMask()?.let { ops += MaskOp(it) }; return }
+        if (paint.masks()) paint.fadeMask()?.let { ops += MaskOp(it); return }
         val p = paint.snap()
         polyOp { it.drawRect(left, top, right, bottom, p) }
     }
@@ -904,7 +1164,7 @@ public class RecordingCanvas : PolyDrawCanvas {
     override fun drawImageRect(image: ImageBitmap, srcOffset: IntOffset, srcSize: IntSize, dstOffset: IntOffset, dstSize: IntSize, paint: Paint) { val p = paint.snap(); polyOp { it.drawImageRect(image, srcOffset, srcSize, dstOffset, dstSize, p) } }
     override fun drawPoints(pointMode: PointMode, points: List<Offset>, paint: Paint) { val p = paint.snap(); val pts = points.toList(); polyOp { it.drawPoints(pointMode, pts, p) } }
     override fun drawRawPoints(pointMode: PointMode, points: FloatArray, paint: Paint) { val p = paint.snap(); val pts = points.copyOf(); polyOp { it.drawRawPoints(pointMode, pts, p) } }
-    override fun drawVertices(vertices: Vertices, blendMode: BlendMode, paint: Paint) {}
+    override fun drawVertices(vertices: Vertices, blendMode: BlendMode, paint: Paint) { val p = paint.snap(); polyOp { it.drawVertices(vertices, blendMode, p) } }
     override fun enableZ() {}
     override fun disableZ() {}
 

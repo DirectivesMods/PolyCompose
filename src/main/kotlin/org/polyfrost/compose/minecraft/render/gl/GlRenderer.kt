@@ -11,6 +11,7 @@ import org.lwjgl.opengl.GL15
 import org.lwjgl.opengl.GL20
 import org.lwjgl.opengl.GL30
 import org.lwjgl.opengl.GL33
+import org.polyfrost.compose.render.BitmapTextureCache
 import org.polyfrost.compose.render.CapturingRenderer
 import org.polyfrost.compose.render.PolyBackdrop
 import org.polyfrost.compose.render.PolyEffectChain
@@ -197,10 +198,14 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
 
     override fun submit(texture: Any, premultiplied: Boolean, nearest: Boolean, verts: FloatArray, colors: IntArray, bounds: FloatArray) {
         RenderCounters.op()
-        batches.add(GlProgram.Batch(texture, premultiplied, nearest, verts, colors))
+        batches.add(GlProgram.Batch(texture, premultiplied, nearest, verts, colors, blendMode))
     }
 
     override val layered: Boolean get() = !GlHost.vanillaPipeline
+
+    override fun blendSupported(mode: Int): Boolean = !GlHost.vanillaPipeline && mode in PolyRenderer.BLEND_SRC_OVER..PolyRenderer.BLEND_SCREEN
+
+    override fun layerBlendSupported(mode: Int): Boolean = blendSupported(mode)
 
     override fun layerMark(): Any = intArrayOf(batches.size, lives.size)
 
@@ -224,7 +229,7 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
                 val l = subLives[li++]
                 run.add(l.moved(l.at - m[0] - start))
             }
-            grouped(ArrayList(sub.subList(start, i)), run, alpha, effect)?.let { out.add(it.batch) }
+            grouped(ArrayList(sub.subList(start, i)), run, alpha, effect)?.let { out.add(it.batch.blended(blendMode)) }
             if (i < sub.size) out.add(sub[i].faded(alpha))
             start = i + 1
         }
@@ -262,6 +267,7 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
     }
 
     override fun fade(mark: Any, alpha: Float): Boolean {
+        if (alpha >= 1f) return true
         val m = mark as IntArray
         for (i in m[0] until batches.size) batches[i] = batches[i].faded(alpha)
         for (i in m[1] until lives.size) {
@@ -793,12 +799,17 @@ internal object GlFrames {
 *///?}
 
 internal object GlProgram {
-    class Batch(val texture: Any, val premultiplied: Boolean, val nearest: Boolean, val verts: FloatArray, val colors: IntArray) {
+    class Batch(
+        val texture: Any, val premultiplied: Boolean, val nearest: Boolean, val verts: FloatArray, val colors: IntArray,
+        val blend: Int = PolyRenderer.BLEND_SRC_OVER,
+    ) {
         @JvmField var arenaAt = 0
         @JvmField var arenaGen = -1
         @JvmField var seen = -1L
 
-        fun sameKey(o: Batch) = texture === o.texture && premultiplied == o.premultiplied && nearest == o.nearest
+        fun sameKey(o: Batch) = texture === o.texture && premultiplied == o.premultiplied && nearest == o.nearest && blend == o.blend
+
+        fun blended(mode: Int): Batch = if (mode == blend) this else Batch(texture, premultiplied, nearest, verts, colors, mode)
 
         fun shifted(dx: Float, dy: Float): Batch {
             val v = verts.copyOf()
@@ -806,10 +817,10 @@ internal object GlProgram {
                 v[i * 4] += dx
                 v[i * 4 + 1] += dy
             }
-            return Batch(texture, premultiplied, nearest, v, colors)
+            return Batch(texture, premultiplied, nearest, v, colors, blend)
         }
 
-        fun faded(alpha: Float) = Batch(texture, premultiplied, nearest, verts, IntArray(colors.size) { i ->
+        fun faded(alpha: Float) = Batch(texture, premultiplied, nearest, verts, blend = blend, colors = IntArray(colors.size) { i ->
             val c = colors[i]
             if (premultiplied) {
                 var out = 0
@@ -837,7 +848,7 @@ internal object GlProgram {
                     o += b.colors.size
                 }
                 val first = list[0]
-                return Batch(first.texture, first.premultiplied, first.nearest, verts, colors)
+                return Batch(first.texture, first.premultiplied, first.nearest, verts, colors, first.blend)
             }
         }
     }
@@ -893,6 +904,22 @@ internal object GlProgram {
     private var drawVbo = 0
     private var boundTex = -1
     private var boundPremul = -1
+    private var boundBlend = PolyRenderer.BLEND_SRC_OVER
+    private val blendFactors = intArrayOf(
+        GL11.GL_ONE, GL11.GL_ONE_MINUS_SRC_ALPHA,
+        GL11.GL_ONE, GL11.GL_ZERO,
+        GL11.GL_ZERO, GL11.GL_ONE_MINUS_SRC_ALPHA,
+        GL11.GL_ZERO, GL11.GL_SRC_ALPHA,
+        GL11.GL_ONE, GL11.GL_ONE,
+        GL11.GL_DST_ALPHA, GL11.GL_ZERO,
+        GL11.GL_ONE_MINUS_DST_ALPHA, GL11.GL_ZERO,
+        GL11.GL_DST_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA,
+        GL11.GL_ONE_MINUS_DST_ALPHA, GL11.GL_ONE,
+        GL11.GL_ONE_MINUS_DST_ALPHA, GL11.GL_SRC_ALPHA,
+        GL11.GL_ONE_MINUS_DST_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA,
+        GL11.GL_ZERO, GL11.GL_SRC_COLOR,
+        GL11.GL_ONE, GL11.GL_ONE_MINUS_SRC_COLOR,
+    )
     private var vertexData: ByteBuffer = BufferUtils.createByteBuffer(1 shl 16)
     private var vertexInts: IntBuffer = vertexData.asIntBuffer()
     private var scratch = IntArray(vertexData.capacity() / 4)
@@ -1210,6 +1237,7 @@ internal object GlProgram {
         GL13.glActiveTexture(GL13.GL_TEXTURE0)
         boundTex = -1
         boundPremul = -1
+        boundBlend = PolyRenderer.BLEND_SRC_OVER
     }
 
     private fun drawBatch(b: Batch, first: Int) {
@@ -1222,7 +1250,14 @@ internal object GlProgram {
                 GlEffects.finish()
             }
             GL20.glUseProgram(program)
+            boundBlend = -1
             return
+        }
+        if (b.blend != boundBlend) {
+            val s = blendFactors[b.blend * 2]
+            val d = blendFactors[b.blend * 2 + 1]
+            GL14.glBlendFuncSeparate(s, d, s, d)
+            boundBlend = b.blend
         }
         val tex = GlTextures.id(b.texture)
         if (tex != boundTex) {
@@ -1319,8 +1354,9 @@ void main() { vec4 c = texture2D(uTex, vUv) * vColor; gl_FragColor = uPremul == 
 }
 
 internal object GlTextures {
-    class Tex(val bitmap: PolyBitmap?, var id: Int, var lastUsed: Long) {
+    class Tex(val bitmap: PolyBitmap?, var id: Int) {
         var filter = GL11.GL_LINEAR
+        internal var stale = false
     }
 
     private class PageTex(val id: Int, var lastUsed: Long, var mask: Boolean) {
@@ -1328,7 +1364,7 @@ internal object GlTextures {
         var filter = GL11.GL_LINEAR
     }
 
-    private val bitmaps = IdentityHashMap<PolyBitmap, Tex>()
+    private val bitmaps = BitmapTextureCache<Tex>(RELEASE_FRAMES)
     private val external = HashMap<Int, Tex>()
     private val pages = IdentityHashMap<PolyGlyphPage.Page, PageTex>()
     private var uploadBytes: ByteBuffer? = null
@@ -1354,9 +1390,9 @@ internal object GlTextures {
         when (key) {
             is GlRenderer.Group -> return nearest && key.restsNearest
             is Tex -> {
-                if (key.bitmap == null) return false
-                if (key.filter != mode) {
-                    key.filter = mode
+                val tex = current(key, key.bitmap ?: return false)
+                if (tex.filter != mode) {
+                    tex.filter = mode
                     applyFilter(mode)
                 }
                 return true
@@ -1378,24 +1414,44 @@ internal object GlTextures {
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, mode)
     }
 
-    fun bitmap(bitmap: PolyBitmap): Tex = bitmaps.getOrPut(bitmap) {
-        scanAt = min(scanAt, frame + RELEASE_FRAMES + 1)
-        Tex(bitmap, 0, frame)
-    }.also { it.lastUsed = frame }
+    fun bitmap(bitmap: PolyBitmap): Tex = bitmaps.get(bitmap)?.texture ?: adopt(bitmap) ?: Tex(bitmap, 0).also { bitmaps.add(bitmap, it) }
 
-    fun external(id: Int): Tex = external.getOrPut(id) { Tex(null, id, 0) }
+    private fun adopt(bitmap: PolyBitmap): Tex? {
+        val e = bitmaps.adopt(bitmap) ?: return null
+        val old = e.texture
+        val tex = Tex(bitmap, old.id)
+        tex.filter = old.filter
+        tex.stale = old.id != 0
+        old.id = 0
+        old.stale = false
+        e.texture = tex
+        return tex
+    }
 
-    fun alive(key: Any): Boolean = key !is Tex || key.bitmap == null || bitmaps[key.bitmap] === key
+    private fun current(key: Tex, bitmap: PolyBitmap): Tex {
+        bitmaps.get(bitmap)?.let { return it.texture }
+        key.id = 0
+        key.stale = false
+        bitmaps.add(bitmap, key)
+        return key
+    }
+
+    fun external(id: Int): Tex = external.getOrPut(id) { Tex(null, id) }
+
+    fun alive(key: Any): Boolean = key !is Tex || key.bitmap.let { it == null || bitmaps.peek(it)?.texture === key }
 
     fun id(key: Any): Int = when (key) {
         is PolyGlyphPage.Page -> glyphPage(key)
         is GlRenderer.Group -> key.tex
-        is Tex -> {
-            key.lastUsed = frame
-            if (key.id == 0 && key.bitmap != null) key.id = upload(key.bitmap)
-            key.id
-        }
+        is Tex -> key.bitmap?.let { textureId(current(key, it), it) } ?: key.id
         else -> 0
+    }
+
+    private fun textureId(tex: Tex, bitmap: PolyBitmap): Int {
+        if (tex.id == 0) tex.id = upload(bitmap)
+        else if (tex.stale) reupload(tex.id, bitmap)
+        tex.stale = false
+        return tex.id
     }
 
     private fun glyphPage(page: PolyGlyphPage.Page): Int {
@@ -1457,6 +1513,13 @@ internal object GlTextures {
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL33.GL_TEXTURE_SWIZZLE_G, if (mask) GL11.GL_RED else GL11.GL_GREEN)
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL33.GL_TEXTURE_SWIZZLE_B, if (mask) GL11.GL_RED else GL11.GL_BLUE)
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL33.GL_TEXTURE_SWIZZLE_A, if (mask) GL11.GL_GREEN else GL11.GL_ALPHA)
+    }
+
+    private fun reupload(id: Int, bitmap: PolyBitmap) {
+        bind(id)
+        val px = scratchBytes(bitmap.pixels.size).put(bitmap.pixels)
+        px.flip()
+        unpacked(bitmap.width) { texSubImage(0, bitmap.width, bitmap.height, px.asIntBuffer()) }
     }
 
     private fun upload(bitmap: PolyBitmap): Int {
@@ -1557,17 +1620,10 @@ internal object GlTextures {
 
     fun endFrame() {
         frame++
+        bitmaps.endFrame(::release)
         if (external.size > 64) external.clear()
         if (frame < scanAt) return
         var next = Long.MAX_VALUE
-        val it = bitmaps.values.iterator()
-        while (it.hasNext()) {
-            val t = it.next()
-            if (frame - t.lastUsed > RELEASE_FRAMES) {
-                if (t.id != 0) deleteTexture(t.id)
-                it.remove()
-            } else next = min(next, t.lastUsed + RELEASE_FRAMES + 1)
-        }
         val pit = pages.entries.iterator()
         while (pit.hasNext()) {
             val (page, t) = pit.next()
@@ -1578,6 +1634,12 @@ internal object GlTextures {
             } else next = min(next, t.lastUsed + RELEASE_FRAMES + 1)
         }
         scanAt = next
+    }
+
+    private fun release(tex: Tex) {
+        if (tex.id != 0) deleteTexture(tex.id)
+        tex.id = 0
+        tex.stale = false
     }
 
     private const val RELEASE_FRAMES = 600L

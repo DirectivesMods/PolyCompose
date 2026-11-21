@@ -674,7 +674,7 @@ class PolyTessellatorTest {
         assertTrue(b.texture is PolyGlyphPage.Page)
         val us = (0 until 4).map { b.verts[it * 4 + 2] * PolyGlyphPage.SIZE }.toSet()
         assertEquals(2, us.size)
-        assertEquals(2f, us.max() - us.min(), 1e-3f)
+        assertEquals(1f, us.max() - us.min(), 1e-3f)
         assertTrue(b.colors.take(4).all { it == 0x8000FF00.toInt() })
         val big = PolyBitmap(300, 2, ByteArray(300 * 2 * 4))
         assertEquals(big, Recorder().apply { image(big, 0f, 0f, 8f, 8f, 0f, 0f, 1f, 1f, -1) }.done().single().texture)

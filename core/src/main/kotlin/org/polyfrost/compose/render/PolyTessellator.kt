@@ -33,8 +33,20 @@ public abstract class PolyTessellator : PolyRenderer {
     ) {
         @JvmField public var proj: FloatArray? = null
 
-        public fun copy(): State = State(sx, sy, tx, ty, alpha, clip, rclip, mask, glyphScale, rot, hole).also { it.proj = proj }
+        @JvmField internal var region: Region? = null
+
+        public fun copy(): State = State(sx, sy, tx, ty, alpha, clip, rclip, mask, glyphScale, rot, hole).also { it.proj = proj; it.region = region }
     }
+
+    internal class RegionPiece(
+        val cover: Array<FloatArray>, val invLen: FloatArray, val inner: Array<FloatArray>, val outer: Array<FloatArray>,
+        val l: Float, val t: Float, val r: Float, val b: Float,
+    )
+
+    internal class Region(
+        val pieces: Array<RegionPiece>, val box: FloatArray?, val bounds: FloatArray, val bottoms: FloatArray,
+        val src: FloatArray, val sizes: IntArray, val evenOdd: Boolean, val parent: Region?,
+    )
 
     @Suppress("REDUNDANT_VISIBILITY_MODIFIER")
     protected class Mask(public val fade: PolyFade, public val parent: Mask?)
@@ -46,29 +58,34 @@ public abstract class PolyTessellator : PolyRenderer {
     ) {
         public val invLen: FloatArray = FloatArray(edge.size / 2) { e ->
             val n = edge.size / 2
-            1f / max(hypot(edge[(e + 1) % n * 2] - edge[e * 2], edge[(e + 1) % n * 2 + 1] - edge[e * 2 + 1]), 1e-4f)
+            1f / max(length(edge[(e + 1) % n * 2] - edge[e * 2], edge[(e + 1) % n * 2 + 1] - edge[e * 2 + 1]), 1e-4f)
         }
     }
 
     protected var state: State = State(1f, 1f, 0f, 0f, 1f, null, null)
     private val stack = ArrayDeque<State>()
 
-    private class Layer(val depth: Int, val alpha: Float, var start: Int, val box: Int, val effect: EffectBox? = null) {
+    private class Layer(
+        val depth: Int, val alpha: Float, var start: Int, val box: Int, val effect: EffectBox? = null, val isolated: Boolean = false,
+        val composite: Int = PolyRenderer.BLEND_SRC_OVER, val resume: Int = -1,
+    ) {
         var mark: Any? = null
+        var blended = false
     }
 
     private class EffectBox(val chain: PolyEffectChain, val x0: Float, val y0: Float, val x1: Float, val y1: Float, val radius: Float, val scale: Float)
 
     private val layers = ArrayList<Layer>()
-    private var boxes = FloatArray(64)
+    private var boxes = FloatArray(BOX * 16)
     private var boxCount = 0
 
     private var verts = FloatArray(4096)
     private var colors = IntArray(1024)
     private var count = 0
-    private var batchTexture: Any = PolyGlyphPage.pages[0]
+    private var batchTexture: Any = whiteTexture()
     private var batchPremul = false
     private var batchNearest = false
+    private var whiteOnly = true
     private var minX = Float.MAX_VALUE
     private var minY = Float.MAX_VALUE
     private var maxX = -Float.MAX_VALUE
@@ -80,6 +97,12 @@ public abstract class PolyTessellator : PolyRenderer {
 
     protected open val cpuOnly: Boolean get() = false
 
+    protected open val sharedAtlas: Boolean get() = true
+
+    private fun whiteTexture(): Any = if (sharedAtlas) PolyGlyphPage.pages[0] else PolyGlyphPage.cpuWhite()
+
+    private fun atlasBitmap(b: PolyBitmap): PolyGlyphPage.Glyph? = if (sharedAtlas) PolyGlyphPage.bitmap(b) else null
+
     protected open val layered: Boolean get() = false
 
     protected open fun layerMark(): Any = Unit
@@ -90,6 +113,41 @@ public abstract class PolyTessellator : PolyRenderer {
         layer(mark, alpha)
 
     protected open fun fade(mark: Any, alpha: Float): Boolean = false
+
+    private var drawBlend = PolyRenderer.BLEND_SRC_OVER
+    private var wantBlend = PolyRenderer.BLEND_SRC_OVER
+    private var discardFrom = Int.MAX_VALUE
+
+    private val discarding: Boolean get() = stack.size >= discardFrom
+
+    protected val blendMode: Int get() = drawBlend
+
+    protected open fun blendSupported(mode: Int): Boolean = mode == PolyRenderer.BLEND_SRC_OVER
+
+    protected open fun layerBlendSupported(mode: Int): Boolean = mode == PolyRenderer.BLEND_SRC_OVER
+
+    private var antiAliased = true
+
+    override fun antiAlias(enabled: Boolean) {
+        antiAliased = enabled
+    }
+
+    override fun blend(mode: Int): Boolean {
+        val supported = blendSupported(mode)
+        wantBlend = if (supported) mode else PolyRenderer.BLEND_SRC_OVER
+        return supported
+    }
+
+    private fun applyBlend() {
+        val m = wantBlend
+        if (m == drawBlend) return
+        flush()
+        clipImpure()
+        drawBlend = m
+        if (m != PolyRenderer.BLEND_SRC_OVER) layers.lastOrNull()?.blended = true
+    }
+
+    private fun invisible(color: Int): Boolean = color ushr 24 == 0 && (discarding || zeroSourceKeepsDst(wantBlend))
 
     private class ClipCtx(val clip: FloatArray, val inner: FloatArray?, val rclip: RClip?, val mask: Mask?, val hole: RClip?)
 
@@ -153,7 +211,7 @@ public abstract class PolyTessellator : PolyRenderer {
     private fun logQuad(log: ClipLog, rotated: Boolean) {
         val s = state
         val clip = s.clip
-        if (rotated || clip == null) return log.event(CLIP_IMPURE)
+        if (rotated || clip == null || s.region != null) return log.event(CLIP_IMPURE)
         var ctx = log.last
         if (ctx == null || ctx.clip !== clip || ctx.rclip !== s.rclip || ctx.mask !== s.mask || ctx.hole !== s.hole) {
             val inner = if (clip === log.entry) null else log.inner[clip] ?: return log.event(CLIP_IMPURE)
@@ -192,7 +250,7 @@ public abstract class PolyTessellator : PolyRenderer {
         return State(
             s.sx, s.sy, s.tx + dx, s.ty + dy, s.alpha, movedClip(l, clip, inner, entry, dx, dy), s.rclip?.let { shiftClip(it, dx, dy) },
             s.mask?.let { shiftMask(it, dx, dy) }, s.glyphScale, null, s.hole?.let { shiftClip(it, dx, dy) },
-        )
+        ).also { it.region = s.region?.let { g -> shiftRegion(g, dx, dy) } }
     }
 
     internal fun clipRecut(log: Any, captured: Any, from: Int, to: Int, dx: Float, dy: Float) {
@@ -221,7 +279,7 @@ public abstract class PolyTessellator : PolyRenderer {
                     qx[i] = q[o] + dx; qy[i] = q[o + 1] + dy; qu[i] = q[o + 2]; qv[i] = q[o + 3]
                     qc[i] = l.colors[e * 4 + i]
                 }
-                cutQuad(box, rclip, mask, hole)
+                cutQuad(box, rclip, mask, hole, null)
             } else if (e == CLIP_FLUSH) {
                 flush()
             } else if (e == CLIP_DRAW) {
@@ -238,15 +296,24 @@ public abstract class PolyTessellator : PolyRenderer {
     protected open fun beginRecut(captured: Any) {}
 
     protected fun beginDraw() {
+        applyBlend()
         clipLogs.lastOrNull()?.event(CLIP_DRAW)
-        if (boxCount * 4 == boxes.size) boxes = boxes.copyOf(boxes.size * 2)
-        val o = boxCount++ * 4
+        if ((boxCount + 1) * BOX > boxes.size) boxes = boxes.copyOf(boxes.size * 2)
+        val o = boxCount++ * BOX
         boxes[o] = Float.MAX_VALUE; boxes[o + 1] = Float.MAX_VALUE; boxes[o + 2] = -Float.MAX_VALUE; boxes[o + 3] = -Float.MAX_VALUE
+        boxes[o + BOX_SELF] = 0f
+        val blended = drawBlend != PolyRenderer.BLEND_SRC_OVER
+        boxes[o + BOX_BLEND] = if (blended) 1f else 0f
+        if (blended) layers.lastOrNull()?.blended = true
+    }
+
+    private fun selfOverlapping() {
+        if (boxCount > 0) boxes[boxCount * BOX - BOX + BOX_SELF] = 1f
     }
 
     protected fun touch(x0: Float, y0: Float, x1: Float, y1: Float) {
         if (boxCount == 0) return
-        val o = boxCount * 4 - 4
+        val o = boxCount * BOX - BOX
         if (x0 < boxes[o]) boxes[o] = x0
         if (y0 < boxes[o + 1]) boxes[o + 1] = y0
         if (x1 > boxes[o + 2]) boxes[o + 2] = x1
@@ -257,21 +324,27 @@ public abstract class PolyTessellator : PolyRenderer {
 
     protected val drawBoxMark: Int get() = boxCount
 
-    protected fun drawBoxesSince(mark: Int): FloatArray = boxes.copyOfRange(min(mark, boxCount) * 4, boxCount * 4)
+    protected fun drawBoxesSince(mark: Int): FloatArray = boxes.copyOfRange(min(mark, boxCount) * BOX, boxCount * BOX)
 
     protected fun appendDrawBoxes(b: FloatArray) {
-        while (boxes.size < boxCount * 4 + b.size) boxes = boxes.copyOf(boxes.size * 2)
-        System.arraycopy(b, 0, boxes, boxCount * 4, b.size)
-        boxCount += b.size / 4
+        while (boxes.size < boxCount * BOX + b.size) boxes = boxes.copyOf(boxes.size * 2)
+        System.arraycopy(b, 0, boxes, boxCount * BOX, b.size)
+        boxCount += b.size / BOX
+        for (i in BOX_BLEND until b.size step BOX) {
+            if (b[i] == 0f) continue
+            layers.lastOrNull()?.blended = true
+            return
+        }
     }
 
     private fun overlapping(from: Int): Boolean {
         if (boxCount - from > MAX_FADE_DRAWS) return true
         for (i in from until boxCount) {
-            val a = i * 4
+            val a = i * BOX
             if (boxes[a] > boxes[a + 2]) continue
+            if (boxes[a + BOX_SELF] != 0f) return true
             for (j in i + 1 until boxCount) {
-                val b = j * 4
+                val b = j * BOX
                 if (boxes[b] > boxes[b + 2]) continue
                 if (boxes[a] < boxes[b + 2] && boxes[b] < boxes[a + 2] && boxes[a + 1] < boxes[b + 3] && boxes[b + 1] < boxes[a + 3]) return true
             }
@@ -279,29 +352,55 @@ public abstract class PolyTessellator : PolyRenderer {
         return false
     }
 
-    private fun collapseBoxes(from: Int) {
+    private fun collapseBoxes(from: Int, blended: Boolean) {
         if (boxCount <= from) return
-        val o = from * 4
+        val o = from * BOX
         for (i in from + 1 until boxCount) {
-            val k = i * 4
+            val k = i * BOX
             boxes[o] = min(boxes[o], boxes[k]); boxes[o + 1] = min(boxes[o + 1], boxes[k + 1])
             boxes[o + 2] = max(boxes[o + 2], boxes[k + 2]); boxes[o + 3] = max(boxes[o + 3], boxes[k + 3])
         }
+        boxes[o + BOX_SELF] = 0f
+        boxes[o + BOX_BLEND] = if (blended) 1f else 0f
         boxCount = from + 1
+    }
+
+    private fun culled(x0: Float, y0: Float, x1: Float, y1: Float, padPx: Float): Boolean {
+        val s = state
+        if (s.clip == null) return false
+        val ax = x0 * s.sx + s.tx; val bx = x1 * s.sx + s.tx
+        val ay = y0 * s.sy + s.ty; val by = y1 * s.sy + s.ty
+        return culledPx(min(ax, bx), min(ay, by), max(ax, bx), max(ay, by), padPx)
+    }
+
+    private fun lineCulled(top: Float, bottom: Float, padPx: Float): Boolean {
+        val s = state
+        val c = s.clip ?: return false
+        if (s.rot != null || s.proj != null || clipLogs.lastOrNull() != null) return false
+        val a = top * s.sy + s.ty; val b = bottom * s.sy + s.ty
+        val pad = padPx + CULL_PAD
+        return max(a, b) + pad <= c[1] || min(a, b) - pad >= c[3]
+    }
+
+    private fun culledPx(l: Float, t: Float, r: Float, b: Float, padPx: Float): Boolean {
+        val s = state
+        val c = s.clip ?: return false
+        if (s.rot != null || s.proj != null || clipLogs.lastOrNull() != null) return false
+        return r + padPx <= c[0] || l - padPx >= c[2] || b + padPx <= c[1] || t - padPx >= c[3]
     }
 
     override fun rect(x: Float, y: Float, w: Float, h: Float, color: Int, radius: Float) {
         beginDraw()
-        if (w <= 0f || h <= 0f) return
+        if (w <= 0f || h <= 0f || culled(x, y, x + w, y + h, CULL_PAD)) return
         clippedFill(x, y, w, h, radius) { fillPolygonPx(it, it.size / 2, color, convex = true) }
     }
 
     override fun rectWithHole(x: Float, y: Float, w: Float, h: Float, holeX: Float, holeY: Float, holeW: Float, holeH: Float, holeRadius: Float, color: Int) {
         beginDraw()
-        if (w <= 0f || h <= 0f) return
+        if (w <= 0f || h <= 0f || culled(x, y, x + w, y + h, CULL_PAD)) return
         if (holeW <= 0f || holeH <= 0f || holeX >= x + w || holeY >= y + h || holeX + holeW <= x || holeY + holeH <= y) return rect(x, y, w, h, color, 0f)
         val c = mulAlpha(color, state.alpha)
-        if (c ushr 24 == 0) return
+        if (invisible(c)) return
         val m = 2f / scaleAvg()
         val l = min(x, holeX - m); val t = min(y, holeY - m)
         val r = max(x + w, holeX + holeW + m); val b = max(y + h, holeY + holeH + m)
@@ -316,7 +415,7 @@ public abstract class PolyTessellator : PolyRenderer {
         val hIn = floats(6, n * 2); val hOut = floats(7, n * 2)
         offsetPolygon(outer, 4, dir, oIn, oOut)
         offsetPolygon(hole, n, -dir, hIn, hOut)
-        begin(whitePage(), false)
+        beginWhite()
         val wuv = PolyGlyphPage.WHITE_UV
         val clear = c and 0x00FFFFFF
         fun q(a: FloatArray, i: Int, ca: Int, b: FloatArray, j: Int, cb: Int, d: FloatArray, k: Int, cd: Int, e: FloatArray, o: Int, ce: Int) = quadVerts(
@@ -328,9 +427,9 @@ public abstract class PolyTessellator : PolyRenderer {
             val next = (k + 1) % 4
             for (i in 0 until per - 1) q(oIn, k, c, hIn, base + i, c, hIn, base + i + 1, c, hIn, base + i + 1, c)
             q(oIn, k, c, hIn, base + per - 1, c, hIn, next * per, c, oIn, next, c)
-            q(oIn, k, c, oOut, k, clear, oOut, next, clear, oIn, next, c)
+            if (antiAliased) q(oIn, k, c, oOut, k, clear, oOut, next, clear, oIn, next, c)
         }
-        for (i in 0 until n) {
+        if (antiAliased) for (i in 0 until n) {
             val j = (i + 1) % n
             q(hIn, i, c, hOut, i, clear, hOut, j, clear, hIn, j, c)
         }
@@ -339,6 +438,7 @@ public abstract class PolyTessellator : PolyRenderer {
 
     override fun rectGradient(x: Float, y: Float, w: Float, h: Float, gradient: PolyGradient, radius: Float) {
         beginDraw()
+        if (culled(x, y, x + w, y + h, CULL_PAD)) return
         shaded(gradient, x, y, w, h) { clippedFill(x, y, w, h, radius) { fillPolygonPx(it, it.size / 2, -1, convex = true) } }
     }
 
@@ -357,10 +457,11 @@ public abstract class PolyTessellator : PolyRenderer {
     private inline fun shaded(gradient: PolyGradient, x: Float, y: Float, w: Float, h: Float, draw: () -> Unit) {
         if (w <= 0f || h <= 0f) return
         val fill = gradient as? PolyImageFill
-        val tex = fill?.bitmap ?: if (gradient.linear) ramp(gradient) else boxRaster(gradient, w / h)
+        val k = deviceScale()
+        val tex = fill?.bitmap ?: if (gradient.linear) ramp(gradient) else boxRaster(gradient, w / h, w * k, h * k)
         if (cpuOnly) return
         // The atlas packs other textures next to the ramp, so a ramp read past its ends needs a texture of its own to clamp
-        val g = if (fill != null || gradient.linear && !inRamp(gradient, x, y, w, h)) null else PolyGlyphPage.bitmap(tex)
+        val g = if (fill != null || gradient.linear && !inRamp(gradient, x, y, w, h)) null else atlasBitmap(tex)
         begin(g?.page ?: bitmapTexture(tex), false)
         val s = state
         shadeSx = s.sx; shadeSy = s.sy; shadeTx = s.tx; shadeTy = s.ty
@@ -414,6 +515,8 @@ public abstract class PolyTessellator : PolyRenderer {
     private fun stroke(x: Float, y: Float, w: Float, h: Float, color: Int, strokeWidth: Float, radius: Float, dense: Boolean = false, shade: ((Float, Float) -> Int)?) {
         beginDraw()
         if (w <= 0f || h <= 0f || strokeWidth <= 0f) return
+        val reach = strokeWidth / 2f
+        if (culled(x - reach, y - reach, x + w + reach, y + h + reach, CULL_PAD)) return
         val q = strokeWidth / 4f
         val rc = state.rclip
         if (rc != null && state.rot == null && radius >= q && strokeWidth * scaleAvg() >= 2f && state.sx > 0f && state.sy > 0f) {
@@ -424,14 +527,15 @@ public abstract class PolyTessellator : PolyRenderer {
             if (same) return stroke(x + q, y + q, w - q * 2f, h - q * 2f, color, strokeWidth / 2f, radius - q, dense, shade)
         }
         val swPx = strokeWidth * scaleAvg()
-        val alphaMul = if (swPx < 1f) swPx else 1f
+        val alphaMul = if (swPx < 1f && antiAliased) swPx else 1f
         val half = (if (swPx < 1f) 1f / scaleAvg() else strokeWidth) / 2f
+        if (half * 2f >= w || half * 2f >= h) selfOverlapping()
         val segs = cornerSegments(radius + half)
         var outer = rrectScratch(0, x - half, y - half, w + half * 2f, h + half * 2f, if (radius > 0f) radius + half else 0f, segs)
         var inner = rrectScratch(1, x + half, y + half, w - half * 2f, h - half * 2f, max(0f, radius - half), segs)
         if (dense) densify(outer, inner).let { outer = it.first; inner = it.second }
         unclipped(x - half, y - half, w + half * 2f, h + half * 2f, if (radius > 0f) radius + half else 0f) {
-            strokeRing(outer, inner, outer.size / 2, mulAlpha(color, alphaMul), shade?.let { f -> { px: Float, py: Float -> mulAlpha(f(px, py), alphaMul) } }, band = half * 2f * scaleAvg() > 1.001f)
+            strokeRing(outer, inner, outer.size / 2, mulAlpha(color, alphaMul), shade?.let { f -> { px: Float, py: Float -> mulAlpha(f(px, py), alphaMul) } }, band = half * 2f * scaleAvg() > 1.001f || !antiAliased)
         }
     }
 
@@ -450,9 +554,9 @@ public abstract class PolyTessellator : PolyRenderer {
         val scale = scaleAvg()
         if (scale <= 0f) return
         val swPx = strokeWidth * scale
-        val alphaMul = if (swPx < 1f) swPx else 1f
+        val alphaMul = if (swPx < 1f && antiAliased) swPx else 1f
         val halfPx = max(swPx, 1f) / 2f
-        val band = max(halfPx - 0.5f, 0f) / scale
+        val band = if (antiAliased) max(halfPx - 0.5f, 0f) / scale else halfPx / scale
         val edge = (halfPx + 0.5f) / scale
         if (ringColors.size < n) {
             ringColors = IntArray(n)
@@ -464,7 +568,7 @@ public abstract class PolyTessellator : PolyRenderer {
         for (i in 0 until n) c[i] = mulAlpha(colors[i], alpha)
         val s = state
         for (i in 0 until n) {
-            if (c[(i + n - 1) % n] ushr 24 == 0 && c[i] ushr 24 == 0 && c[(i + 1) % n] ushr 24 == 0) continue
+            if (invisible(c[(i + n - 1) % n]) && invisible(c[i]) && invisible(c[(i + 1) % n])) continue
             val x = points[i * 2]; val y = points[i * 2 + 1]
             val nx = normals[i * 2]; val ny = normals[i * 2 + 1]
             val o = i * 8
@@ -473,15 +577,16 @@ public abstract class PolyTessellator : PolyRenderer {
             p[o + 4] = (x - nx * band) * s.sx + s.tx; p[o + 5] = (y - ny * band) * s.sy + s.ty
             p[o + 6] = (x - nx * edge) * s.sx + s.tx; p[o + 7] = (y - ny * edge) * s.sy + s.ty
         }
-        begin(whitePage(), false)
+        beginWhite()
         val w = PolyGlyphPage.WHITE_UV
         for (i in 0 until n) {
             val j = (i + 1) % n
             val ci = c[i]; val cj = c[j]
-            if (ci ushr 24 == 0 && cj ushr 24 == 0) continue
+            if (invisible(ci) && invisible(cj)) continue
             val ti = ci and 0x00FFFFFF; val tj = cj and 0x00FFFFFF
             val a = i * 8; val b = j * 8
             if (band > 0f) quadVerts(p[a], p[a + 1], w, w, ci, p[a + 4], p[a + 5], w, w, ci, p[b + 4], p[b + 5], w, w, cj, p[b], p[b + 1], w, w, cj)
+            if (!antiAliased) continue
             quadVerts(p[a], p[a + 1], w, w, ci, p[a + 2], p[a + 3], w, w, ti, p[b + 2], p[b + 3], w, w, tj, p[b], p[b + 1], w, w, cj)
             quadVerts(p[a + 4], p[a + 5], w, w, ci, p[a + 6], p[a + 7], w, w, ti, p[b + 6], p[b + 7], w, w, tj, p[b + 4], p[b + 5], w, w, cj)
         }
@@ -493,9 +598,13 @@ public abstract class PolyTessellator : PolyRenderer {
         val dy = y2 - y1
         val len = hypot(dx, dy)
         if (len <= 0f) return
-        val swPx = strokeWidth * scaleAvg()
-        val alphaMul = if (swPx < 1f) swPx else 1f
-        val half = (if (swPx < 1f) 1f / scaleAvg() else strokeWidth) / 2f
+        val reach = max(strokeWidth, 0f) / 2f
+        if (culled(min(x1, x2) - reach, min(y1, y2) - reach, max(x1, x2) + reach, max(y1, y2) + reach, CULL_PAD)) return
+        val across = normalScale(dx, dy)
+        if (across <= 0f) return
+        val swPx = strokeWidth * across
+        val alphaMul = if (swPx < 1f && antiAliased) swPx else 1f
+        val half = (if (swPx < 1f) 1f / across else strokeWidth) / 2f
         val nx = -dy / len * half
         val ny = dx / len * half
         val pts = floatArrayOf(x1 + nx, y1 + ny, x2 + nx, y2 + ny, x2 - nx, y2 - ny, x1 - nx, y1 - ny)
@@ -506,15 +615,66 @@ public abstract class PolyTessellator : PolyRenderer {
     override fun fillPathGradient(path: PolyPath, x: Float, y: Float, w: Float, h: Float, gradient: PolyGradient): Unit =
         shaded(gradient, x, y, w, h) { fillPath(path, -1) }
 
+    override fun hairlineWidth(): Float = scaleAvg().let { if (it > 0f) 1f / it else 1f }
+
+    override fun hairlineWidth(dx: Float, dy: Float): Float = normalScale(dx, dy).let { if (it > 0f) 1f / it else hairlineWidth() }
+
+    private fun normalScale(dx: Float, dy: Float): Float {
+        val len = hypot(dx, dy)
+        if (len <= 0f) return 0f
+        val s = state
+        var vx = -dy / len * s.sx
+        var vy = dx / len * s.sy
+        val m = s.rot
+        if (m != null) {
+            val rx = m[0] * vx + m[1] * vy
+            vy = m[2] * vx + m[3] * vy
+            vx = rx
+        }
+        return hypot(vx, vy)
+    }
+
+    override fun triangles(positions: FloatArray, colors: IntArray, indices: IntArray, bitmap: PolyBitmap?, uvs: FloatArray?) {
+        beginDraw()
+        if (indices.size < 3) return
+        val textured = bitmap != null && uvs != null
+        if (textured && cpuOnly) return
+        selfOverlapping()
+        if (textured) begin(bitmapTexture(bitmap), false) else beginWhite()
+        val white = PolyGlyphPage.WHITE_UV
+        val p = FloatArray(6)
+        val u = FloatArray(6)
+        val c = IntArray(3)
+        for (t in 0 until indices.size / 3) {
+            var visible = false
+            for (k in 0 until 3) {
+                val i = indices[t * 3 + k]
+                p[k * 2] = positions[i * 2]; p[k * 2 + 1] = positions[i * 2 + 1]
+                u[k * 2] = if (textured) uvs[i * 2] else white
+                u[k * 2 + 1] = if (textured) uvs[i * 2 + 1] else white
+                c[k] = mulAlpha(colors[i], state.alpha)
+                if (!invisible(c[k])) visible = true
+            }
+            if (!visible) continue
+            transformInPlace(p)
+            quadVerts(
+                p[0], p[1], u[0], u[1], c[0], p[2], p[3], u[2], u[3], c[1],
+                p[4], p[5], u[4], u[5], c[2], p[4], p[5], u[4], u[5], c[2],
+            )
+        }
+    }
+
     override fun fillPath(path: PolyPath, color: Int) {
         beginDraw()
         val c = mulAlpha(color, state.alpha)
-        if (c ushr 24 == 0) return
+        if (invisible(c)) return
         val mesh = pathMesh(path)
         val xy = mesh.xy
         val solid = mesh.solid
         if (solid.isEmpty()) return
-        begin(whitePage(), false)
+        if (culledPx(mesh.l + state.tx, mesh.t + state.ty, mesh.r + state.tx, mesh.b + state.ty, CULL_PAD)) return
+        if (!mesh.convex) selfOverlapping()
+        beginWhite()
         val clear = c and 0x00FFFFFF
         val tx = state.tx
         val ty = state.ty
@@ -522,25 +682,39 @@ public abstract class PolyTessellator : PolyRenderer {
         for (i in solid.indices) vertex(xy[i * 2] + tx, xy[i * 2 + 1] + ty, w, w, if (solid[i]) c else clear)
     }
 
-    private class PathMesh(val xy: FloatArray, val solid: BooleanArray)
+    private class PathMesh(val xy: FloatArray, val solid: BooleanArray, val convex: Boolean) {
+        var l = Float.MAX_VALUE
+        var t = Float.MAX_VALUE
+        var r = -Float.MAX_VALUE
+        var b = -Float.MAX_VALUE
+
+        init {
+            for (i in 0 until xy.size / 2) {
+                l = min(l, xy[i * 2]); r = max(r, xy[i * 2])
+                t = min(t, xy[i * 2 + 1]); b = max(b, xy[i * 2 + 1])
+            }
+        }
+    }
 
     private class PathKey {
         var path: PolyPath? = null
         var sx = 0f
         var sy = 0f
+        var aa = true
         var hash = 0
 
-        fun set(p: PolyPath?, sx: Float, sy: Float) {
+        fun set(p: PolyPath?, sx: Float, sy: Float, aa: Boolean = true) {
             path = p
             this.sx = sx
             this.sy = sy
-            hash = if (p == null) 0 else (p.contentHash() * 31 + sx.toRawBits()) * 31 + sy.toRawBits()
+            this.aa = aa
+            hash = if (p == null) 0 else ((p.contentHash() * 31 + sx.toRawBits()) * 31 + sy.toRawBits()) * 2 + (if (aa) 1 else 0)
         }
 
         override fun hashCode(): Int = hash
 
         override fun equals(other: Any?): Boolean {
-            if (other !is PathKey || other.hash != hash || other.sx.toRawBits() != sx.toRawBits() || other.sy.toRawBits() != sy.toRawBits()) return false
+            if (other !is PathKey || other.hash != hash || other.aa != aa || other.sx.toRawBits() != sx.toRawBits() || other.sy.toRawBits() != sy.toRawBits()) return false
             val a = path ?: return false
             val b = other.path ?: return false
             return a.contentEquals(b)
@@ -569,7 +743,7 @@ public abstract class PolyTessellator : PolyRenderer {
     private fun pathMesh(path: PolyPath): PathMesh {
         val s = state
         val probe = pathProbe
-        probe.set(path, s.sx, s.sy)
+        probe.set(path, s.sx, s.sy, antiAliased)
         val cached = pathMeshes[probe]
         probe.set(null, 0f, 0f)
         if (cached != null) return cached
@@ -577,22 +751,25 @@ public abstract class PolyTessellator : PolyRenderer {
         s.tx = 0f; s.ty = 0f; s.alpha = 1f
         recording = true
         recCount = 0
-        try {
+        val convex = try {
             tessellatePath(path)
         } finally {
             recording = false
             s.tx = tx; s.ty = ty; s.alpha = alpha
         }
-        val mesh = PathMesh(recXy.copyOf(recCount * 2), recSolid.copyOf(recCount))
-        if (recCount <= MAX_PATH_MESH_VERTICES) pathMeshes[PathKey().also { it.set(path.snapshot(), s.sx, s.sy) }] = mesh
+        val mesh = PathMesh(recXy.copyOf(recCount * 2), recSolid.copyOf(recCount), convex)
+        if (recCount <= MAX_PATH_MESH_VERTICES) pathMeshes[PathKey().also { it.set(path.snapshot(), s.sx, s.sy, antiAliased) }] = mesh
         return mesh
     }
 
-    private fun tessellatePath(path: PolyPath) {
+    private fun tessellatePath(path: PolyPath): Boolean {
         val color = -1
         val loops = flatten(path)
         for (loop in loops) transformInPlace(loop)
-        if (loops.size == 1) return fillPolygonPx(loops[0], loops[0].size / 2, color, convex = false)
+        if (loops.size == 1) {
+            fillPolygonPx(loops[0], loops[0].size / 2, color, convex = false)
+            return isConvexLoop(loops[0], loops[0].size / 2)
+        }
         val n = loops.size
         val area = FloatArray(n) { signedArea(loops[it], loops[it].size / 2) }
         val parent = IntArray(n) { -1 }
@@ -619,11 +796,12 @@ public abstract class PolyTessellator : PolyRenderer {
             if (h == null) fillPolygonPx(loops[i], loops[i].size / 2, color, convex = false)
             else fillWithHoles(loops, area, i, h, color)
         }
+        return false
     }
 
     private fun fillWithHoles(loops: List<FloatArray>, area: FloatArray, o: Int, holes: List<Int>, color: Int) {
         val c = mulAlpha(color, state.alpha)
-        if (c ushr 24 == 0) return
+        if (invisible(c)) return
         val rings = ArrayList<FloatArray>(holes.size * 2 + 2)
         fun ring(p: FloatArray, dir: Float): FloatArray {
             val inner = FloatArray(p.size); val outer = FloatArray(p.size)
@@ -637,7 +815,7 @@ public abstract class PolyTessellator : PolyRenderer {
             val inner = ring(loops[h], if (area[h] > 0f) -1f else 1f)
             merged = bridge(merged, if (area[h] > 0f) reversed(inner) else inner)
         }
-        if (!recording) begin(whitePage(), false)
+        if (!recording) beginWhite()
         val w = PolyGlyphPage.WHITE_UV
         val m = merged
         val tris = earClip(m, m.size / 2)
@@ -645,6 +823,7 @@ public abstract class PolyTessellator : PolyRenderer {
             val a = tris[k] * 2; val b = tris[k + 1] * 2; val d = tris[k + 2] * 2
             quadVerts(m[a], m[a + 1], w, w, c, m[b], m[b + 1], w, w, c, m[d], m[d + 1], w, w, c, m[d], m[d + 1], w, w, c)
         }
+        if (!antiAliased) return
         val clear = c and 0x00FFFFFF
         for (k in 0 until rings.size step 2) {
             val inner = rings[k]; val outer = rings[k + 1]
@@ -748,11 +927,27 @@ public abstract class PolyTessellator : PolyRenderer {
 
     override fun strokePolylineGradient(
         points: FloatArray, closed: Boolean, x: Float, y: Float, w: Float, h: Float, gradient: PolyGradient, strokeWidth: Float, cap: Int, join: Int,
-    ): Unit = shaded(gradient, x, y, w, h) { strokePolyline(points, closed, -1, strokeWidth, cap, join) }
+    ): Unit = strokePolylineGradient(points, closed, x, y, w, h, gradient, strokeWidth, cap, join, DEFAULT_MITER_LIMIT)
 
-    override fun strokePolyline(points: FloatArray, closed: Boolean, color: Int, strokeWidth: Float, cap: Int, join: Int) {
+    override fun strokePolylineGradient(
+        points: FloatArray, closed: Boolean, x: Float, y: Float, w: Float, h: Float, gradient: PolyGradient, strokeWidth: Float, cap: Int, join: Int, miterLimit: Float,
+    ): Unit = shaded(gradient, x, y, w, h) { strokePolyline(points, closed, -1, strokeWidth, cap, join, miterLimit) }
+
+    override fun strokePolyline(points: FloatArray, closed: Boolean, color: Int, strokeWidth: Float, cap: Int, join: Int): Unit =
+        strokePolyline(points, closed, color, strokeWidth, cap, join, DEFAULT_MITER_LIMIT)
+
+    override fun strokePolyline(points: FloatArray, closed: Boolean, color: Int, strokeWidth: Float, cap: Int, join: Int, miterLimit: Float) {
         beginDraw()
         if (points.size < 4 || strokeWidth <= 0f) return
+        if (state.clip != null) {
+            var l = Float.MAX_VALUE; var t = Float.MAX_VALUE; var r = -Float.MAX_VALUE; var b = -Float.MAX_VALUE
+            for (i in 0 until points.size / 2) {
+                l = min(l, points[i * 2]); r = max(r, points[i * 2])
+                t = min(t, points[i * 2 + 1]); b = max(b, points[i * 2 + 1])
+            }
+            val reach = strokeWidth / 2f * max(miterLimit, 2f)
+            if (culled(l - reach, t - reach, r + reach, b + reach, CULL_PAD * max(miterLimit, 2f))) return
+        }
         val p = dedupe(points)
         if (p.size == 2) {
             if (cap != PolyRenderer.CAP_BUTT) rect(p[0] - strokeWidth / 2f, p[1] - strokeWidth / 2f, strokeWidth, strokeWidth, color, if (cap == PolyRenderer.CAP_ROUND) strokeWidth / 2f else 0f)
@@ -763,7 +958,7 @@ public abstract class PolyTessellator : PolyRenderer {
         val n = p.size / 2
         if (n < 2) return
         val swPx = strokeWidth * scaleAvg()
-        val c = mulAlpha(color, if (swPx < 1f) swPx else 1f)
+        val c = mulAlpha(color, if (swPx < 1f && antiAliased) swPx else 1f)
         val half = max(swPx, 1f) / 2f
         if (!loop && cap == PolyRenderer.CAP_SQUARE) {
             fun extend(i: Int, from: Int) {
@@ -775,60 +970,88 @@ public abstract class PolyTessellator : PolyRenderer {
             extend(n - 1, n - 2)
         }
         val arcSegs = max(4, min(32, ceil(sqrt(half) * 3.2f).toInt()))
-        val per = if (join == PolyRenderer.JOIN_ROUND) arcSegs + 1 else 1
+        val round = join == PolyRenderer.JOIN_ROUND
+        val per = if (round) arcSegs + 3 else 5
         val left = FloatArray(n * per * 2)
         val right = FloatArray(n * per * 2)
         var lo = 0
         var ro = 0
+        fun put(rightOuter: Boolean, ox: Float, oy: Float, ix: Float, iy: Float) {
+            if (rightOuter) {
+                left[lo++] = ix; left[lo++] = iy; right[ro++] = ox; right[ro++] = oy
+            } else {
+                left[lo++] = ox; left[lo++] = oy; right[ro++] = ix; right[ro++] = iy
+            }
+        }
+        val segCount = if (loop) n else n - 1
+        val dir = FloatArray(n * 2)
+        val len = FloatArray(n)
+        for (s in 0 until segCount) {
+            val j = (s + 1) % n
+            val dx = p[j * 2] - p[s * 2]; val dy = p[j * 2 + 1] - p[s * 2 + 1]
+            val l = length(dx, dy)
+            dir[s * 2] = dx / l; dir[s * 2 + 1] = dy / l; len[s] = l
+        }
+        val turns = FloatArray(n)
         for (i in 0 until n) {
-            val prev = if (loop || i > 0) (i + n - 1) % n else -1
-            val next = if (loop || i < n - 1) (i + 1) % n else -1
-            var mx = 0f; var my = 0f
-            var d0x = 0f; var d0y = 0f; var d1x = 0f; var d1y = 0f
-            if (prev >= 0) {
-                val dx = p[i * 2] - p[prev * 2]; val dy = p[i * 2 + 1] - p[prev * 2 + 1]
-                val l = length(dx, dy)
-                d0x = dx / l; d0y = dy / l
-                mx -= d0y; my += d0x
-            }
-            if (next >= 0) {
-                val dx = p[next * 2] - p[i * 2]; val dy = p[next * 2 + 1] - p[i * 2 + 1]
-                val l = length(dx, dy)
-                d1x = dx / l; d1y = dy / l
-                mx -= d1y; my += d1x
-            }
-            if (prev >= 0 && next >= 0) { mx /= 2f; my /= 2f }
+            if (!loop && (i == 0 || i == n - 1)) continue
+            val a = (i + n - 1) % n
+            val t = atan2(dir[a * 2] * dir[i * 2 + 1] - dir[a * 2 + 1] * dir[i * 2], dir[a * 2] * dir[i * 2] + dir[a * 2 + 1] * dir[i * 2 + 1])
+            if (abs(t) >= 1e-3f) turns[i] = t
+        }
+        fun room(seg: Int, other: Int, turn: Float) = if (turns[other] * turn > 0f) len[seg] / 2f else len[seg]
+        for (i in 0 until n) {
+            val a = if (loop || i > 0) (i + n - 1) % n else 0
+            val b = if (loop || i < n - 1) i else n - 2
+            val n0x = -dir[a * 2 + 1]; val n0y = dir[a * 2]
+            val n1x = -dir[b * 2 + 1]; val n1y = dir[b * 2]
+            val mx = (n0x + n1x) / 2f; val my = (n0y + n1y) / 2f
             val d2 = mx * mx + my * my
-            val k = if (d2 > 1e-6f) min(1f / d2, 4f) * half else half
             val px = p[i * 2]; val py = p[i * 2 + 1]
-            val turn = if (join != PolyRenderer.JOIN_ROUND || prev < 0 || next < 0) 0f else atan2(d0x * d1y - d0y * d1x, d0x * d1x + d0y * d1y)
-            if (abs(turn) < 1e-3f) {
-                left[lo++] = px + mx * k; left[lo++] = py + my * k
-                right[ro++] = px - mx * k; right[ro++] = py - my * k
+            val turn = turns[i]
+            if (turn == 0f) {
+                val k = half / d2
+                put(false, px + mx * k, py + my * k, px - mx * k, py - my * k)
                 continue
             }
-            val segs = max(1, ceil(arcSegs * abs(turn) / Math.PI.toFloat()).toInt())
-            val side = if (turn > 0f) -1f else 1f
-            val a0 = atan2(d0x * side, -d0y * side)
-            val ix = px - mx * k * side; val iy = py - my * k * side
-            for (s in 0..segs) {
-                val a = a0 + turn * s / segs
-                val ax = px + cos(a) * half; val ay = py + sin(a) * half
-                if (turn > 0f) {
-                    left[lo++] = ix; left[lo++] = iy; right[ro++] = ax; right[ro++] = ay
-                } else {
-                    left[lo++] = ax; left[lo++] = ay; right[ro++] = ix; right[ro++] = iy
+            val rightOuter = turn > 0f
+            val side = if (rightOuter) -1f else 1f
+            val hx = half * side
+            val ox0 = px + n0x * hx; val oy0 = py + n0y * hx
+            val ox1 = px + n1x * hx; val oy1 = py + n1y * hx
+            val meet = d2 > 1e-6f && half * tan(abs(turn) / 2f) <= min(room(a, a, turn), room(b, (i + 1) % n, turn))
+            val cx = if (meet) px - mx * hx / d2 else px
+            val cy = if (meet) py - my * hx / d2 else py
+            if (!meet) put(rightOuter, ox0, oy0, px - n0x * hx, py - n0y * hx)
+            if (round) {
+                val steps = max(1, ceil(arcSegs * abs(turn) / Math.PI.toFloat()).toInt())
+                val a0 = atan2(n0y * side, n0x * side)
+                for (s in 0..steps) {
+                    val ang = a0 + turn * s / steps
+                    put(rightOuter, px + cos(ang) * half, py + sin(ang) * half, cx, cy)
                 }
+            } else if (join == PolyRenderer.JOIN_MITER && d2 > 1e-6f && d2 * miterLimit * miterLimit >= 1f) {
+                if (!meet) put(rightOuter, ox0, oy0, cx, cy)
+                put(rightOuter, px + mx * hx / d2, py + my * hx / d2, cx, cy)
+                if (!meet) put(rightOuter, ox1, oy1, cx, cy)
+            } else {
+                put(rightOuter, ox0, oy0, cx, cy)
+                put(rightOuter, ox1, oy1, cx, cy)
             }
+            if (!meet) put(rightOuter, ox1, oy1, px - n1x * hx, py - n1y * hx)
         }
         val m = lo / 2
         val l = if (lo == left.size) left else left.copyOf(lo)
         val r = if (ro == right.size) right else right.copyOf(ro)
         if (loop) {
             val leftOuter = abs(signedArea(l, m)) >= abs(signedArea(r, m))
-            strokeRing(if (leftOuter) l else r, if (leftOuter) r else l, m, c, band = half * 2f > 1.001f)
+            val outerRing = if (leftOuter) l else r
+            val innerRing = if (leftOuter) r else l
+            if (!isConvexLoop(p, n) || !isConvexLoop(innerRing, m) || (signedArea(innerRing, m) > 0f) != (signedArea(outerRing, m) > 0f)) selfOverlapping()
+            strokeRing(outerRing, innerRing, m, c, band = half * 2f > 1.001f || !antiAliased)
             return
         }
+        if (n > 2) selfOverlapping()
         val segs = if (cap == PolyRenderer.CAP_ROUND) arcSegs else 0
         val ce = (segs - 1).coerceAtLeast(0)
         val out = FloatArray((m * 2 + ce * 2) * 2)
@@ -871,11 +1094,25 @@ public abstract class PolyTessellator : PolyRenderer {
     override fun textOutline(text: String, x: Float, y: Float, color: Int, font: PolyFont, width: Float): Unit =
         glyphs(text, x, y, color, font, width * scaleAvg(), true, true)
 
-    private fun glyphs(text: String, x: Float, y: Float, color: Int, font: PolyFont, outlinePx: Float, round: Boolean, subpixel: Boolean, letterSpacing: Float = 0f) {
+    internal fun textStroke(text: String, x: Float, y: Float, color: Int, font: PolyFont, letterSpacing: Float, skewX: Float, width: Float) {
+        val radius = (if (width > 0f) width * scaleAvg() else 1f) / 2f
+        if (skewX != 0f && state.sy != 0f) {
+            shearX = skewX * state.sx / state.sy
+            shearBase = y * state.sy + state.ty
+        }
+        glyphs(text, x, y, color, font, radius, true, true, letterSpacing, true)
+        shearX = 0f
+    }
+
+    private fun glyphs(
+        text: String, x: Float, y: Float, color: Int, font: PolyFont, outlinePx: Float, round: Boolean, subpixel: Boolean, letterSpacing: Float = 0f, ring: Boolean = false,
+    ) {
         beginDraw()
+        if (outlinePx > 0f) selfOverlapping()
+        if (lineCulled(y - font.size * TEXT_ASCENT_REACH, y + font.size * TEXT_DESCENT_REACH, outlinePx)) return
         val r = PolyGlyphPage.rasterizer ?: return
         val face = face(r, font.name) ?: return
-        glyphRun(r, text, 0, text.length, x, y, color, face, font.size, outlinePx, round, subpixel, letterSpacing)
+        glyphRun(r, text, 0, text.length, x, y, color, face, font.size, outlinePx, round, subpixel, letterSpacing, ring)
     }
 
     private var faceSource: PolyGlyphPage.Rasterizer? = null
@@ -915,11 +1152,16 @@ public abstract class PolyTessellator : PolyRenderer {
     private var runOutline = 0f
     private var runRound = false
     private var runLum = -1
+    private var runRing = false
+
+    private fun runAtlasFor(f: PolyGlyphPage.Face): PolyGlyphPage.Atlas =
+        if (runRing) PolyGlyphPage.ringAtlas(f, runBucket, runOutline) else PolyGlyphPage.atlas(f, runBucket, runOutline, runRound, runLum)
 
     private fun runGlyph(f: PolyGlyphPage.Face, id: Int, phase: Int): PolyGlyphPage.Glyph? {
+        if (!sharedAtlas) return if (cpuOnly) null else PolyGlyphPage.cpuGlyph(f, runBucket, id, runOutline, runRound, phase, runLum, runRing)
         if (f !== runFace && f !== runFallback) {
             runFallback = f
-            if (!cpuOnly) runFallbackAtlas = PolyGlyphPage.atlas(f, runBucket, runOutline, runRound, runLum)
+            if (!cpuOnly) runFallbackAtlas = runAtlasFor(f)
         }
         val a = if (f === runFace) runAtlas else runFallbackAtlas
         if (a != null) return PolyGlyphPage.glyph(a, f, runBucket, id, runOutline, runRound, phase, runLum)
@@ -929,10 +1171,10 @@ public abstract class PolyTessellator : PolyRenderer {
 
     private fun glyphRun(
         r: PolyGlyphPage.Rasterizer, text: String, start: Int, end: Int, x: Float, y: Float, color: Int, face: PolyGlyphPage.Face, size: Float,
-        outlinePx: Float, round: Boolean, subpixel: Boolean, letterSpacing: Float,
+        outlinePx: Float, round: Boolean, subpixel: Boolean, letterSpacing: Float, ring: Boolean = false,
     ) {
         val c = mulAlpha(color, state.alpha)
-        if (c ushr 24 == 0) return
+        if (invisible(c)) return
         var k = state.glyphScale
         val ax = abs(state.sx)
         val ay = abs(state.sy)
@@ -942,7 +1184,7 @@ public abstract class PolyTessellator : PolyRenderer {
         val outline = outlinePx / k
         var bucket = raw.roundToInt()
         val lum = if (outline > 0f) -1 else PolyMaskGamma.bucket(color)
-        if (outline <= 0f && !cpuOnly) {
+        if (outline <= 0f && !cpuOnly && sharedAtlas) {
             val snapped = PolyGlyphPage.animatedBucket(face, bucket, lum)
             if (snapped != bucket) {
                 k *= bucket / snapped.toFloat()
@@ -956,13 +1198,15 @@ public abstract class PolyTessellator : PolyRenderer {
         runOutline = outline
         runRound = round
         runLum = lum
-        runAtlas = if (cpuOnly) null else PolyGlyphPage.atlas(face, bucket, outline, round, lum)
+        runRing = ring && outline > 0f
+        runAtlas = if (cpuOnly || !sharedAtlas) null else runAtlasFor(face)
         runFallback = null
         runFallbackAtlas = null
         val s = state
         val deviceY = y * s.sy + s.ty
         val emoji = r.emoji()
         var penX = x
+        var kernGlyph = 0
         var i = start
         while (i < end) {
             val at = i
@@ -984,6 +1228,9 @@ public abstract class PolyTessellator : PolyRenderer {
                     if (fid != 0) { f = other!!; id = fid }
                 }
             }
+            val kernable = f === face && id != 0 && sequence == 0L && PolyGlyphPage.kernable(cp)
+            if (kernable && kernGlyph != 0) penX += face.kern(kernGlyph, id) * size
+            kernGlyph = if (kernable) id else 0
             val sx = penX * s.sx + s.tx
             if (kx != 1f || ky != 1f) {
                 val phase = if (subpixel) ((sx - floor(sx)) * PolyGlyphPage.SUBPIXELS).toInt() else 0
@@ -1013,6 +1260,7 @@ public abstract class PolyTessellator : PolyRenderer {
         runAtlas = null
         runFallback = null
         runFallbackAtlas = null
+        runRing = false
     }
 
     override fun mcText(text: String, x: Float, y: Float, color: Int, shadow: Boolean, scale: Float) {
@@ -1035,7 +1283,8 @@ public abstract class PolyTessellator : PolyRenderer {
         var index = 0
         while (true) {
             val end = mcLineEnd(text, start)
-            mcLine(text, start, end, x, mcLineTop(y, index, scale) + dy, color, scale, shadow, literal)
+            val top = mcLineTop(y, index, scale) + dy
+            if (!lineCulled(top - MC_LINE_REACH * scale, top + (MC_LINE_HEIGHT + MC_LINE_REACH) * scale, 0f)) mcLine(text, start, end, x, top, color, scale, shadow, literal)
             if (end >= text.length) return
             start = mcNextLine(text, end)
             index++
@@ -1093,7 +1342,33 @@ public abstract class PolyTessellator : PolyRenderer {
         beginDraw()
         if (cpuOnly) return
         val x = if (snapMcX) mcLineLeft(x) else x
-        val c = mulAlpha(outlineColor, state.alpha)
+        mcOutlineQuads(text, x, y, mulAlpha(outlineColor, state.alpha), scale, literal)
+        mcText(text, x, y, color, false, scale, literal, false)
+    }
+
+    internal fun mcTextStroke(text: String, x: Float, y: Float, color: Int, scale: Float, literal: Boolean, snapX: Boolean) {
+        if (!layered || !blendSupported(PolyRenderer.BLEND_DST_OUT) || !McGlyphs.available()) return mcText(text, x, y, color, false, scale, literal, snapX)
+        if (cpuOnly) return
+        withMcX(snapX) {
+            val left = if (snapMcX) mcLineLeft(x) else x
+            val outer = wantBlend
+            saveLayerBlend(1f, outer)
+            blend(PolyRenderer.BLEND_SRC_OVER)
+            try {
+                beginDraw()
+                mcOutlineQuads(text, left, y, mulAlpha(color, state.alpha), scale, literal)
+                blend(PolyRenderer.BLEND_DST_OUT)
+                beginDraw()
+                mcLines(text, left, y, 0f, MC_PUNCH, scale, false, literal)
+                blend(PolyRenderer.BLEND_SRC_OVER)
+            } finally {
+                restore()
+                blend(outer)
+            }
+        }
+    }
+
+    private fun mcOutlineQuads(text: String, x: Float, y: Float, c: Int, scale: Float, literal: Boolean) {
         val r = PolyGlyphPage.rasterizer
         if (c ushr 24 != 0 && r != null) {
             val s = state
@@ -1105,7 +1380,7 @@ public abstract class PolyTessellator : PolyRenderer {
                 val end = mcLineEnd(text, start)
                 val line = if (start == 0 && end == text.length) text else text.substring(start, end)
                 val index = lineCount++
-                val rects = mcOutlineRects(r, line, literal)
+                val rects = mcOutlineRects(r, line, literal, sharedAtlas)
                 val top = mcLineTop(y, index, scale)
                 var i = 0
                 while (i < rects.size) {
@@ -1123,7 +1398,7 @@ public abstract class PolyTessellator : PolyRenderer {
                 start = mcNextLine(text, end)
             }
             if (n > 0) {
-                begin(whitePage(), false)
+                beginWhite()
                 val wuv = PolyGlyphPage.WHITE_UV
                 if (lineCount == 1) {
                     for (i in 0 until n step 4) quadPx(boxes[i], boxes[i + 1], boxes[i + 2], boxes[i + 3], wuv, wuv, wuv, wuv, c)
@@ -1153,7 +1428,6 @@ public abstract class PolyTessellator : PolyRenderer {
                 }
             }
         }
-        mcText(text, x, y, color, false, scale, literal, false)
     }
 
     override fun mcTextOutline(text: String, x: Float, y: Float, color: Int, outlineColor: Int, scale: Float, literal: Boolean, snapX: Boolean) {
@@ -1206,8 +1480,8 @@ public abstract class PolyTessellator : PolyRenderer {
 
     private fun mcEffect(x0: Float, y0: Float, x1: Float, y1: Float, color: Int) {
         val c = mulAlpha(color, state.alpha)
-        if (c ushr 24 == 0) return
-        begin(whitePage(), false)
+        if (invisible(c)) return
+        beginWhite()
         val s = state
         val w = PolyGlyphPage.WHITE_UV
         quadPx(x0 * s.sx + s.tx, y0 * s.sy + s.ty, x1 * s.sx + s.tx, y1 * s.sy + s.ty, w, w, w, w, c)
@@ -1250,7 +1524,10 @@ public abstract class PolyTessellator : PolyRenderer {
             val start = pen
             if (g != null) {
                 mcGlyph(g, pen + o, top + o, scale, drawn)
-                if (bold) mcGlyph(g, pen + o + g.offset * scale, top + o, scale, drawn)
+                if (bold) {
+                    selfOverlapping()
+                    mcGlyph(g, pen + o + g.offset * scale, top + o, scale, drawn)
+                }
                 pen += (g.advance + if (bold) g.offset else 0f) * scale
             } else {
                 val main = r?.let { face(it, if (bold) MC_BOLD_FACE else MC_FACE) }
@@ -1267,6 +1544,7 @@ public abstract class PolyTessellator : PolyRenderer {
                     uni.advance(uni.glyph(cp)) * size
                 }
             }
+            if (under || strike) selfOverlapping()
             if (under) mcEffect(start + o - scale, top + o + 8f * scale, pen + o, top + o + 9f * scale, drawn)
             if (strike) mcEffect(start + o - scale, top + o + 3.5f * scale, pen + o, top + o + 4.5f * scale, drawn)
         }
@@ -1279,7 +1557,7 @@ public abstract class PolyTessellator : PolyRenderer {
     private fun mcPlaced(b: PolyBitmap): PolyGlyphPage.Glyph? {
         val last = mcSheetGlyph
         if (b === mcSheet && last != null && !last.page.retired) return last
-        val p = PolyGlyphPage.bitmap(b)
+        val p = atlasBitmap(b)
         mcSheet = b
         mcSheetGlyph = p
         return p
@@ -1288,7 +1566,7 @@ public abstract class PolyTessellator : PolyRenderer {
     private fun mcGlyph(g: McGlyph, x: Float, top: Float, scale: Float, color: Int) {
         val sheet = g.bitmap ?: return
         val c = mulAlpha(color, state.alpha)
-        if (c ushr 24 == 0) return
+        if (invisible(c)) return
         val s = state
         val nearest = abs(g.width * scale * s.sx) >= g.pixelWidth && abs(g.height * scale * s.sy) >= g.pixelHeight
         val b = if (nearest) sheet else g.linearBitmap ?: return
@@ -1308,11 +1586,16 @@ public abstract class PolyTessellator : PolyRenderer {
         )
     }
 
-    override fun image(bitmap: PolyBitmap, x: Float, y: Float, w: Float, h: Float, u0: Float, v0: Float, u1: Float, v1: Float, tint: Int, filterQuality: FilterQuality) {
+    override fun image(bitmap: PolyBitmap, x: Float, y: Float, w: Float, h: Float, u0: Float, v0: Float, u1: Float, v1: Float, tint: Int, filterQuality: FilterQuality): Unit =
+        imageQuad(bitmap, x, y, w, h, u0, v0, u1, v1, tint, filterQuality, strict = true)
+
+    private fun imageQuad(
+        bitmap: PolyBitmap, x: Float, y: Float, w: Float, h: Float, u0: Float, v0: Float, u1: Float, v1: Float, tint: Int, filterQuality: FilterQuality, strict: Boolean,
+    ) {
         beginDraw()
         val c = mulAlpha(tint, state.alpha)
-        if (c ushr 24 == 0 || cpuOnly) return
-        val g = PolyGlyphPage.bitmap(bitmap)
+        if (invisible(c) || cpuOnly || culled(x, y, x + w, y + h, CULL_PAD)) return
+        val g = atlasBitmap(bitmap)
         begin(g?.page ?: bitmapTexture(bitmap), false, filterQuality == FilterQuality.None)
         val x0 = x * state.sx + state.tx
         val y0 = y * state.sy + state.ty
@@ -1322,7 +1605,50 @@ public abstract class PolyTessellator : PolyRenderer {
         val tv = if (filterQuality == FilterQuality.None) ((g?.let { abs(it.v(1f) - it.v(0f)) } ?: 1f) / bitmap.height * NEAREST_TIE_BIAS) else 0f
         val ua = (g?.u(u0) ?: u0) + tu; val va = (g?.v(v0) ?: v0) + tv
         val ub = (g?.u(u1) ?: u1) + tu; val vb = (g?.v(v1) ?: v1) + tv
-        texturedQuad(x, y, w, h, x0, y0, x1, y1, ua, va, ub, vb, tint)
+        var uLo = min(ua, ub); var uHi = max(ua, ub)
+        var vLo = min(va, vb); var vHi = max(va, vb)
+        if (strict && filterQuality != FilterQuality.None) {
+            val hu = (g?.let { abs(it.u(1f) - it.u(0f)) } ?: 1f) / bitmap.width * 0.5f
+            val hv = (g?.let { abs(it.v(1f) - it.v(0f)) } ?: 1f) / bitmap.height * 0.5f
+            if (min(u0, u1) > STRICT_EDGE_EPSILON) uLo += hu
+            if (max(u0, u1) < 1f - STRICT_EDGE_EPSILON) uHi -= hu
+            if (min(v0, v1) > STRICT_EDGE_EPSILON) vLo += hv
+            if (max(v0, v1) < 1f - STRICT_EDGE_EPSILON) vHi -= hv
+            if (uLo > uHi) { val m = (uLo + uHi) / 2f; uLo = m; uHi = m }
+            if (vLo > vHi) { val m = (vLo + vHi) / 2f; vLo = m; vHi = m }
+        }
+        texturedQuad(x, y, w, h, x0, y0, x1, y1, ua, va, ub, vb, tint, uLo, uHi, vLo, vHi)
+    }
+
+    private val sliceXd = FloatArray(4)
+    private val sliceXt = FloatArray(4)
+    private val sliceYd = FloatArray(4)
+    private val sliceYt = FloatArray(4)
+
+    private fun slices(d0: Float, d1: Float, t0: Float, t1: Float, lo: Float, hi: Float, outD: FloatArray, outT: FloatArray): Int {
+        outD[0] = d0; outT[0] = t0.coerceIn(lo, hi)
+        var n = 1
+        var last = t1.coerceIn(lo, hi)
+        if (t1 != t0) {
+            val near = if (t0 < t1) lo else hi
+            val far = if (t0 < t1) hi else lo
+            if ((near - t0) * (near - t1) < 0f) {
+                val d = d0 + (near - t0) / (t1 - t0) * (d1 - d0)
+                if (sampledPast(d0, d)) { outD[n] = d; outT[n] = near; n++ } else outT[0] = t0
+            }
+            if ((far - t0) * (far - t1) < 0f) {
+                val d = d0 + (far - t0) / (t1 - t0) * (d1 - d0)
+                if (sampledPast(d1, d)) { outD[n] = d; outT[n] = far; n++ } else last = t1
+            }
+        }
+        outD[n] = d1; outT[n] = last
+        return n + 1
+    }
+
+    private fun sampledPast(end: Float, cut: Float): Boolean {
+        val eps = abs(cut - end) * STRICT_CENTER_EPSILON
+        if (end <= cut) return ceil(end - 0.5f) + 0.5f < cut - eps
+        return floor(end - 0.5f) + 0.5f > cut + eps
     }
 
     /**
@@ -1361,6 +1687,7 @@ public abstract class PolyTessellator : PolyRenderer {
     private fun texturedQuad(
         x: Float, y: Float, w: Float, h: Float, x0: Float, y0: Float, x1: Float, y1: Float,
         ua: Float, va: Float, ub: Float, vb: Float, tint: Int,
+        uLo: Float = min(ua, ub), uHi: Float = max(ua, ub), vLo: Float = min(va, vb), vHi: Float = max(va, vb),
     ) {
         val rc = state.rclip
         if (rc != null && state.rot == null && state.sx > 0f && state.sy > 0f && x1 > x0 && y1 > y0) {
@@ -1370,7 +1697,20 @@ public abstract class PolyTessellator : PolyRenderer {
             val sf = rc.safe
             val safe = (x0 >= sf[0] && y0 >= sf[1] && x1 <= sf[2] && y1 <= sf[3]) || (x0 >= sf[4] && y0 >= sf[5] && x1 <= sf[6] && y1 <= sf[7])
             if (covers || !safe) {
-                val uLo = min(ua, ub); val uHi = max(ua, ub); val vLo = min(va, vb); val vHi = max(va, vb)
+                if (uLo > min(ua, ub) || uHi < max(ua, ub) || vLo > min(va, vb) || vHi < max(va, vb)) {
+                    val nx = slices(x0, x1, ua, ub, uLo, uHi, sliceXd, sliceXt)
+                    val ny = slices(y0, y1, va, vb, vLo, vHi, sliceYd, sliceYt)
+                    val xd = sliceXd.copyOf(nx); val xt = sliceXt.copyOf(nx)
+                    val yd = sliceYd.copyOf(ny); val yt = sliceYt.copyOf(ny)
+                    val strictUv: (Float, Float, FloatArray) -> Unit = { fx, fy, out ->
+                        out[0] = pieceAt(fx, xd, xt)
+                        out[1] = pieceAt(fy, yd, yt)
+                    }
+                    val cutsX = xd.copyOfRange(1, nx - 1)
+                    val cutsY = yd.copyOfRange(1, ny - 1)
+                    clippedFill(x, y, w, h, 0f) { fillPolygonCut(it, it.size / 2, tint, strictUv, cutsX, cutsY) }
+                    return
+                }
                 val uv: (Float, Float, FloatArray) -> Unit = { fx, fy, out ->
                     out[0] = (ua + (fx - x0) / (x1 - x0) * (ub - ua)).coerceIn(uLo, uHi)
                     out[1] = (va + (fy - y0) / (y1 - y0) * (vb - va)).coerceIn(vLo, vHi)
@@ -1378,8 +1718,113 @@ public abstract class PolyTessellator : PolyRenderer {
                 clippedFill(x, y, w, h, 0f) { fillPolygonPx(it, it.size / 2, tint, convex = true, uv = uv, keepBatch = true) }
                 return
             }
+            state.rclip = rc.parent
+            try {
+                texturedPieces(x0, y0, x1, y1, ua, va, ub, vb, mulAlpha(tint, state.alpha), uLo, uHi, vLo, vHi)
+            } finally {
+                state.rclip = rc
+            }
+            return
         }
-        quadPx(x0, y0, x1, y1, ua, va, ub, vb, mulAlpha(tint, state.alpha))
+        texturedPieces(x0, y0, x1, y1, ua, va, ub, vb, mulAlpha(tint, state.alpha), uLo, uHi, vLo, vHi)
+    }
+
+    private fun pieceAt(d: Float, ds: FloatArray, ts: FloatArray): Float {
+        if (d <= ds[0]) return ts[0]
+        for (i in 0 until ds.size - 1) {
+            if (d > ds[i + 1]) continue
+            val span = ds[i + 1] - ds[i]
+            return if (span > 0f) ts[i] + (d - ds[i]) / span * (ts[i + 1] - ts[i]) else ts[i + 1]
+        }
+        return ts[ds.size - 1]
+    }
+
+    private fun fillPolygonCut(p: FloatArray, n: Int, color: Int, uv: (Float, Float, FloatArray) -> Unit, cutsX: FloatArray, cutsY: FloatArray) {
+        if (n < 3) return
+        val c = mulAlpha(color, state.alpha)
+        if (c ushr 24 == 0) return
+        val clockwise = signedArea(p, n) > 0f
+        val inner = floats(0, n * 2)
+        val outer = floats(1, n * 2)
+        offsetPolygon(p, n, if (clockwise) 1f else -1f, inner, outer)
+        val solid = (c ushr 24).toFloat()
+        fun corner(src: FloatArray, i: Int, alpha: Float, out: FloatArray, at: Int) {
+            out[at] = src[i * 2]; out[at + 1] = src[i * 2 + 1]; out[at + 2] = alpha
+        }
+        val tri = FloatArray(9)
+        for (i in 1 until n - 1) {
+            corner(inner, 0, solid, tri, 0); corner(inner, i, solid, tri, 3); corner(inner, i + 1, solid, tri, 6)
+            emitCut(tri, c, uv, cutsX, cutsY)
+        }
+        if (!antiAliased) return
+        for (i in 0 until n) {
+            val j = (i + 1) % n
+            corner(inner, i, solid, tri, 0); corner(outer, i, 0f, tri, 3); corner(outer, j, 0f, tri, 6)
+            emitCut(tri, c, uv, cutsX, cutsY)
+            corner(inner, i, solid, tri, 0); corner(outer, j, 0f, tri, 3); corner(inner, j, solid, tri, 6)
+            emitCut(tri, c, uv, cutsX, cutsY)
+        }
+    }
+
+    private fun emitCut(tri: FloatArray, color: Int, uv: (Float, Float, FloatArray) -> Unit, cutsX: FloatArray, cutsY: FloatArray) {
+        var parts = listOf(tri)
+        for (axis in 0..1) for (at in if (axis == 0) cutsX else cutsY) {
+            val next = ArrayList<FloatArray>(parts.size * 2)
+            for (part in parts) {
+                for (high in booleanArrayOf(false, true)) {
+                    val half = halfPlane(part, axis, at, high)
+                    if (half.size >= 9) next += half
+                }
+            }
+            parts = next
+        }
+        val rgb = color and 0xFFFFFF
+        val st = FloatArray(2)
+        for (part in parts) {
+            val m = part.size / 3
+            fun put(i: Int) {
+                uv(part[i * 3], part[i * 3 + 1], st)
+                val a = (part[i * 3 + 2] + 0.5f).toInt().coerceIn(0, 255)
+                vertex(part[i * 3], part[i * 3 + 1], st[0], st[1], (a shl 24) or rgb)
+            }
+            for (i in 1 until m - 1) {
+                put(0); put(i); put(i + 1); put(i + 1)
+            }
+        }
+    }
+
+    private fun halfPlane(poly: FloatArray, axis: Int, at: Float, high: Boolean): FloatArray {
+        val n = poly.size / 3
+        val sign = if (high) 1f else -1f
+        val out = FloatArray((n + 1) * 3)
+        var k = 0
+        for (i in 0 until n) {
+            val j = (i + 1) % n
+            val ci = (poly[i * 3 + axis] - at) * sign
+            val cj = (poly[j * 3 + axis] - at) * sign
+            if (ci >= 0f) {
+                out[k++] = poly[i * 3]; out[k++] = poly[i * 3 + 1]; out[k++] = poly[i * 3 + 2]
+            }
+            if ((ci > 0f && cj < 0f) || (ci < 0f && cj > 0f)) {
+                val t = ci / (ci - cj)
+                for (f in 0..2) out[k++] = poly[i * 3 + f] + (poly[j * 3 + f] - poly[i * 3 + f]) * t
+            }
+        }
+        return out.copyOf(k)
+    }
+
+    private fun texturedPieces(
+        x0: Float, y0: Float, x1: Float, y1: Float, ua: Float, va: Float, ub: Float, vb: Float, c: Int, uLo: Float, uHi: Float, vLo: Float, vHi: Float,
+    ) {
+        if (uLo <= min(ua, ub) && uHi >= max(ua, ub) && vLo <= min(va, vb) && vHi >= max(va, vb)) return quadPx(x0, y0, x1, y1, ua, va, ub, vb, c)
+        val xd = sliceXd; val xt = sliceXt; val yd = sliceYd; val yt = sliceYt
+        val nx = slices(x0, x1, ua, ub, uLo, uHi, xd, xt)
+        val ny = slices(y0, y1, va, vb, vLo, vHi, yd, yt)
+        for (pass in 0..1) for (j in 0 until ny - 1) for (i in 0 until nx - 1) {
+            if (xd[i] == xd[i + 1] || yd[j] == yd[j + 1]) continue
+            if ((xt[i] != xt[i + 1] && yt[j] != yt[j + 1]) != (pass == 0)) continue
+            quadPx(xd[i], yd[j], xd[i + 1], yd[j + 1], xt[i], yt[j], xt[i + 1], yt[j + 1], c)
+        }
     }
 
     override fun shadow(x: Float, y: Float, w: Float, h: Float, radius: Float, shadow: PolyShadow): Unit =
@@ -1400,13 +1845,14 @@ public abstract class PolyTessellator : PolyRenderer {
         val sigmaQ = if (blur > 0f) ((blur * s * 0.57735f + 0.5f) * 2f).roundToInt() else 0
         if (sigmaQ == 0 || bw <= 0f || bh <= 0f) return rect(bx, by, bw, bh, color, rad)
         val rPx = min(rad * s, min(bw, bh) * s / 2f).roundToInt()
-        val m = shadowMask(rPx, sigmaQ)
+        val m = lastMask?.takeIf { rPx == lastMaskR && sigmaQ == lastMaskQ } ?: shadowMask(rPx, sigmaQ).also { lastMask = it; lastMaskR = rPx; lastMaskQ = sigmaQ }
         val e = m.extent / s
         val x0 = bx - e
         val y0 = by - e
         val x3 = bx + bw + e
         val y3 = by + bh + e
-        val kx = min(m.slice, (x3 - x0) * s / 2f)
+        if (culled(x0, y0, x3, y3, CULL_PAD)) return
+        val kx =min(m.slice, (x3 - x0) * s / 2f)
         val ky = min(m.slice, (y3 - y0) * s / 2f)
         val mw = m.width
         val xs = floatArrayOf(x0, x0 + kx / s, x3 - kx / s, x3)
@@ -1425,7 +1871,7 @@ public abstract class PolyTessellator : PolyRenderer {
         } else null
         for (j in 0 until 3) for (i in 0 until 3) {
             if (xs[i + 1] <= xs[i] || ys[j + 1] <= ys[j]) continue
-            if (holes == null) image(m.bitmap, xs[i], ys[j], xs[i + 1] - xs[i], ys[j + 1] - ys[j], us[i], vs[j], us[i + 1], vs[j + 1], color)
+            if (holes == null) imageQuad(m.bitmap, xs[i], ys[j], xs[i + 1] - xs[i], ys[j + 1] - ys[j], us[i], vs[j], us[i + 1], vs[j + 1], color, FilterQuality.Low, strict = false)
             else shadowPiece(m.bitmap, xs[i], ys[j], xs[i + 1], ys[j + 1], xs[i], ys[j], xs[i + 1], ys[j + 1], us[i], vs[j], us[i + 1], vs[j + 1], color, holes, 0)
         }
     }
@@ -1439,7 +1885,7 @@ public abstract class PolyTessellator : PolyRenderer {
         if (k == holes.size) {
             fun u(x: Float) = u0 + (x - cx0) / (cx1 - cx0) * (u1 - u0)
             fun v(y: Float) = v0 + (y - cy0) / (cy1 - cy0) * (v1 - v0)
-            image(bmp, l, t, r - l, b - t, u(l), v(t), u(r), v(b), color)
+            imageQuad(bmp, l, t, r - l, b - t, u(l), v(t), u(r), v(b), color, FilterQuality.Low, strict = false)
             return
         }
         val hl = holes[k]; val ht = holes[k + 1]; val hr = holes[k + 2]; val hb = holes[k + 3]
@@ -1487,6 +1933,14 @@ public abstract class PolyTessellator : PolyRenderer {
         }
         var h = s.hole
         while (h != null) { keyAdd(-3f); keyPairs(h.edge); h = h.parent }
+        var g = s.region
+        while (g != null) {
+            keyAdd(if (g.box != null) -6f else -5f)
+            keyAdd(if (g.evenOdd) 1f else 0f)
+            for (n in g.sizes) keyAdd(n.toFloat())
+            keyPairs(g.src)
+            g = g.parent
+        }
         var m = s.mask
         while (m != null) {
             keyAdd(if (m.fade.vertical) 1f else 0f)
@@ -1553,8 +2007,20 @@ public abstract class PolyTessellator : PolyRenderer {
         return State(
             s.sx, s.sy, s.tx + dx, s.ty + dy, s.alpha, s.clip?.let { shiftPairs(it, dx, dy, it.size) }, s.rclip?.let { shiftClip(it, dx, dy) },
             s.mask?.let { shiftMask(it, dx, dy) }, s.glyphScale, null, s.hole?.let { shiftClip(it, dx, dy) },
-        )
+        ).also { it.region = s.region?.let { g -> shiftRegion(g, dx, dy) } }
     }
+
+    private fun shiftRegion(g: Region, dx: Float, dy: Float): Region = Region(
+        Array(g.pieces.size) {
+            val p = g.pieces[it]
+            RegionPiece(
+                Array(p.cover.size) { e -> shiftPairs(p.cover[e], dx, dy, 4) }, p.invLen, Array(p.inner.size) { e -> shiftPairs(p.inner[e], dx, dy, 4) },
+                Array(p.outer.size) { e -> shiftPairs(p.outer[e], dx, dy, 4) }, p.l + dx, p.t + dy, p.r + dx, p.b + dy,
+            )
+        },
+        g.box?.let { shiftPairs(it, dx, dy, 4) }, shiftPairs(g.bounds, dx, dy, 4), FloatArray(g.bottoms.size) { g.bottoms[it] + dy }, shiftPairs(g.src, dx, dy, g.src.size), g.sizes, g.evenOdd,
+        g.parent?.let { shiftRegion(it, dx, dy) },
+    )
 
     private fun shiftPairs(a: FloatArray, dx: Float, dy: Float, count: Int): FloatArray {
         if (a === NONE || a === NO_SAFE) return a
@@ -1579,7 +2045,10 @@ public abstract class PolyTessellator : PolyRenderer {
     protected fun shiftedBoxes(b: FloatArray, dx: Float, dy: Float): FloatArray {
         if (b.isEmpty()) return b
         val out = b.copyOf()
-        for (i in out.indices) out[i] += if (i and 1 == 0) dx else dy
+        for (i in out.indices) {
+            val k = i % BOX
+            if (k < BOX_SELF) out[i] += if (k and 1 == 0) dx else dy
+        }
         return out
     }
 
@@ -1622,25 +2091,56 @@ public abstract class PolyTessellator : PolyRenderer {
 
     override fun restore() {
         val l = layers.lastOrNull()
-        if (l != null && l.depth == stack.size) endLayer(l)
+        if (l != null && l.depth == stack.size) {
+            endLayer(l)
+            if (l.resume >= 0) wantBlend = l.resume
+        }
         state = stack.removeLast()
+        if (stack.size < discardFrom) discardFrom = Int.MAX_VALUE
     }
 
     override fun saveLayerAlpha(alpha: Float) {
         save()
-        if (alpha >= 1f) return
-        if (!layered || alpha <= 0f) {
-            state.alpha *= alpha
+        if (alpha >= 1f || discarding) return
+        val carried = wantBlend
+        if (alpha <= 0f && zeroSourceKeepsDst(carried)) {
+            state.alpha = 0f
+            discardFrom = stack.size
+            return
+        }
+        val a = max(alpha, 0f)
+        if (!layered || carried != PolyRenderer.BLEND_SRC_OVER && !layerBlendSupported(carried)) {
+            state.alpha *= a
             return
         }
         clipImpure()
-        layers.add(Layer(stack.size, state.alpha * alpha, count, boxCount))
+        val blended = carried != PolyRenderer.BLEND_SRC_OVER
+        layers.add(Layer(stack.size, state.alpha * a, count, boxCount, composite = carried, resume = if (blended) carried else -1))
+        wantBlend = PolyRenderer.BLEND_SRC_OVER
         state.alpha = 1f
     }
 
-    override fun saveLayerEffect(x: Float, y: Float, w: Float, h: Float, radius: Float, chain: PolyEffectChain, alpha: Float) {
+    override fun saveLayerBlend(alpha: Float, mode: Int) {
+        if (discarding) return save()
+        val composite = if (layerBlendSupported(mode)) mode else PolyRenderer.BLEND_SRC_OVER
+        if (!layered || alpha <= 0f && zeroSourceKeepsDst(composite)) return saveLayerAlpha(alpha)
+        save()
+        layers.add(Layer(stack.size, state.alpha * max(alpha, 0f), count, boxCount, isolated = true, composite = composite))
+        state.alpha = 1f
+    }
+
+    override fun saveAlpha(alpha: Float) {
+        save()
+        state.alpha *= alpha.coerceIn(0f, 1f)
+    }
+
+    override fun saveLayerEffect(x: Float, y: Float, w: Float, h: Float, radius: Float, chain: PolyEffectChain, alpha: Float): Unit =
+        saveLayerEffect(x, y, w, h, radius, chain, alpha, PolyRenderer.BLEND_SRC_OVER)
+
+    override fun saveLayerEffect(x: Float, y: Float, w: Float, h: Float, radius: Float, chain: PolyEffectChain, alpha: Float, mode: Int) {
+        if (discarding) return save()
         val s = state
-        if (chain.isEmpty || !layered || alpha <= 0f) return saveLayerAlpha(alpha)
+        if (chain.isEmpty || !layered || alpha <= 0f) return if (mode == PolyRenderer.BLEND_SRC_OVER) saveLayerAlpha(alpha) else saveLayerBlend(alpha, mode)
         save()
         val m = s.rot
         val box = if (m == null) {
@@ -1663,34 +2163,63 @@ public abstract class PolyTessellator : PolyRenderer {
             EffectBox(chain, l, t, r, b, if (axisAligned(p)) radius * scale else 0f, scale)
         }
         clipImpure()
-        layers.add(Layer(stack.size, s.alpha * alpha, count, boxCount, box))
+        val composite = if (layerBlendSupported(mode)) mode else PolyRenderer.BLEND_SRC_OVER
+        layers.add(Layer(stack.size, s.alpha * alpha, count, boxCount, box, composite = composite))
         state.alpha = 1f
     }
 
     private fun endLayer(l: Layer) {
-        clipImpure()
         val mark = l.mark
+        val plain = !l.blended && l.composite == PolyRenderer.BLEND_SRC_OVER
+        if (l.isolated && plain && l.alpha >= 1f && (mark == null || plainFade(mark, 1f))) {
+            layers.removeAt(layers.lastIndex)
+            return
+        }
+        clipImpure()
         val e = l.effect
+        if (e != null || l.composite != PolyRenderer.BLEND_SRC_OVER) layers.getOrNull(layers.lastIndex - 1)?.blended = true
         if (e != null) {
             flush()
             layers.removeAt(layers.lastIndex)
-            layer(l.mark!!, l.alpha, e.chain, e.x0, e.y0, e.x1, e.y1, e.radius, e.scale)
+            val outer = drawBlend
+            drawBlend = l.composite
+            try {
+                layer(l.mark!!, l.alpha, e.chain, e.x0, e.y0, e.x1, e.y1, e.radius, e.scale)
+            } finally {
+                drawBlend = outer
+            }
             if (boxCount <= l.box) return
-            collapseBoxes(l.box)
+            collapseBoxes(l.box, true)
             val pad = e.chain.outset * e.scale
-            val o = l.box * 4
+            val o = l.box * BOX
             boxes[o] -= pad; boxes[o + 1] -= pad; boxes[o + 2] += pad; boxes[o + 3] += pad
             return
         }
-        if (!overlapping(l.box) && (mark == null || fade(mark, l.alpha))) {
+        if (plain && !overlapping(l.box) && (mark == null || plainFade(mark, l.alpha))) {
             layers.removeAt(layers.lastIndex)
             for (i in (if (mark == null) l.start else 0) until count) colors[i] = if (batchPremul) scaleArgb(colors[i], l.alpha) else mulAlpha(colors[i], l.alpha)
             return
         }
         flush()
         layers.removeAt(layers.lastIndex)
-        layer(l.mark!!, l.alpha)
-        collapseBoxes(l.box)
+        val outer = drawBlend
+        drawBlend = l.composite
+        try {
+            layer(l.mark!!, l.alpha)
+        } finally {
+            drawBlend = outer
+        }
+        collapseBoxes(l.box, l.composite != PolyRenderer.BLEND_SRC_OVER)
+    }
+
+    private fun plainFade(mark: Any, alpha: Float): Boolean {
+        val outer = drawBlend
+        drawBlend = PolyRenderer.BLEND_SRC_OVER
+        try {
+            return fade(mark, alpha)
+        } finally {
+            drawBlend = outer
+        }
     }
 
     override fun deviceTransform(): FloatArray? = if (state.rot != null) null else floatArrayOf(state.sx, state.sy, state.tx, state.ty)
@@ -1867,11 +2396,44 @@ public abstract class PolyTessellator : PolyRenderer {
     override fun clipRRect(x: Float, y: Float, w: Float, h: Float, radius: Float) {
         clipRect(x, y, w, h)
         if (radius <= 0f) return
-        val p = rrectPoints(x, y, w, h, radius)
         if (state.rot != null) {
+            val p = rrectPoints(x, y, w, h, radius)
             toDevice(p)
             return polygonClip(p)
         }
+        val s = state
+        val ox = x * s.sx + s.tx
+        val oy = y * s.sy + s.ty
+        val parent = s.rclip
+        val probe = rrectProbe
+        probe.set(s.sx, s.sy, w, h, radius, antiAliased)
+        val shape = rrectShapes[probe]
+        if (shape == null) {
+            val made = rrectClip(x, y, w, h, radius, parent)
+            rrectShapes[RRectKey().also { it.set(s.sx, s.sy, w, h, radius, antiAliased) }] = RRectShape(made, ox, oy)
+            s.rclip = made
+            return
+        }
+        val last = shape.last
+        if (shape.lastX.toRawBits() == ox.toRawBits() && shape.lastY.toRawBits() == oy.toRawBits() && last.parent === parent) {
+            s.rclip = last
+            return
+        }
+        val base = shape.base
+        val dx = ox - shape.baseX
+        val dy = oy - shape.baseY
+        val moved = RClip(
+            shiftPairs(base.edge, dx, dy, base.edge.size), shiftPairs(base.inner, dx, dy, base.inner.size), shiftPairs(base.outer, dx, dy, base.outer.size),
+            parent, shiftPairs(base.safe, dx, dy, base.safe.size), shiftPairs(base.box, dx, dy, 4),
+        )
+        shape.last = moved
+        shape.lastX = ox
+        shape.lastY = oy
+        s.rclip = moved
+    }
+
+    private fun rrectClip(x: Float, y: Float, w: Float, h: Float, radius: Float, parent: RClip?): RClip {
+        val p = rrectPoints(x, y, w, h, radius)
         orient(p)
         val n = p.size / 2
         val inner = FloatArray(p.size); val outer = FloatArray(p.size)
@@ -1880,7 +2442,39 @@ public abstract class PolyTessellator : PolyRenderer {
         val l = box[0]; val t = box[1]; val rt = box[2]; val b = box[3]
         val rx = box[4] + 1f; val ry = box[5] + 1f
         val safe = floatArrayOf(l + rx, t + 1f, rt - rx, b - 1f, l + 1f, t + ry, rt - 1f, b - ry)
-        state.rclip = RClip(p, inner, outer, state.rclip, safe, box)
+        return RClip(p, inner, outer, parent, safe, box)
+    }
+
+    private class RRectShape(val base: RClip, val baseX: Float, val baseY: Float) {
+        var last: RClip = base
+        var lastX: Float = baseX
+        var lastY: Float = baseY
+    }
+
+    private class RRectKey {
+        var sx = 0f
+        var sy = 0f
+        var w = 0f
+        var h = 0f
+        var radius = 0f
+        var aa = true
+        var hash = 0
+
+        fun set(sx: Float, sy: Float, w: Float, h: Float, radius: Float, aa: Boolean) {
+            this.sx = sx; this.sy = sy; this.w = w; this.h = h; this.radius = radius; this.aa = aa
+            hash = ((((sx.toRawBits() * 31 + sy.toRawBits()) * 31 + w.toRawBits()) * 31 + h.toRawBits()) * 31 + radius.toRawBits()) * 2 + (if (aa) 1 else 0)
+        }
+
+        override fun hashCode(): Int = hash
+
+        override fun equals(other: Any?): Boolean = other is RRectKey && other.hash == hash && other.aa == aa &&
+            other.sx.toRawBits() == sx.toRawBits() && other.sy.toRawBits() == sy.toRawBits() && other.w.toRawBits() == w.toRawBits() &&
+            other.h.toRawBits() == h.toRawBits() && other.radius.toRawBits() == radius.toRawBits()
+    }
+
+    private val rrectProbe = RRectKey()
+    private val rrectShapes = object : LinkedHashMap<RRectKey, RRectShape>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<RRectKey, RRectShape>?) = size > MAX_RRECT_SHAPES
     }
 
     override fun clipPolygon(points: FloatArray) {
@@ -1927,6 +2521,413 @@ public abstract class PolyTessellator : PolyRenderer {
         state.hole = RClip(p, inner, outer, state.hole, NONE, NONE)
     }
 
+    private class RegionKey(val path: PolyPath, val transform: FloatArray, val difference: Boolean) {
+        private val hash = (path.contentHash() * 31 + transform.contentHashCode()) * 31 + difference.hashCode()
+
+        override fun hashCode(): Int = hash
+
+        override fun equals(other: Any?): Boolean =
+            other is RegionKey && other.hash == hash && other.difference == difference && other.transform.contentEquals(transform) && other.path.contentEquals(path)
+    }
+
+    private class RegionEntry(val region: Region?, val outline: FloatArray?, val bounds: FloatArray)
+
+    private val regions = object : LinkedHashMap<RegionKey, RegionEntry>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<RegionKey, RegionEntry>?) = size > MAX_REGIONS
+    }
+
+    override fun clipPath(path: PolyPath, difference: Boolean) {
+        val s = state
+        val key = if (s.rot == null && s.proj == null) RegionKey(path, floatArrayOf(s.sx, s.sy, s.tx, s.ty), difference) else null
+        val hit = key?.let { regions[it] }
+        if (hit != null) {
+            hit.outline?.let { return clipPolygon(it) }
+            val b = hit.bounds
+            if (!difference) clipRect(b[0], b[1], b[2] - b[0], b[3] - b[1])
+            val g = hit.region ?: return
+            state.region = Region(g.pieces, g.box, g.bounds, g.bottoms, g.src, g.sizes, g.evenOdd, state.region)
+            return
+        }
+        val loops = flatten(path)
+        if (loops.isEmpty()) {
+            if (!difference) clipRect(0f, 0f, 0f, 0f)
+            return
+        }
+        var l = Float.MAX_VALUE; var t = Float.MAX_VALUE; var r = -Float.MAX_VALUE; var b = -Float.MAX_VALUE
+        val device = ArrayList<FloatArray>(loops.size)
+        for (loop in loops) {
+            for (i in loop.indices step 2) {
+                l = min(l, loop[i]); r = max(r, loop[i])
+                t = min(t, loop[i + 1]); b = max(b, loop[i + 1])
+            }
+            val d = loop.copyOf()
+            transformInPlace(d)
+            toDevice(d)
+            device += d
+        }
+        val convex = !difference && device.size == 1 && convexOutline(device[0])
+        val g = if (convex) null else region(device, path.evenOdd, difference)
+        if (key != null) regions[RegionKey(path.snapshot(), key.transform, difference)] = RegionEntry(g, if (convex) loops[0] else null, floatArrayOf(l, t, r, b))
+        if (convex) return clipPolygon(loops[0])
+        if (!difference) clipRect(l, t, r - l, b - t)
+        if (g != null) state.region = Region(g.pieces, g.box, g.bounds, g.bottoms, g.src, g.sizes, g.evenOdd, state.region)
+    }
+
+    private fun convexOutline(points: FloatArray): Boolean {
+        val p = FloatArray(points.size)
+        var k = 0
+        for (i in points.indices step 2) {
+            if (k > 0 && abs(points[i] - p[k - 2]) < 0.01f && abs(points[i + 1] - p[k - 1]) < 0.01f) continue
+            p[k++] = points[i]; p[k++] = points[i + 1]
+        }
+        if (k > 4 && abs(p[0] - p[k - 2]) < 0.01f && abs(p[1] - p[k - 1]) < 0.01f) k -= 2
+        val n = k / 2
+        if (n < 3) return true
+        val sign = if (signedArea(p, n) >= 0f) 1f else -1f
+        var turn = 0.0
+        for (i in 0 until n) {
+            val a = i * 2; val c = (i + 1) % n * 2; val d = (i + 2) % n * 2
+            val ux = p[c] - p[a]; val uy = p[c + 1] - p[a + 1]
+            val vx = p[d] - p[c]; val vy = p[d + 1] - p[c + 1]
+            val cross = (ux * vy - uy * vx) * sign
+            if (cross < -0.01f) return false
+            turn += atan2(cross.toDouble(), (ux * vx + uy * vy).toDouble())
+        }
+        return turn < Math.PI * 3
+    }
+
+    private class RegionEdges(size: Int) {
+        val ax = FloatArray(size); val ay = FloatArray(size); val bx = FloatArray(size); val by = FloatArray(size)
+        val dir = IntArray(size)
+        val path = BooleanArray(size)
+        var count = 0
+
+        fun add(x0: Float, y0: Float, x1: Float, y1: Float, onPath: Boolean) {
+            if (y0 == y1) return
+            val e = count++
+            if (y0 < y1) { ax[e] = x0; ay[e] = y0; bx[e] = x1; by[e] = y1; dir[e] = 1 } else { ax[e] = x1; ay[e] = y1; bx[e] = x0; by[e] = y0; dir[e] = -1 }
+            path[e] = onPath
+        }
+
+        fun xAt(e: Int, y: Float): Float = when {
+            y <= ay[e] -> ax[e]
+            y >= by[e] -> bx[e]
+            else -> ax[e] + (bx[e] - ax[e]) * ((y - ay[e]) / (by[e] - ay[e]))
+        }
+
+        fun crossing(i: Int, j: Int): Float {
+            if (!path[i] || !path[j] || by[i] <= ay[j] || by[j] <= ay[i]) return Float.NaN
+            if (max(ax[i], bx[i]) < min(ax[j], bx[j]) || max(ax[j], bx[j]) < min(ax[i], bx[i])) return Float.NaN
+            val rx = (bx[i] - ax[i]).toDouble(); val ry = (by[i] - ay[i]).toDouble()
+            val sx = (bx[j] - ax[j]).toDouble(); val sy = (by[j] - ay[j]).toDouble()
+            val den = rx * sy - ry * sx
+            if (abs(den) < 1e-12) return Float.NaN
+            val qx = (ax[j] - ax[i]).toDouble(); val qy = (ay[j] - ay[i]).toDouble()
+            val t = (qx * sy - qy * sx) / den
+            val u = (qx * ry - qy * rx) / den
+            if (t <= 0.0 || t >= 1.0 || u <= 0.0 || u >= 1.0) return Float.NaN
+            return (ay[i] + t * ry).toFloat()
+        }
+    }
+
+    private class Spans {
+        var xs = FloatArray(64)
+        var sides = IntArray(32)
+        var count = 0
+
+        fun add(slabStart: Int, left: Int, right: Int, tl: Float, tr: Float, bl: Float, br: Float) {
+            val last = count - 1
+            if (last >= slabStart && abs(xs[last * 4 + 1] - tl) < 1e-4f && abs(xs[last * 4 + 3] - bl) < 1e-4f) {
+                xs[last * 4 + 1] = tr; xs[last * 4 + 3] = br; sides[last * 2 + 1] = right
+                return
+            }
+            if (count * 4 == xs.size) { xs = xs.copyOf(xs.size * 2); sides = sides.copyOf(sides.size * 2) }
+            xs[count * 4] = tl; xs[count * 4 + 1] = tr; xs[count * 4 + 2] = bl; xs[count * 4 + 3] = br
+            sides[count * 2] = left; sides[count * 2 + 1] = right
+            count++
+        }
+    }
+
+    private fun region(loops: List<FloatArray>, evenOdd: Boolean, difference: Boolean): Region {
+        var pl = Float.MAX_VALUE; var pt = Float.MAX_VALUE; var pr = -Float.MAX_VALUE; var pb = -Float.MAX_VALUE
+        var points = 0
+        for (p in loops) {
+            points += p.size / 2
+            for (i in p.indices step 2) {
+                pl = min(pl, p[i]); pr = max(pr, p[i])
+                pt = min(pt, p[i + 1]); pb = max(pb, p[i + 1])
+            }
+        }
+        val box = if (difference) floatArrayOf(floor(pl) - 2f, floor(pt) - 2f, ceil(pr) + 2f, ceil(pb) + 2f) else null
+        val edges = RegionEdges(points + 2)
+        for (p in loops) {
+            val n = p.size / 2
+            for (i in 0 until n) {
+                val j = (i + 1) % n
+                edges.add(p[i * 2], p[i * 2 + 1], p[j * 2], p[j * 2 + 1], true)
+            }
+        }
+        if (box != null) {
+            edges.add(box[0], box[1], box[0], box[3], false)
+            edges.add(box[2], box[3], box[2], box[1], false)
+        }
+        val m = edges.count
+        var ys = FloatArray(m * 2 + 2)
+        var yn = 0
+        fun addY(y: Float) {
+            if (yn == ys.size) ys = ys.copyOf(yn * 2)
+            ys[yn++] = y
+        }
+        for (e in 0 until m) { addY(edges.ay[e]); addY(edges.by[e]) }
+        val order = (0 until m).sortedBy { edges.ay[it] }
+        for (a in 0 until m) {
+            val i = order[a]
+            for (c in a + 1 until m) {
+                val j = order[c]
+                if (edges.ay[j] >= edges.by[i]) break
+                val y = edges.crossing(i, j)
+                if (!y.isNaN()) addY(y)
+            }
+        }
+        ys.sort(0, yn)
+        var slabYs = 0
+        for (i in 0 until yn) if (slabYs == 0 || ys[i] - ys[slabYs - 1] > 1e-3f) ys[slabYs++] = ys[i]
+        val slabs = max(slabYs - 1, 0)
+        val spans = Spans()
+        val slabStart = IntArray(slabs + 1)
+        val active = IntArray(m)
+        val xm = FloatArray(m)
+        var an = 0
+        var next = 0
+        fun filled(w: Int) = if (evenOdd) w and 1 != 0 else w != 0
+        fun inside(wp: Int, wb: Int) = if (difference) wb != 0 && !filled(wp) else filled(wp)
+        for (k in 0 until slabs) {
+            val y0 = ys[k]
+            val y1 = ys[k + 1]
+            val mid = (y0 + y1) / 2f
+            var w = 0
+            for (i in 0 until an) if (edges.by[active[i]] > mid) active[w++] = active[i]
+            an = w
+            while (next < m && edges.ay[order[next]] < mid) {
+                val e = order[next++]
+                if (edges.by[e] > mid) active[an++] = e
+            }
+            for (i in 0 until an) xm[active[i]] = edges.xAt(active[i], mid)
+            for (i in 1 until an) {
+                val e = active[i]
+                var j = i - 1
+                while (j >= 0 && xm[active[j]] > xm[e]) { active[j + 1] = active[j]; j-- }
+                active[j + 1] = e
+            }
+            slabStart[k] = spans.count
+            var wp = 0
+            var wb = 0
+            var open = -1
+            for (i in 0 until an) {
+                val e = active[i]
+                val was = inside(wp, wb)
+                if (edges.path[e]) wp += edges.dir[e] else wb += edges.dir[e]
+                val now = inside(wp, wb)
+                if (!was && now) open = e
+                if (!was || now || open < 0) continue
+                var tl = edges.xAt(open, y0); var tr = edges.xAt(e, y0)
+                var bl = edges.xAt(open, y1); var br = edges.xAt(e, y1)
+                if (tr < tl) { tl = (tl + tr) / 2f; tr = tl }
+                if (br < bl) { bl = (bl + br) / 2f; br = bl }
+                if (tr - tl > 1e-4f || br - bl > 1e-4f) spans.add(slabStart[k], open, e, tl, tr, bl, br)
+            }
+        }
+        slabStart[slabs] = spans.count
+        val pieces = ArrayList<RegionPiece>()
+        val sx = spans.xs
+        val top = FloatArray(spans.count * 2 + 4)
+        val bottom = FloatArray(spans.count * 2 + 4)
+        for (k in 0 until slabs) for (s in slabStart[k] until slabStart[k + 1]) {
+            val tl = sx[s * 4]; val tr = sx[s * 4 + 1]; val bl = sx[s * 4 + 2]; val br = sx[s * 4 + 3]
+            val tn = when {
+                k > 0 -> uncovered(tl, tr, sx, slabStart[k - 1], slabStart[k], 2, top)
+                box == null -> { top[0] = tl; top[1] = tr; 2 }
+                else -> 0
+            }
+            val bn = when {
+                k < slabs - 1 -> uncovered(bl, br, sx, slabStart[k + 1], slabStart[k + 2], 0, bottom)
+                box == null -> { bottom[0] = bl; bottom[1] = br; 2 }
+                else -> 0
+            }
+            val y0 = ys[k]
+            val y1 = ys[k + 1]
+            val limits = ArrayList<FloatArray>(6)
+            val lx = min(tl, bl) - 1f
+            val rx = max(tr, br) + 1f
+            limits += floatArrayOf(lx, y1, lx, y0)
+            limits += floatArrayOf(rx, y0, rx, y1)
+            limits += floatArrayOf(lx, y0 - 1f, rx, y0 - 1f)
+            limits += floatArrayOf(rx, y1 + 1f, lx, y1 + 1f)
+            if (s > slabStart[k]) limits += floatArrayOf((sx[s * 4 - 1] + bl) / 2f, y1, (sx[s * 4 - 3] + tl) / 2f, y0)
+            if (s + 1 < slabStart[k + 1]) limits += floatArrayOf((tr + sx[s * 4 + 4]) / 2f, y0, (br + sx[s * 4 + 6]) / 2f, y1)
+            val caps = ArrayList<Cap>()
+            if (k > 0) capsAt(edges, spans, slabStart[k - 1], slabStart[k], tl, tr, y0, true, caps)
+            if (k < slabs - 1) capsAt(edges, spans, slabStart[k + 1], slabStart[k + 2], bl, br, y1, false, caps)
+            val leftSoft = edges.path[spans.sides[s * 2]]
+            val rightSoft = edges.path[spans.sides[s * 2 + 1]]
+            spanPieces(y0, y1, tl, tr, bl, br, leftSoft, rightSoft, top, tn, bottom, bn, limits, caps, pieces)
+        }
+        pieces.sortBy { it.t }
+        val bounds = floatArrayOf(Float.MAX_VALUE, Float.MAX_VALUE, -Float.MAX_VALUE, -Float.MAX_VALUE)
+        val bottoms = FloatArray(pieces.size)
+        for ((i, p) in pieces.withIndex()) {
+            bounds[0] = min(bounds[0], p.l); bounds[1] = min(bounds[1], p.t); bounds[2] = max(bounds[2], p.r); bounds[3] = max(bounds[3], p.b)
+            bottoms[i] = if (i == 0) p.b else max(bottoms[i - 1], p.b)
+        }
+        val src = FloatArray(points * 2)
+        var o = 0
+        for (p in loops) { p.copyInto(src, o); o += p.size }
+        return Region(pieces.toTypedArray(), box, bounds, bottoms, src, IntArray(loops.size) { loops[it].size / 2 }, evenOdd, null)
+    }
+
+    private class Cap(val x: Float, val right: Boolean, val line: FloatArray)
+
+    private fun capsAt(edges: RegionEdges, spans: Spans, from: Int, to: Int, a: Float, b: Float, y: Float, top: Boolean, out: MutableList<Cap>) {
+        val xs = spans.xs
+        val at = if (top) 2 else 0
+        val far = if (top) 0 else 2
+        for (s in from until to) {
+            val c = xs[s * 4 + at]; val d = xs[s * 4 + at + 1]
+            if (c > a + 1e-3f && c < b - 1e-3f && xs[s * 4 + far] > c + 1e-3f) cap(edges, spans.sides[s * 2], c, true, y, top, out)
+            if (d > a + 1e-3f && d < b - 1e-3f && xs[s * 4 + far + 1] < d - 1e-3f) cap(edges, spans.sides[s * 2 + 1], d, false, y, top, out)
+        }
+    }
+
+    private fun cap(edges: RegionEdges, e: Int, x: Float, right: Boolean, y: Float, top: Boolean, out: MutableList<Cap>) {
+        if (!edges.path[e]) return
+        var line = floatArrayOf(edges.ax[e], edges.ay[e], edges.bx[e], edges.by[e])
+        if (edgeSide(line, 0, x + if (right) 0.5f else -0.5f, if (top) y + 1f else y - 1f) < 0f) line = floatArrayOf(line[2], line[3], line[0], line[1])
+        out += Cap(x, right, line)
+    }
+
+    private fun uncovered(a: Float, b: Float, xs: FloatArray, from: Int, to: Int, at: Int, out: FloatArray): Int {
+        var n = 0
+        var x = a
+        for (s in from until to) {
+            val c = xs[s * 4 + at]
+            val d = xs[s * 4 + at + 1]
+            if (d <= x) continue
+            if (c >= b) break
+            if (c - x > 1e-3f) { out[n++] = x; out[n++] = c }
+            x = max(x, d)
+            if (x >= b) break
+        }
+        if (b - x > 1e-3f) { out[n++] = x; out[n++] = b }
+        return n
+    }
+
+    private fun spanPieces(
+        y0: Float, y1: Float, tl: Float, tr: Float, bl: Float, br: Float, leftSoft: Boolean, rightSoft: Boolean,
+        top: FloatArray, tn: Int, bottom: FloatArray, bn: Int, limits: List<FloatArray>, caps: List<Cap>, out: MutableList<RegionPiece>,
+    ) {
+        val px = floatArrayOf(tl, tr, br, bl)
+        val py = floatArrayOf(y0, y0, y1, y1)
+        val pl = intArrayOf(SIDE_TOP, SIDE_RIGHT, SIDE_BOTTOM, SIDE_LEFT)
+        val cuts = FloatArray(tn + bn + caps.size)
+        var cn = 0
+        for (i in 0 until tn) if (top[i] > tl + 1e-3f && top[i] < tr - 1e-3f) cuts[cn++] = top[i]
+        for (i in 0 until bn) if (bottom[i] > bl + 1e-3f && bottom[i] < br - 1e-3f) cuts[cn++] = bottom[i]
+        for (c in caps) cuts[cn++] = c.x
+        cuts.sort(0, cn)
+        var unique = 0
+        for (i in 0 until cn) if (unique == 0 || cuts[i] - cuts[unique - 1] > 1e-3f) cuts[unique++] = cuts[i]
+        cn = unique
+        val ax = FloatArray(12); val ay = FloatArray(12); val al = IntArray(12)
+        val bx = FloatArray(12); val by = FloatArray(12); val bl2 = IntArray(12)
+        for (c in 0..cn) {
+            var n = 4
+            px.copyInto(ax); py.copyInto(ay); pl.copyInto(al)
+            if (c > 0) {
+                n = cutX(ax, ay, al, n, cuts[c - 1], true, bx, by, bl2)
+                bx.copyInto(ax, 0, 0, n); by.copyInto(ay, 0, 0, n); bl2.copyInto(al, 0, 0, n)
+            }
+            if (c < cn && n >= 3) {
+                n = cutX(ax, ay, al, n, cuts[c], false, bx, by, bl2)
+                bx.copyInto(ax, 0, 0, n); by.copyInto(ay, 0, 0, n); bl2.copyInto(al, 0, 0, n)
+            }
+            if (n < 3) continue
+            val soft = BooleanArray(n)
+            for (i in 0 until n) {
+                val mid = (ax[i] + ax[(i + 1) % n]) / 2f
+                soft[i] = when (al[i]) {
+                    SIDE_TOP -> within(top, tn, mid)
+                    SIDE_BOTTOM -> within(bottom, bn, mid)
+                    SIDE_LEFT -> leftSoft
+                    SIDE_RIGHT -> rightSoft
+                    else -> false
+                }
+            }
+            val lo = if (c > 0) cuts[c - 1] else Float.NaN
+            val hi = if (c < cn) cuts[c] else Float.NaN
+            val stripCaps = if (caps.isEmpty()) emptyList() else caps.filter { if (it.right) abs(it.x - lo) <= 1e-3f else abs(it.x - hi) <= 1e-3f }.map { it.line }
+            regionPiece(ax, ay, soft, n, limits, stripCaps)?.let { out += it }
+        }
+    }
+
+    private fun within(intervals: FloatArray, n: Int, x: Float): Boolean {
+        for (i in 0 until n step 2) if (x >= intervals[i] && x <= intervals[i + 1]) return true
+        return false
+    }
+
+    private fun cutX(xs: FloatArray, ys: FloatArray, ls: IntArray, n: Int, at: Float, keepRight: Boolean, ox: FloatArray, oy: FloatArray, ol: IntArray): Int {
+        var k = 0
+        for (i in 0 until n) {
+            val j = (i + 1) % n
+            val ii = if (keepRight) xs[i] >= at else xs[i] <= at
+            val ij = if (keepRight) xs[j] >= at else xs[j] <= at
+            if (ii) { ox[k] = xs[i]; oy[k] = ys[i]; ol[k] = ls[i]; k++ }
+            if (ii != ij) {
+                val f = (at - xs[i]) / (xs[j] - xs[i])
+                ox[k] = at; oy[k] = ys[i] + (ys[j] - ys[i]) * f; ol[k] = if (ii) SIDE_CUT else ls[i]; k++
+            }
+        }
+        return k
+    }
+
+    private fun regionPiece(xs: FloatArray, ys: FloatArray, soft: BooleanArray, count: Int, limits: List<FloatArray>, caps: List<FloatArray>): RegionPiece? {
+        val ex = FloatArray(count); val ey = FloatArray(count); val es = BooleanArray(count)
+        var n = 0
+        for (i in 0 until count) {
+            if (n > 0 && abs(xs[i] - ex[n - 1]) < 1e-4f && abs(ys[i] - ey[n - 1]) < 1e-4f) { es[n - 1] = soft[i]; continue }
+            ex[n] = xs[i]; ey[n] = ys[i]; es[n] = soft[i]; n++
+        }
+        while (n > 1 && abs(ex[0] - ex[n - 1]) < 1e-4f && abs(ey[0] - ey[n - 1]) < 1e-4f) n--
+        if (n < 3) return null
+        val edge = FloatArray(n * 2)
+        for (i in 0 until n) { edge[i * 2] = ex[i]; edge[i * 2 + 1] = ey[i] }
+        if (signedArea(edge, n) <= 1e-6f) return null
+        val cover = ArrayList<FloatArray>(n + caps.size)
+        val outer = ArrayList<FloatArray>(n + limits.size)
+        for (e in 0 until n) {
+            val j = (e + 1) % n
+            val line = floatArrayOf(ex[e], ey[e], ex[j], ey[j])
+            if (es[e]) cover += line
+            outer += if (es[e]) offsetLine(line, -0.5f) else line
+        }
+        cover += caps
+        outer += limits
+        val invLen = FloatArray(cover.size) { 1f / max(length(cover[it][2] - cover[it][0], cover[it][3] - cover[it][1]), 1e-6f) }
+        val inner = Array(cover.size) { offsetLine(cover[it], 0.5f) }
+        var l = Float.MAX_VALUE; var t = Float.MAX_VALUE; var r = -Float.MAX_VALUE; var b = -Float.MAX_VALUE
+        for (i in 0 until n) {
+            l = min(l, ex[i]); r = max(r, ex[i])
+            t = min(t, ey[i]); b = max(b, ey[i])
+        }
+        return RegionPiece(cover.toTypedArray(), invLen, inner, outer.toTypedArray(), l - 1f, t - 1f, r + 1f, b + 1f)
+    }
+
+    private fun offsetLine(line: FloatArray, by: Float): FloatArray {
+        val dx = line[2] - line[0]; val dy = line[3] - line[1]
+        val o = by / max(length(dx, dy), 1e-6f)
+        val ox = -dy * o; val oy = dx * o
+        return floatArrayOf(line[0] + ox, line[1] + oy, line[2] + ox, line[3] + oy)
+    }
+
     // Winds a clip polygon so edgeSide is positive inside it
     private fun orient(p: FloatArray) {
         if (signedArea(p, p.size / 2) >= 0f) return
@@ -1962,7 +2963,14 @@ public abstract class PolyTessellator : PolyRenderer {
         val safe = (b[0] >= sf[0] && b[1] >= sf[1] && b[2] <= sf[2] && b[3] <= sf[3]) || (b[0] >= sf[4] && b[1] >= sf[5] && b[2] <= sf[6] && b[3] <= sf[7])
         if (!covers && (safe || b[4] > 0.5f || b[5] > 0.5f)) {
             val r = rrectScratch(0, x, y, w, h, radius)
-            return unclipped(x, y, w, h, radius) { fill(r) }
+            if (!safe) return unclipped(x, y, w, h, radius) { fill(r) }
+            state.rclip = saved.parent
+            try {
+                unclipped(x, y, w, h, radius) { fill(r) }
+            } finally {
+                state.rclip = saved
+            }
+            return
         }
         val poly = if (covers) saved.edge else clipToBox(saved.edge, b[0], b[1], b[2], b[3])
         if (poly.size < 6) return
@@ -2023,9 +3031,29 @@ public abstract class PolyTessellator : PolyRenderer {
     }
 
     // Geometry drawn with a gradient keeps sampling the gradient's texture
-    private fun whitePage(): Any = if (shading != null) batchTexture else batchTexture as? PolyGlyphPage.Page ?: PolyGlyphPage.pages[0]
+    private fun whitePage(): Any = if (shading != null) batchTexture else batchTexture as? PolyGlyphPage.Page ?: whiteTexture()
 
     protected fun begin(texture: Any, premultiplied: Boolean, nearest: Boolean = false) {
+        applyBlend()
+        if (whiteOnly && premultiplied == batchPremul && (texture === batchTexture || texture is PolyGlyphPage.Page && batchTexture is PolyGlyphPage.Page)) {
+            if (texture !== batchTexture || nearest != batchNearest) clipLogs.lastOrNull()?.begin(texture, premultiplied, nearest)
+            batchTexture = texture
+            batchNearest = nearest
+        } else {
+            switchBatch(texture, premultiplied, nearest)
+        }
+        whiteOnly = false
+    }
+
+    private fun beginWhite() {
+        applyBlend()
+        if (shading != null) return begin(whitePage(), false, batchNearest)
+        val white = whiteOnly || count == 0
+        switchBatch(whitePage(), false, batchNearest)
+        whiteOnly = white || count == 0
+    }
+
+    private fun switchBatch(texture: Any, premultiplied: Boolean, nearest: Boolean) {
         if (texture !== batchTexture || premultiplied != batchPremul || nearest != batchNearest) clipLogs.lastOrNull()?.begin(texture, premultiplied, nearest)
         if (count > 0 && (texture !== batchTexture || premultiplied != batchPremul || nearest != batchNearest)) flush()
         batchTexture = texture
@@ -2049,9 +3077,14 @@ public abstract class PolyTessellator : PolyRenderer {
         boxCount = 0
         count = 0
         qn = 0
-        batchTexture = PolyGlyphPage.pages[0]
+        batchTexture = whiteTexture()
         batchPremul = false
         batchNearest = false
+        whiteOnly = true
+        drawBlend = PolyRenderer.BLEND_SRC_OVER
+        wantBlend = PolyRenderer.BLEND_SRC_OVER
+        discardFrom = Int.MAX_VALUE
+        antiAliased = true
         minX = Float.MAX_VALUE; minY = Float.MAX_VALUE; maxX = -Float.MAX_VALUE; maxY = -Float.MAX_VALUE
     }
 
@@ -2067,6 +3100,7 @@ public abstract class PolyTessellator : PolyRenderer {
         b[0] = minX; b[1] = minY; b[2] = maxX; b[3] = maxY
         submit(batchTexture, batchPremul, batchNearest, verts.copyOf(count * 4), colors.copyOf(count), b)
         count = 0
+        whiteOnly = true
         minX = Float.MAX_VALUE; minY = Float.MAX_VALUE; maxX = -Float.MAX_VALUE; maxY = -Float.MAX_VALUE
     }
 
@@ -2092,6 +3126,8 @@ public abstract class PolyTessellator : PolyRenderer {
         }
         return b
     }
+
+    private fun premultiplied(color: Int): Int = (color and -0x1000000) or (scaleArgb(color, (color ushr 24) / 255f) and 0x00FFFFFF)
 
     private fun scaleArgb(color: Int, alpha: Float): Int {
         var out = 0
@@ -2178,13 +3214,13 @@ public abstract class PolyTessellator : PolyRenderer {
     private fun fillPolygonPx(p: FloatArray, n: Int, color: Int, convex: Boolean, uv: ((Float, Float, FloatArray) -> Unit)? = null, keepBatch: Boolean = false, quads: IntArray? = null) {
         if (n < 3) return
         val c = mulAlpha(color, state.alpha)
-        if (c ushr 24 == 0) return
+        if (invisible(c)) return
         if (convex && n == 4 && uv == null && quads == null && !recording && alignedRect(p, c, keepBatch)) return
         val clockwise = signedArea(p, n) > 0f
         val inner = floats(0, n * 2)
         val outer = floats(1, n * 2)
         offsetPolygon(p, n, if (clockwise) 1f else -1f, inner, outer)
-        if (!keepBatch && !recording) begin(whitePage(), false)
+        if (!keepBatch && !recording) beginWhite()
         val iuv = uvs(inner, n, uv, 2)
         val ouv = uvs(outer, n, uv, 3)
         fun tri(a: Int, b: Int, d: Int) = quadVerts(
@@ -2215,6 +3251,7 @@ public abstract class PolyTessellator : PolyRenderer {
             val t = earClip(inner, n)
             for (k in t.indices step 3) tri(t[k], t[k + 1], t[k + 2])
         }
+        if (!antiAliased) return
         val clear = c and 0x00FFFFFF
         for (i in 0 until n) {
             val j = (i + 1) % n
@@ -2249,7 +3286,7 @@ public abstract class PolyTessellator : PolyRenderer {
             if (!inside(rc, x0, y0) || !inside(rc, x1, y0) || !inside(rc, x1, y1) || !inside(rc, x0, y1)) return false
             rc = rc.parent
         }
-        if (!keepBatch) begin(whitePage(), false)
+        if (!keepBatch) beginWhite()
         val w = PolyGlyphPage.WHITE_UV
         quadPx(x0, y0, x1, y1, w, w, w, w, c)
         return true
@@ -2270,16 +3307,16 @@ public abstract class PolyTessellator : PolyRenderer {
 
     private fun strokeRing(outerPts: FloatArray, innerPts: FloatArray, n: Int, color: Int, shade: ((Float, Float) -> Int)? = null, band: Boolean = true) {
         val c = mulAlpha(color, state.alpha)
-        if ((shade == null && c ushr 24 == 0) || n < 3) return
+        if ((shade == null && invisible(c)) || n < 3) return
         val dir = if (signedArea(outerPts, n) > 0f) 1f else -1f
         val oIn = floats(4, n * 2); val oOut = floats(5, n * 2)
         val iIn = floats(6, n * 2); val iOut = floats(7, n * 2)
         offsetPolygon(outerPts, n, dir, oIn, oOut)
         offsetPolygon(innerPts, n, -dir, iIn, iOut)
-        begin(whitePage(), false)
+        if (shade != null) begin(whitePage(), true) else beginWhite()
         val w = PolyGlyphPage.WHITE_UV
-        fun at(p: FloatArray, i: Int) = if (shade == null) c else mulAlpha(shade(p[i * 2], p[i * 2 + 1]), state.alpha)
-        fun clear(p: FloatArray, i: Int) = at(p, i) and 0x00FFFFFF
+        fun at(p: FloatArray, i: Int) = if (shade == null) c else premultiplied(mulAlpha(shade(p[i * 2], p[i * 2 + 1]), state.alpha))
+        fun clear(p: FloatArray, i: Int) = if (shade == null) c and 0x00FFFFFF else 0
         val oc = ints(0, n); val ic = ints(1, n); val ocl = ints(2, n); val icl = ints(3, n)
         for (i in 0 until n) {
             oc[i] = at(oIn, i); ic[i] = at(iIn, i)
@@ -2289,6 +3326,7 @@ public abstract class PolyTessellator : PolyRenderer {
             val j = (i + 1) % n
             val a = i * 2; val b = j * 2
             if (band) quadVerts(oIn[a], oIn[a + 1], w, w, oc[i], iIn[a], iIn[a + 1], w, w, ic[i], iIn[b], iIn[b + 1], w, w, ic[j], oIn[b], oIn[b + 1], w, w, oc[j])
+            if (!antiAliased) continue
             quadVerts(oIn[a], oIn[a + 1], w, w, oc[i], oOut[a], oOut[a + 1], w, w, ocl[i], oOut[b], oOut[b + 1], w, w, ocl[j], oIn[b], oIn[b + 1], w, w, oc[j])
             quadVerts(iIn[a], iIn[a + 1], w, w, ic[i], iOut[a], iOut[a + 1], w, w, icl[i], iOut[b], iOut[b + 1], w, w, icl[j], iIn[b], iIn[b + 1], w, w, ic[j])
         }
@@ -2347,8 +3385,9 @@ public abstract class PolyTessellator : PolyRenderer {
                 mx *= scale; my *= scale
             }
             val x = p[i * 2]; val y = p[i * 2 + 1]
-            inner[i * 2] = x + mx * 0.5f; inner[i * 2 + 1] = y + my * 0.5f
-            outer[i * 2] = x - mx * 0.5f; outer[i * 2 + 1] = y - my * 0.5f
+            val reach = if (antiAliased) 0.5f else 0f
+            inner[i * 2] = x + mx * reach; inner[i * 2 + 1] = y + my * reach
+            outer[i * 2] = x - mx * reach; outer[i * 2 + 1] = y - my * reach
         }
     }
 
@@ -2571,7 +3610,7 @@ public abstract class PolyTessellator : PolyRenderer {
             warpCorner(2, (i + 1) * step, (j + 1) * step, fill)
             warpCorner(3, i * step, (j + 1) * step, fill)
             log?.let { logQuad(it, m != null) }
-            cutQuad(s.clip, s.rclip, s.mask, s.hole)
+            cutQuad(s.clip, s.rclip, s.mask, s.hole, s.region)
         }
     }
 
@@ -2631,6 +3670,7 @@ public abstract class PolyTessellator : PolyRenderer {
     }
 
     private fun vertex(x: Float, y: Float, u: Float, v: Float, color: Int) {
+        if (discarding) return
         if (textFill != null || state.proj != null) return warpedVertex(x, y, u, v, color)
         val m = state.rot
         if (m == null) { qx[qn] = x; qy[qn] = y } else { qx[qn] = m[0] * x + m[1] * y + m[4]; qy[qn] = m[2] * x + m[3] * y + m[5] }
@@ -2640,10 +3680,10 @@ public abstract class PolyTessellator : PolyRenderer {
         if (++qn < 4) return
         qn = 0
         clipLogs.lastOrNull()?.let { logQuad(it, m != null) }
-        cutQuad(state.clip, state.rclip, state.mask, state.hole)
+        cutQuad(state.clip, state.rclip, state.mask, state.hole, state.region)
     }
 
-    private fun cutQuad(box: FloatArray?, clipped: RClip?, masked: Mask?, hole: RClip?) {
+    private fun cutQuad(box: FloatArray?, clipped: RClip?, masked: Mask?, hole: RClip?, region: Region?) {
         var crosses = 0
         if (box != null) {
             val x0 = min(min(qx[0], qx[1]), min(qx[2], qx[3])); val x1 = max(max(qx[0], qx[1]), max(qx[2], qx[3]))
@@ -2659,7 +3699,7 @@ public abstract class PolyTessellator : PolyRenderer {
         while (rclip != null && quadInside(rclip)) rclip = rclip.parent
         var mask = masked
         while (mask != null && maskOpaque(mask.fade)) mask = mask.parent
-        if (crosses == 0 && rclip == null && mask == null && hole == null) {
+        if (crosses == 0 && rclip == null && mask == null && hole == null && region == null) {
             for (i in 0 until 4) emit(qx[i], qy[i], qu[i], qv[i], qc[i])
         } else {
             polyUsed = 0
@@ -2670,6 +3710,13 @@ public abstract class PolyTessellator : PolyRenderer {
             if (crosses == 0) polys.add(quad) else boxCut(quad, box!!, crosses, polys)
             if (rclip != null && polys.isNotEmpty()) polys = clipQuad(polys, rclip, ::cut)
             if (hole != null && polys.isNotEmpty()) polys = clipQuad(polys, hole, ::cutHole)
+            var rg = region
+            while (rg != null && polys.isNotEmpty()) {
+                val next = other(polys)
+                for (i in polys.indices) cutRegion(polys[i], rg, next)
+                polys = next
+                rg = rg.parent
+            }
             while (mask != null && polys.isNotEmpty()) {
                 val m = mask.fade
                 val next = other(polys)
@@ -2985,6 +4032,78 @@ public abstract class PolyTessellator : PolyRenderer {
         return p
     }
 
+    private fun cutRegion(p: Poly, g: Region, out: MutableList<Poly>) {
+        var x0 = Float.MAX_VALUE; var y0 = Float.MAX_VALUE; var x1 = -Float.MAX_VALUE; var y1 = -Float.MAX_VALUE
+        for (i in 0 until p.size) {
+            x0 = min(x0, p.x[i]); x1 = max(x1, p.x[i])
+            y0 = min(y0, p.y[i]); y1 = max(y1, p.y[i])
+        }
+        var rest = p
+        val box = g.box
+        if (box != null) {
+            if (x1 <= box[0] || x0 >= box[2] || y1 <= box[1] || y0 >= box[3]) { out.add(p); return }
+            if (x0 < box[0]) rest = keepPast(rest, false, box[0], 1f, out)
+            if (rest.size >= 3 && x1 > box[2]) rest = keepPast(rest, false, box[2], -1f, out)
+            if (rest.size >= 3 && y0 < box[1]) rest = keepPast(rest, true, box[1], 1f, out)
+            if (rest.size >= 3 && y1 > box[3]) rest = keepPast(rest, true, box[3], -1f, out)
+            if (rest.size < 3) return
+            x0 = max(x0, box[0]); y0 = max(y0, box[1]); x1 = min(x1, box[2]); y1 = min(y1, box[3])
+        } else {
+            val b = g.bounds
+            if (x1 <= b[0] || x0 >= b[2] || y1 <= b[1] || y0 >= b[3]) return
+        }
+        val pieces = g.pieces
+        var lo = 0
+        var hi = pieces.size
+        val bottoms = g.bottoms
+        while (lo < hi) {
+            val mid = (lo + hi) ushr 1
+            if (bottoms[mid] <= y0) lo = mid + 1 else hi = mid
+        }
+        for (k in lo until pieces.size) {
+            val pc = pieces[k]
+            if (pc.t >= y1) break
+            if (pc.b <= y0 || pc.r <= x0 || pc.l >= x1) continue
+            var q = poly()
+            for (i in 0 until rest.size) q.addFrom(rest, i)
+            for (line in pc.outer) {
+                q = split(q, line, 0, null)
+                if (q.size < 3) break
+            }
+            if (q.size < 3) continue
+            for (e in pc.inner.indices) {
+                val past = poly()
+                q = split(q, pc.inner[e], 0, past)
+                var rest2 = past
+                for (f in e + 1 until pc.inner.size) {
+                    if (rest2.size < 3) break
+                    val corner = poly()
+                    rest2 = split(rest2, pc.inner[f], 0, corner)
+                    if (corner.size >= 3) out.add(regionCovered(corner, pc))
+                }
+                if (rest2.size >= 3) out.add(regionCovered(rest2, pc))
+                if (q.size < 3) break
+            }
+            if (q.size >= 3) out.add(q)
+        }
+    }
+
+    private fun keepPast(p: Poly, vertical: Boolean, at: Float, sign: Float, out: MutableList<Poly>): Poly {
+        val outside = poly()
+        val rest = splitAxis(p, vertical, at, outside, sign)
+        if (outside.size >= 3) out.add(outside)
+        return rest
+    }
+
+    private fun regionCovered(p: Poly, pc: RegionPiece): Poly {
+        for (i in 0 until p.size) {
+            var d = Float.MAX_VALUE
+            for (e in pc.cover.indices) d = min(d, edgeSide(pc.cover[e], 0, p.x[i], p.y[i]) * pc.invLen[e])
+            p.c[i] = coverColor(p.c[i], (d + 0.5f).coerceIn(0f, 1f), batchPremul)
+        }
+        return p
+    }
+
     private fun emitFan(p: Poly) {
         if (p.size < 3) return
         var i = 1
@@ -3018,8 +4137,16 @@ public abstract class PolyTessellator : PolyRenderer {
 
     private class ShadowMask(val bitmap: PolyBitmap, val slice: Float, val extent: Float, val width: Float)
 
+    private var lastMask: ShadowMask? = null
+    private var lastMaskR = -1
+    private var lastMaskQ = -1
+
     public companion object {
         private const val MAX_FADE_DRAWS = 16
+        private const val BOX = 6
+        private const val BOX_SELF = 4
+        private const val BOX_BLEND = 5
+        private const val DEFAULT_MITER_LIMIT = 4f
         private const val KEY_EXACT: Byte = 0
         private const val KEY_X: Byte = 1
         private const val KEY_Y: Byte = 2
@@ -3032,6 +4159,12 @@ public abstract class PolyTessellator : PolyRenderer {
         private const val MAX_PATH_MESHES = 64
         private const val MAX_PATH_MESH_VERTICES = 16384
         private const val ALIGN_EPSILON = 1e-3f
+        private const val MAX_REGIONS = 16
+        private const val SIDE_TOP = 0
+        private const val SIDE_RIGHT = 1
+        private const val SIDE_BOTTOM = 2
+        private const val SIDE_LEFT = 3
+        private const val SIDE_CUT = 4
         private const val CAMERA_UNIT = 72f
         private const val MIN_W = 0.05f
         private const val WARP_FLAT = 1.002f
@@ -3039,7 +4172,16 @@ public abstract class PolyTessellator : PolyRenderer {
         private const val FILL_STEP = 12f
         private const val MAX_WARP = 8
 
+        private const val CULL_PAD = 2f
+        private const val MAX_RRECT_SHAPES = 32
+        private const val TEXT_ASCENT_REACH = 3f
+        private const val TEXT_DESCENT_REACH = 2f
+        private const val MC_LINE_REACH = 16f
+        private const val MC_LINE_HEIGHT = 9f
+
         private const val NEAREST_TIE_BIAS = 1f / 256f
+        private const val STRICT_EDGE_EPSILON = 1e-5f
+        private const val STRICT_CENTER_EPSILON = 2e-3f
         private const val EDGE_EPSILON = 1f / 512f
 
         // Holes are only cut along their edges, so they need no safe areas or box
@@ -3106,23 +4248,56 @@ public abstract class PolyTessellator : PolyRenderer {
         })
 
         private val ramps = lru<Pair<List<PolyColor>, List<Float>?>, PolyBitmap>(64)
-        private val boxRasters = lru<Pair<PolyGradient, Int>, PolyBitmap>(32)
+        private data class BoxKey(val gradient: PolyGradient, val aspect: Int, val w: Int, val h: Int)
+
+        private val boxRasters = LinkedHashMap<BoxKey, PolyBitmap>(16, 0.75f, true)
+        private var boxBytes = 0L
         private val masks = lru<Long, ShadowMask>(32)
         private val mcOutlines = arrayOf(lru<String, FloatArray>(256), lru<String, FloatArray>(256))
 
         @Volatile
         private var mcOutlinesRevision = -1
 
-        private fun mcOutlineRects(r: PolyGlyphPage.Rasterizer, line: String, literal: Boolean): FloatArray {
+        private fun mcOutlineRects(r: PolyGlyphPage.Rasterizer, line: String, literal: Boolean, shared: Boolean): FloatArray {
+            if (!shared) return mcCpuOutlineRects(r, line, literal)
             val revision = FontManager.revision
             if (revision != mcOutlinesRevision) {
                 for (m in mcOutlines) m.clear()
                 mcOutlinesRevision = revision
             }
-            return mcOutlines[if (literal) 1 else 0].getOrPut(line) { mcOutline(r, line, literal) }
+            return mcOutlines[if (literal) 1 else 0].getOrPut(line) { mcOutline(r, line, literal, mcRasters, mcInks) }
+        }
+
+        private class McCpuCache(val revision: Int) {
+            val outlines = arrayOf(lru<String, FloatArray>(256), lru<String, FloatArray>(256))
+            val rasters: MutableMap<Pair<PolyGlyphPage.Face, Int>, PolyGlyphPage.Raster?> = Collections.synchronizedMap(HashMap())
+            val inks: Array<MutableMap<Any, McInk?>> = Array(2) { Collections.synchronizedMap(WeakHashMap()) }
+        }
+
+        @Volatile
+        private var mcCpu = McCpuCache(-1)
+        private val mcCpuLock = Any()
+
+        private fun mcCpuCache(): McCpuCache {
+            val revision = FontManager.revision
+            mcCpu.let { if (it.revision >= revision) return it }
+            synchronized(mcCpuLock) {
+                val c = mcCpu
+                if (c.revision >= revision) return c
+                return McCpuCache(revision).also { mcCpu = it }
+            }
+        }
+
+        private fun mcCpuOutlineRects(r: PolyGlyphPage.Rasterizer, line: String, literal: Boolean): FloatArray {
+            val c = mcCpuCache()
+            val outlines = c.outlines[if (literal) 1 else 0]
+            outlines[line]?.let { return it }
+            val rects = mcOutline(r, line, literal, c.rasters, c.inks)
+            return outlines.putIfAbsent(line, rects) ?: rects
         }
 
         private const val FACE_CACHE = 4
+        private const val MC_PUNCH = -0x1000000
         private const val MC_GLYPH_CACHE = 0x800
         private const val MAX_CORNER_SEGMENTS = 16
         private const val RRECT_SLOTS = 2
@@ -3181,7 +4356,10 @@ public abstract class PolyTessellator : PolyRenderer {
         }
 
         // unions the cached grown glyphs row by row, so a changed text costs its runs rather than its whole bounding block
-        private fun mcOutline(r: PolyGlyphPage.Rasterizer, text: String, literal: Boolean): FloatArray {
+        private fun mcOutline(
+            r: PolyGlyphPage.Rasterizer, text: String, literal: Boolean,
+            rasters: MutableMap<Pair<PolyGlyphPage.Face, Int>, PolyGlyphPage.Raster?>, inkCaches: Array<out MutableMap<Any, McInk?>>,
+        ): FloatArray {
             val inks = ArrayList<McInk>()
             val at = ArrayList<Int>()
             val effects = ArrayList<Int>()
@@ -3215,7 +4393,7 @@ public abstract class PolyTessellator : PolyRenderer {
                         at += baseline
                     }
                     val start = pen
-                    val cache = mcInks[if (italic) 1 else 0]
+                    val cache = inkCaches[if (italic) 1 else 0]
                     val rg = McGlyphs.source?.invoke(cp)
                     if (rg != null) {
                         val g = cache.getOrPut(rg) { mcRaster(rg)?.let { mcInk(it, italic) } }
@@ -3228,7 +4406,7 @@ public abstract class PolyTessellator : PolyRenderer {
                         val em: Float
                         if (main != null && main.glyph(cp) != 0) { face = main; em = 10f } else { face = r.face("unifont") ?: continue; em = 8f }
                         val id = face.glyph(cp)
-                        val raster = mcRasters.getOrPut(face to id) { face.raster(id, em * MC_GRID) }
+                        val raster = rasters.getOrPut(face to id) { face.raster(id, em * MC_GRID) }
                         place(raster?.let { cache.getOrPut(it) { mcInk(it, italic) } }, pen)
                         pen += face.advance(id) * em
                     }
@@ -3312,19 +4490,40 @@ public abstract class PolyTessellator : PolyRenderer {
         private fun ramp(g: PolyGradient): PolyBitmap = g.rampBitmap
             ?: ramps.getOrPut(g.colors to g.stops) { bitmapOf(256, 1) { x, _ -> g.sample(x / 255f) } }.also { g.rampBitmap = it }
 
-        private fun boxRaster(g: PolyGradient, aspect: Float): PolyBitmap {
-            val q = (aspect * 16f).roundToInt().coerceIn(1, 1024)
-            g.boxBitmap?.let { if (g.boxAspect == q) return it }
-            return boxRaster(g, q).also { g.boxBitmap = it; g.boxAspect = q }
+        private const val MIN_BOX_SIDE = 16
+        private const val MAX_BOX_SIDE = 512
+        private const val BOX_BYTES = 8L shl 20
+
+        private fun boxSide(px: Float): Int {
+            val n = if (px > 0f) ceil(min(px, MAX_BOX_SIDE.toFloat())).toInt().coerceIn(MIN_BOX_SIDE, MAX_BOX_SIDE) else MIN_BOX_SIDE
+            return Integer.highestOneBit(n - 1) shl 1
         }
 
-        private fun boxRaster(g: PolyGradient, q: Int): PolyBitmap {
-            return boxRasters.getOrPut(g to q) {
-                val a = q / 16f
-                val w = if (a >= 1f) 64 else max(8, (64 * a).roundToInt())
-                val h = if (a >= 1f) max(8, (64 / a).roundToInt()) else 64
-                bitmapOf(w, h) { x, y -> g.colorAt((x + 0.5f) / w * a, (y + 0.5f) / h, 0f, 0f, a, 1f) }
+        private fun boxRaster(g: PolyGradient, aspect: Float, pw: Float, ph: Float): PolyBitmap {
+            val q = (aspect * 16f).roundToInt().coerceIn(1, 1024)
+            val w = boxSide(pw)
+            val h = boxSide(ph)
+            g.boxBitmap?.let { if (g.boxAspect == q && it.width == w && it.height == h) return it }
+            return boxRaster(BoxKey(g, q, w, h)).also { g.boxBitmap = it; g.boxAspect = q }
+        }
+
+        private fun boxRaster(key: BoxKey): PolyBitmap {
+            synchronized(boxRasters) { boxRasters[key]?.let { return it } }
+            val g = key.gradient
+            val a = key.aspect / 16f
+            val w = key.w
+            val h = key.h
+            val made = bitmapOf(w, h) { x, y -> g.colorAt((x + 0.5f) / w * a, (y + 0.5f) / h, 0f, 0f, a, 1f) }
+            synchronized(boxRasters) {
+                boxRasters.put(key, made)?.let { boxBytes -= it.pixels.size }
+                boxBytes += made.pixels.size
+                val eldest = boxRasters.values.iterator()
+                while (boxBytes > BOX_BYTES && boxRasters.size > 1) {
+                    boxBytes -= eldest.next().pixels.size
+                    eldest.remove()
+                }
             }
+            return made
         }
 
         private const val MAX_MASK_SIGMA = 6f
@@ -3377,3 +4576,9 @@ private val MC_COLORS = intArrayOf(
     0x000000, 0x0000AA, 0x00AA00, 0x00AAAA, 0xAA0000, 0xAA00AA, 0xFFAA00, 0xAAAAAA,
     0x555555, 0x5555FF, 0x55FF55, 0x55FFFF, 0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF,
 )
+
+internal fun zeroSourceKeepsDst(mode: Int): Boolean = when (mode) {
+    PolyRenderer.BLEND_SRC, PolyRenderer.BLEND_DST_IN, PolyRenderer.BLEND_SRC_IN, PolyRenderer.BLEND_SRC_OUT,
+    PolyRenderer.BLEND_DST_ATOP, PolyRenderer.BLEND_MODULATE -> false
+    else -> true
+}

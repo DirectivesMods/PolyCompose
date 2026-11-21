@@ -44,6 +44,13 @@ public interface PolyRenderer {
         points: FloatArray, closed: Boolean, x: Float, y: Float, w: Float, h: Float, gradient: PolyGradient, strokeWidth: Float, cap: Int, join: Int,
     ): Unit = strokePolyline(points, closed, gradient.colorAt(x + w / 2f, y + h / 2f, x, y, w, h), strokeWidth, cap, join)
 
+    public fun strokePolyline(points: FloatArray, closed: Boolean, color: Int, strokeWidth: Float, cap: Int, join: Int, miterLimit: Float): Unit =
+        strokePolyline(points, closed, color, strokeWidth, cap, join)
+
+    public fun strokePolylineGradient(
+        points: FloatArray, closed: Boolean, x: Float, y: Float, w: Float, h: Float, gradient: PolyGradient, strokeWidth: Float, cap: Int, join: Int, miterLimit: Float,
+    ): Unit = strokePolylineGradient(points, closed, x, y, w, h, gradient, strokeWidth, cap, join)
+
     public fun strokeColorRing(points: FloatArray, normals: FloatArray, colors: IntArray, strokeWidth: Float, shape: FloatArray? = null) {
         val n = colors.size
         for (i in 0 until n) {
@@ -131,15 +138,42 @@ public interface PolyRenderer {
 
     public fun saveLayerEffect(x: Float, y: Float, w: Float, h: Float, radius: Float, chain: PolyEffectChain, alpha: Float): Unit = saveLayerAlpha(alpha)
 
+    public fun saveLayerEffect(x: Float, y: Float, w: Float, h: Float, radius: Float, chain: PolyEffectChain, alpha: Float, mode: Int): Unit =
+        saveLayerEffect(x, y, w, h, radius, chain, alpha)
+
     public fun save()
     public fun restore()
 
     public fun saveLayerAlpha(alpha: Float)
+
+    public fun saveAlpha(alpha: Float): Unit = saveLayerAlpha(alpha)
     public fun saveLayerFade(fade: PolyFade): Unit = save()
+
+    public fun saveLayerBlend(alpha: Float, mode: Int): Unit = saveLayerAlpha(alpha)
+
+    public fun blend(mode: Int): Boolean = mode == BLEND_SRC_OVER
+
+    public fun antiAlias(enabled: Boolean) {}
 
     public fun deviceTransform(): FloatArray? = null
 
     public fun deviceScale(): Float = deviceTransform()?.let { max(abs(it[0]), abs(it[1])) } ?: 1f
+
+    public fun hairlineWidth(): Float = deviceScale().let { if (it > 0f) 1f / it else 1f }
+
+    public fun hairlineWidth(dx: Float, dy: Float): Float = hairlineWidth()
+
+    public fun triangles(positions: FloatArray, colors: IntArray, indices: IntArray, bitmap: PolyBitmap? = null, uvs: FloatArray? = null) {
+        for (t in 0 until indices.size / 3) {
+            val a = indices[t * 3]
+            val path = PolyPath()
+            path.moveTo(positions[a * 2], positions[a * 2 + 1])
+            path.lineTo(positions[indices[t * 3 + 1] * 2], positions[indices[t * 3 + 1] * 2 + 1])
+            path.lineTo(positions[indices[t * 3 + 2] * 2], positions[indices[t * 3 + 2] * 2 + 1])
+            path.close()
+            fillPath(path, colors[a])
+        }
+    }
 
     public fun translate(dx: Float, dy: Float)
     public fun scale(sx: Float, sy: Float)
@@ -165,17 +199,65 @@ public interface PolyRenderer {
     /** Removes the rectangle from the clip. Renderers that can't remove areas from it keep drawing over the rectangle. */
     public fun clipOutRect(x: Float, y: Float, w: Float, h: Float) {}
 
+    public fun clipPath(path: PolyPath, difference: Boolean) {
+        if (difference) return
+        val loops = path.outlines()
+        if (loops.size == 1) return clipPolygon(loops[0])
+        var l = Float.MAX_VALUE; var t = Float.MAX_VALUE; var r = -Float.MAX_VALUE; var b = -Float.MAX_VALUE
+        for (p in loops) for (i in p.indices step 2) {
+            l = min(l, p[i]); r = max(r, p[i])
+            t = min(t, p[i + 1]); b = max(b, p[i + 1])
+        }
+        if (l > r) clipRect(0f, 0f, 0f, 0f) else clipRect(l, t, r - l, b - t)
+    }
+
     public companion object {
         public const val CAP_BUTT: Int = 0
         public const val CAP_ROUND: Int = 1
         public const val CAP_SQUARE: Int = 2
         public const val JOIN_MITER: Int = 0
         public const val JOIN_ROUND: Int = 1
+        public const val JOIN_BEVEL: Int = 2
         public const val EFFECT_BEHIND: Int = 1
         public const val EFFECT_GAME_FRAME: Int = 2
         public const val EFFECT_LAYER: Int = 4
         public const val EFFECT_CUSTOM: Int = 8
+        public const val BLEND_SRC_OVER: Int = 0
+        public const val BLEND_SRC: Int = 1
+        public const val BLEND_DST_OUT: Int = 2
+        public const val BLEND_DST_IN: Int = 3
+        public const val BLEND_PLUS: Int = 4
+        public const val BLEND_SRC_IN: Int = 5
+        public const val BLEND_SRC_OUT: Int = 6
+        public const val BLEND_SRC_ATOP: Int = 7
+        public const val BLEND_DST_OVER: Int = 8
+        public const val BLEND_DST_ATOP: Int = 9
+        public const val BLEND_XOR: Int = 10
+        public const val BLEND_MODULATE: Int = 11
+        public const val BLEND_SCREEN: Int = 12
     }
+}
+
+private fun PolyPath.outlines(): List<FloatArray> {
+    val loops = ArrayList<FloatArray>()
+    var cur = FloatArray(16)
+    var n = 0
+    fun add(x: Float, y: Float) {
+        if (n + 2 > cur.size) cur = cur.copyOf(cur.size * 2)
+        cur[n++] = x; cur[n++] = y
+    }
+    fun end() {
+        if (n >= 6) loops += cur.copyOf(n)
+        n = 0
+    }
+    visit(object : PolyPath.Visitor {
+        override fun moveTo(x: Float, y: Float) { end(); add(x, y) }
+        override fun lineTo(x: Float, y: Float) = add(x, y)
+        override fun tangentArcTo(x1: Float, y1: Float, x2: Float, y2: Float, radius: Float) { add(x1, y1); add(x2, y2) }
+        override fun close() = end()
+    })
+    end()
+    return loops
 }
 
 public class PolyFade(public val vertical: Boolean, public val stops: FloatArray, public val alphas: FloatArray, public val colors: IntArray? = null) {

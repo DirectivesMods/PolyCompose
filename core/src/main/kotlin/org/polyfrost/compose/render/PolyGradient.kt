@@ -113,11 +113,18 @@ public sealed class PolyGradient {
         return PolyBitmap(w, h, px)
     }
 
+    internal fun positions(): FloatArray = stopArray()
+
     private fun stopArray(): FloatArray {
         stopCache?.let { return it }
         val s = stops
         val n = colors.size
-        return FloatArray(n) { s?.getOrNull(it) ?: (it.toFloat() / (n - 1)) }.also { stopCache = it }
+        var prev = 0f
+        return FloatArray(n) {
+            val raw = s?.getOrNull(it) ?: (it.toFloat() / (n - 1))
+            prev = if (raw.isNaN()) prev else raw.coerceIn(prev, 1f)
+            prev
+        }.also { stopCache = it }
     }
 
     public data class Linear(
@@ -199,12 +206,31 @@ public sealed class PolyGradient {
         @JvmStatic
         public fun lerpArgb(a: Int, b: Int, t: Float): Int {
             if (a == b) return a
+            val aa = a ushr 24
+            val ab = b ushr 24
+            if (aa != ab) return lerpPremultiplied(a, b, aa, ab, t.coerceIn(0f, 1f))
             var out = 0
             var shift = 0
             while (shift <= 24) {
                 val ca = (a ushr shift) and 0xFF
                 val cb = (b ushr shift) and 0xFF
                 out = out or (((ca + (cb - ca) * t).roundToInt().coerceIn(0, 255)) shl shift)
+                shift += 8
+            }
+            return out
+        }
+
+        private fun lerpPremultiplied(a: Int, b: Int, aa: Int, ab: Int, t: Float): Int {
+            val wa = aa * (1f - t)
+            val wb = ab * t
+            val oa = wa + wb
+            if (oa <= 0f) return (if (aa == 0) b else a) and 0xFFFFFF
+            var out = oa.roundToInt().coerceIn(0, 255) shl 24
+            var shift = 0
+            while (shift <= 16) {
+                val ca = (a ushr shift) and 0xFF
+                val cb = (b ushr shift) and 0xFF
+                out = out or (((ca * wa + cb * wb) / oa).roundToInt().coerceIn(0, 255) shl shift)
                 shift += 8
             }
             return out

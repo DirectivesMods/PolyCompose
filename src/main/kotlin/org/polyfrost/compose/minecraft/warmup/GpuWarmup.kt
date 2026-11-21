@@ -21,6 +21,7 @@ import com.mojang.blaze3d.systems.RenderSystem
 import org.polyfrost.compose.minecraft.mixin.render.PostChainAccessor
 import org.polyfrost.compose.minecraft.mixin.render.PostPassAccessor
 import org.polyfrost.compose.minecraft.render.blaze.BlazeBackdrop
+import org.polyfrost.compose.minecraft.render.blaze.BlendPipelines
 import org.polyfrost.compose.minecraft.render.blaze.KeptMeshes
 import org.polyfrost.compose.minecraft.render.blaze.UiBlur
 //?}
@@ -96,6 +97,7 @@ internal object GpuWarmup {
         }
         //? if >= 1.21.11 {
         steps += compile(KeptMeshes.pipelines)
+        steps += compile(BlendPipelines.pipelines)
         steps += compile(listOf(BlazeBackdrop.composite))
         steps += compile(listOf(BlazeBackdrop.blur))
         steps += Step {

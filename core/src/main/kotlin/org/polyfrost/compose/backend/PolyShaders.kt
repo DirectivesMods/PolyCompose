@@ -5,12 +5,14 @@ package org.polyfrost.compose.backend
 import androidx.compose.ui.InternalComposeUiApi
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Matrix
 import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.platform.PlatformShader
 import org.polyfrost.compose.render.ChromaShader
 import org.polyfrost.compose.render.PolyBitmap
+import org.polyfrost.compose.render.PolyColor
 import org.polyfrost.compose.render.PolyFade
 import org.polyfrost.compose.render.PolyGradient
 import org.polyfrost.compose.render.PolyImageFill
@@ -30,14 +32,26 @@ internal abstract class PolyShader : PlatformShader {
 }
 
 internal class GradientShader(val brush: PolyGradient, val center: Offset?, val radius: Float, val tile: TileMode = TileMode.Clamp) : PolyShader() {
-    fun brushFor(x: Float, y: Float, w: Float, h: Float): PolyGradient {
-        val c = center ?: return brush
+    private class Placed(val x: Float, val y: Float, val w: Float, val h: Float, val filter: ColorFilter?, val brush: PolyGradient)
+
+    @Volatile
+    private var placed: Placed? = null
+
+    fun brushFor(x: Float, y: Float, w: Float, h: Float, filter: ColorFilter? = null): PolyGradient {
+        placed?.let { if (it.x == x && it.y == y && it.w == w && it.h == h && it.filter == filter) return it.brush }
+        val platform = filter?.let { PolyPaint.filterPlatform(it) }
+        val source = if (platform == null) brush else brush.filtered { PolyPaint.filtered(platform, it) }
+        return place(source, x, y, w, h).also { placed = Placed(x, y, w, h, filter, it) }
+    }
+
+    private fun place(g: PolyGradient, x: Float, y: Float, w: Float, h: Float): PolyGradient {
+        val c = center ?: return g
         val m = min(w, h)
-        if (w <= 0f || h <= 0f || m <= 0f) return brush
-        return when (brush) {
-            is PolyGradient.Radial -> brush.copy(centerX = (c.x - x) / w, centerY = (c.y - y) / h, radius = radius / m)
-            is PolyGradient.Sweep -> brush.copy(centerX = (c.x - x) / w, centerY = (c.y - y) / h)
-            else -> brush
+        if (w <= 0f || h <= 0f || m <= 0f) return g
+        return when (g) {
+            is PolyGradient.Radial -> g.copy(centerX = (c.x - x) / w, centerY = (c.y - y) / h, radius = radius / m)
+            is PolyGradient.Sweep -> g.copy(centerX = (c.x - x) / w, centerY = (c.y - y) / h)
+            else -> g
         }
     }
 
@@ -128,6 +142,41 @@ internal class TransformedShader(val inner: PlatformShader, val inverse: FloatAr
 internal object ClearShader : PolyShader() {
     override fun color(x: Float, y: Float): Int = 0
 }
+
+internal fun PolyGradient.filtered(map: (Int) -> Int): PolyGradient {
+    val n = colors.size
+    if (n == 0) return this
+    val at = positions()
+    val ts = ArrayList<Float>(n + FILTER_STEPS)
+    val cs = ArrayList<PolyColor>(n + FILTER_STEPS)
+    for (i in 0 until n) {
+        ts += at[i]
+        cs += PolyColor(map(colors[i].argb))
+        if (i == n - 1) break
+        val lo = at[i]
+        val hi = at[i + 1]
+        var k = floor(lo * FILTER_STEPS).toInt() + 1
+        while (k.toFloat() / FILTER_STEPS < hi - FILTER_EPSILON) {
+            val t = k.toFloat() / FILTER_STEPS
+            if (t > lo + FILTER_EPSILON) {
+                ts += t
+                cs += PolyColor(map(sample(t)))
+            }
+            k++
+        }
+    }
+    return when (this) {
+        is PolyGradient.Points -> copy(colors = cs, stops = ts)
+        is PolyGradient.Linear -> copy(colors = cs, stops = ts)
+        is PolyGradient.Radial -> copy(colors = cs, stops = ts)
+        is PolyGradient.Sweep -> copy(colors = cs, stops = ts)
+        else -> this
+    }
+}
+
+private const val FILTER_STEPS = 255
+
+private const val FILTER_EPSILON = 1e-4f
 
 internal val IDENTITY = floatArrayOf(1f, 0f, 0f, 1f, 0f, 0f)
 
@@ -329,15 +378,15 @@ internal object ShaderRaster {
     private const val MAX_SIDE = 2048
     private const val MAX_PIXELS = 1 shl 20
 
-    private class Entry(val fill: PolyImageFill, val x: Float, val y: Float, val w: Float, val h: Float, val kx: Float, val ky: Float)
+    private class Entry(val fill: PolyImageFill, val x: Float, val y: Float, val w: Float, val h: Float, val kx: Float, val ky: Float, val filter: ColorFilter?)
 
     private val cache = WeakHashMap<PlatformShader, Entry>()
 
-    fun fill(shader: PlatformShader, x: Float, y: Float, w: Float, h: Float, kx: Float, ky: Float): PolyImageFill? {
+    fun fill(shader: PlatformShader, x: Float, y: Float, w: Float, h: Float, kx: Float, ky: Float, filter: ColorFilter? = null): PolyImageFill? {
         if (!(w > 0f && h > 0f) || w.isInfinite() || h.isInfinite()) return null
         synchronized(cache) {
             cache[shader]?.let { e ->
-                val covers = e.x <= x && e.y <= y && e.x + e.w >= x + w && e.y + e.h >= y + h
+                val covers = e.filter == filter && e.x <= x && e.y <= y && e.x + e.w >= x + w && e.y + e.h >= y + h
                 if (covers && e.kx >= kx * 0.9f && e.ky >= ky * 0.9f && e.kx <= kx * 2f && e.ky <= ky * 2f) return e.fill
             }
         }
@@ -349,17 +398,19 @@ internal object ShaderRaster {
             ph = (ph * f).toInt().coerceAtLeast(1)
         }
         prepareShader(shader)
+        val platform = filter?.let { PolyPaint.filterPlatform(it) }
         val px = ByteArray(pw * ph * 4)
         for (j in 0 until ph) {
             val ly = y + (j + 0.5f) / ph * h
             for (i in 0 until pw) {
-                val c = shaderColor(shader, x + (i + 0.5f) / pw * w, ly)
+                val raw = shaderColor(shader, x + (i + 0.5f) / pw * w, ly)
+                val c = if (platform == null) raw else PolyPaint.filtered(platform, raw)
                 val o = (j * pw + i) * 4
                 px[o] = (c shr 16).toByte(); px[o + 1] = (c shr 8).toByte(); px[o + 2] = c.toByte(); px[o + 3] = (c ushr 24).toByte()
             }
         }
         val fill = PolyImageFill(PolyBitmap(pw, ph, px), 1f / w, 0f, -x / w, 0f, 1f / h, -y / h)
-        synchronized(cache) { cache[shader] = Entry(fill, x, y, w, h, pw / w, ph / h) }
+        synchronized(cache) { cache[shader] = Entry(fill, x, y, w, h, pw / w, ph / h, filter) }
         return fill
     }
 }

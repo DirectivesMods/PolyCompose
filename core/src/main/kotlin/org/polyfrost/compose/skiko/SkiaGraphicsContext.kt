@@ -34,6 +34,8 @@ import org.polyfrost.compose.backend.RecordingCanvas
 import org.polyfrost.compose.backend.TintFilter
 import org.polyfrost.compose.backend.clipTo
 import org.polyfrost.compose.backend.imageBlur
+import org.polyfrost.compose.backend.layerAlphaOf
+import org.polyfrost.compose.backend.layerBlendOf
 import org.polyfrost.compose.effect.Effect
 import org.polyfrost.compose.effect.toPoly
 import org.polyfrost.compose.profile.FrameProfiler
@@ -45,6 +47,7 @@ import org.polyfrost.compose.render.PolyEffectChain
 import org.polyfrost.compose.render.PolyRenderer
 import org.polyfrost.compose.render.PolyShadow
 import org.polyfrost.compose.render.PolyTessellator
+import org.polyfrost.compose.render.zeroSourceKeepsDst
 
 @Suppress("UNUSED_PARAMETER")
 public class SkiaGraphicsContext(measureDrawBounds: Boolean = false, snapshotCache: Boolean = true) : PlatformGraphicsContext() {
@@ -127,6 +130,8 @@ public class PolyGraphicsLayer : PlatformGraphicsLayer {
         private val pivotOffset = l.pivotOffset
         private val renderEffect = l.renderEffect
         private val colorFilter = l.colorFilter
+        private val blendMode = l.blendMode
+        private val compositingStrategy = l.compositingStrategy
 
         fun matches(l: PolyGraphicsLayer): Boolean =
             same(translationX, l.translationX) && same(translationY, l.translationY) && same(left, l.left) && same(top, l.top) && matchesMoved(l)
@@ -136,7 +141,8 @@ public class PolyGraphicsLayer : PlatformGraphicsLayer {
                 same(rotationZ, l.rotationZ) && same(rotationX, l.rotationX) && same(rotationY, l.rotationY) &&
                 same(cameraDistance, l.cameraDistance) && size == l.size && outline == l.outline && clip == l.clip &&
                 same(shadowElevation, l.shadowElevation) && spotShadowColor == l.spotShadowColor && pivotOffset == l.pivotOffset &&
-                sameEffect(renderEffect, l.renderEffect) && colorFilter == l.colorFilter
+                sameEffect(renderEffect, l.renderEffect) && colorFilter == l.colorFilter && blendMode == l.blendMode &&
+                compositingStrategy == l.compositingStrategy
 
         private fun same(a: Float, b: Float) = a.toBits() == b.toBits()
     }
@@ -244,10 +250,29 @@ public class PolyGraphicsLayer : PlatformGraphicsLayer {
     }
 
     private fun drawCached(c: PolyCanvas, cr: CapturingRenderer) {
-        if (alpha <= 0f) return
-        if (alpha >= 1f || effectLayer(c.renderer) != null) return drawCachedInLayer(c, cr)
-        c.renderer.saveLayerAlpha(alpha)
+        if (invisible()) return
+        val mode = compositeMode()
+        if (compositeAlpha() >= 1f && !isolated(mode) || effectLayer(c.renderer) != null) return drawCachedInLayer(c, cr)
+        saveComposite(c.renderer, mode)
         try { drawCachedInLayer(c, cr) } finally { c.renderer.restore() }
+    }
+
+    private fun compositeMode(): Int = layerBlendOf(blendMode)
+
+    private fun compositeAlpha(): Float = layerAlphaOf(blendMode, alpha)
+
+    private fun invisible(): Boolean = compositeAlpha() <= 0f && zeroSourceKeepsDst(compositeMode())
+
+    private fun isolated(mode: Int): Boolean = mode != PolyRenderer.BLEND_SRC_OVER || compositingStrategy == CompositingStrategy.Offscreen
+
+    private fun saveComposite(r: PolyRenderer, mode: Int) {
+        val a = compositeAlpha()
+        when {
+            isolated(mode) -> r.saveLayerBlend(a, mode)
+            a >= 1f -> r.save()
+            compositingStrategy == CompositingStrategy.ModulateAlpha -> r.saveAlpha(a)
+            else -> r.saveLayerAlpha(a)
+        }
     }
 
     private fun drawCachedInLayer(c: PolyCanvas, cr: CapturingRenderer) {
@@ -378,10 +403,11 @@ public class PolyGraphicsLayer : PlatformGraphicsLayer {
     }
 
     private fun drawLive(c: PolyCanvas, layered: Boolean = false) {
-        if (alpha <= 0f) return
+        if (invisible()) return
         val r = c.renderer
         val effect = effectLayer(r)
-        if (alpha < 1f && !layered && effect == null) r.saveLayerAlpha(alpha) else r.save()
+        val mode = compositeMode()
+        if (layered || effect != null) r.save() else saveComposite(r, mode)
         r.translate(left + translationX, top + translationY)
         if (scaleX != 1f || scaleY != 1f || rotationZ != 0f || rotationX != 0f || rotationY != 0f) {
             val p = if (pivotOffset.isUnspecified) Offset(size.width / 2f, size.height / 2f) else pivotOffset
@@ -396,8 +422,9 @@ public class PolyGraphicsLayer : PlatformGraphicsLayer {
             val b = o.bounds
             r.shadow(b.left, b.top + shadowElevation / 2f, b.width, b.height, radiusOf(o), PolyShadow(PolyColor(spotShadowColor.copy(alpha = spotShadowColor.alpha * 0.25f).toArgb()), shadowElevation, 0f, 0f, 0f))
         }
-        if (effect != null) r.saveLayerEffect(0f, 0f, size.width.toFloat(), size.height.toFloat(), o?.let(::radiusOf) ?: 0f, effect, alpha)
+        if (effect != null) r.saveLayerEffect(0f, 0f, size.width.toFloat(), size.height.toFloat(), if (clip) o?.let(::radiusOf) ?: 0f else 0f, effect, compositeAlpha(), mode)
         applyClip(r)
+        if (!clip && isolated(mode)) r.clipRect(0f, 0f, size.width.toFloat(), size.height.toFloat())
         val cap = capturing.lastOrNull()
         val cr = r as? CapturingRenderer
         val prevBlur = imageBlur
@@ -466,7 +493,7 @@ public class PolyGraphicsLayer : PlatformGraphicsLayer {
                 is Effect -> item.toPoly(d)?.let { list += it }
             }
         }
-        if (filter != null) filterEffect(filter)?.let { list += it }
+        if (filter != null) colorFilterEffect(filter)?.let { list += it }
         chainEffect = effect
         chainFilter = filter
         chainDensity = density
@@ -490,28 +517,43 @@ public class PolyGraphicsLayer : PlatformGraphicsLayer {
     private var chain = PolyEffectChain.Empty
 
     private companion object {
-        val capturing = ArrayList<Capture?>()
-        var drawing: PolyGraphicsLayer? = null
+        val captures: ThreadLocal<ArrayList<Capture?>> = ThreadLocal.withInitial { ArrayList() }
+        val drawings: ThreadLocal<PolyGraphicsLayer?> = ThreadLocal()
+
+        val capturing: ArrayList<Capture?> get() = captures.get()
+
+        var drawing: PolyGraphicsLayer?
+            get() = drawings.get()
+            set(value) = drawings.set(value)
 
         fun sameEffect(a: RenderEffect?, b: RenderEffect?): Boolean =
             a == b || a != null && b != null && a.javaClass == b.javaClass && a.platformRenderEffect.let { it is ChainEffect && it == b.platformRenderEffect }
+    }
+}
 
-        fun filterEffect(filter: ColorFilter): PolyEffect? = when (val p = PolyPaint.filterPlatform(filter)) {
-            is MatrixFilter -> PolyEffect.ColorMatrix(p.matrix.values.copyOf())
-            is TintFilter -> {
-                val c = p.color
-                when (p.blendMode) {
-                    BlendMode.SrcOver -> PolyEffect.Tint(c.toArgb())
-                    BlendMode.Modulate -> PolyEffect.ColorMatrix(
-                        floatArrayOf(c.red, 0f, 0f, 0f, 0f, 0f, c.green, 0f, 0f, 0f, 0f, 0f, c.blue, 0f, 0f, 0f, 0f, 0f, c.alpha, 0f),
-                    )
-                    BlendMode.SrcIn, BlendMode.SrcAtop -> PolyEffect.ColorMatrix(
-                        floatArrayOf(0f, 0f, 0f, 0f, c.red * 255f, 0f, 0f, 0f, 0f, c.green * 255f, 0f, 0f, 0f, 0f, c.blue * 255f, 0f, 0f, 0f, c.alpha, 0f),
-                    )
-                    else -> null
-                }
+internal fun colorFilterEffect(filter: ColorFilter): PolyEffect? = when (val p = PolyPaint.filterPlatform(filter)) {
+    is MatrixFilter -> PolyEffect.ColorMatrix(p.matrix.values.copyOf())
+    is TintFilter -> {
+        val c = p.color
+        when (p.blendMode) {
+            BlendMode.SrcOver -> PolyEffect.Tint(c.toArgb())
+            BlendMode.Modulate -> PolyEffect.ColorMatrix(
+                floatArrayOf(c.red, 0f, 0f, 0f, 0f, 0f, c.green, 0f, 0f, 0f, 0f, 0f, c.blue, 0f, 0f, 0f, 0f, 0f, c.alpha, 0f),
+            )
+            BlendMode.SrcIn -> PolyEffect.ColorMatrix(
+                floatArrayOf(0f, 0f, 0f, 0f, c.red * 255f, 0f, 0f, 0f, 0f, c.green * 255f, 0f, 0f, 0f, 0f, c.blue * 255f, 0f, 0f, 0f, c.alpha, 0f),
+            )
+            BlendMode.SrcAtop -> {
+                val k = 1f - c.alpha
+                PolyEffect.ColorMatrix(
+                    floatArrayOf(
+                        k, 0f, 0f, 0f, c.red * c.alpha * 255f, 0f, k, 0f, 0f, c.green * c.alpha * 255f,
+                        0f, 0f, k, 0f, c.blue * c.alpha * 255f, 0f, 0f, 0f, 1f, 0f,
+                    ),
+                )
             }
             else -> null
         }
     }
+    else -> null
 }

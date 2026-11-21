@@ -10,6 +10,16 @@ import com.mojang.renderpearl.api.pipeline.RenderPipeline
 /*import com.mojang.blaze3d.pipeline.BlendFunction
 import com.mojang.blaze3d.pipeline.RenderPipeline
 *///?}
+//? if >= 26.3 {
+import com.mojang.renderpearl.api.pipeline.BlendFactor as BlendSrc
+import com.mojang.renderpearl.api.pipeline.BlendFactor as BlendDst
+//?} elif 26.2 {
+/*import com.mojang.blaze3d.platform.BlendFactor as BlendSrc
+import com.mojang.blaze3d.platform.BlendFactor as BlendDst
+*///?} else {
+/*import com.mojang.blaze3d.platform.SourceFactor as BlendSrc
+import com.mojang.blaze3d.platform.DestFactor as BlendDst
+*///?}
 //? if 26.2 {
 /*import com.mojang.blaze3d.PrimitiveTopology
 *///?} elif < 26.2
@@ -24,6 +34,7 @@ import com.mojang.renderpearl.api.textures.FilterMode
 import com.mojang.blaze3d.vertex.VertexConsumer
 import com.mojang.renderpearl.api.buffers.GpuBuffer
 import com.mojang.renderpearl.api.commands.RenderPass
+import java.nio.ByteBuffer
 import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.WeakHashMap
@@ -40,6 +51,7 @@ import net.minecraft.client.renderer.RenderPipelines
 import net.minecraft.client.renderer.texture.DynamicTexture
 import net.minecraft.client.gui.render.GuiRenderer
 import net.minecraft.network.chat.TextColor
+import net.minecraft.resources.Identifier
 import org.polyfrost.compose.minecraft.compat.GnetumCompat
 import org.polyfrost.compose.minecraft.compat.GnetumOffscreenState
 import org.polyfrost.compose.minecraft.render.ColorMath
@@ -65,6 +77,7 @@ import net.minecraft.network.chat.Style
 import net.minecraft.util.StringDecomposer
 import org.joml.Matrix4f
 import org.lwjgl.system.MemoryUtil
+import org.polyfrost.compose.render.BitmapTextureCache
 import org.polyfrost.compose.render.PolyGlyphPage
 import org.polyfrost.compose.render.PolyTessellator
 import org.polyfrost.compose.render.CapturingRenderer
@@ -275,11 +288,12 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
     }
 
     private fun addLayer(list: List<(GuiGraphicsExtractor) -> Unit>, alpha: Float, effect: LayerEffect?) {
-        val op = LayerOp.of(list, alpha, guiScale, screenW, screenH, effect)
+        val op = LayerOp.of(list, alpha, guiScale, screenW, screenH, effect, blendMode)
         if (op != null) ops.add(op)
     }
 
     override fun fade(mark: Any, alpha: Float): Boolean {
+        if (alpha >= 1f) return true
         val from = mark as Int
         val faded = ArrayList<(GuiGraphicsExtractor) -> Unit>(ops.size - from)
         for (i in from until ops.size) faded += when (val op = ops[i]) {
@@ -321,9 +335,17 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
             is PolyGlyphPage.Page -> GlyphAtlas.page(texture).setup(nearest)
             else -> GlyphAtlas.page(PolyGlyphPage.pages[0]).setup()
         }
-        val pipeline = if (premultiplied) RenderPipelines.GUI_TEXTURED_PREMULTIPLIED_ALPHA else RenderPipelines.GUI_TEXTURED
+        val pipeline = when {
+            blendMode != PolyRenderer.BLEND_SRC_OVER -> BlendPipelines.of(blendMode, premultiplied)
+            premultiplied -> RenderPipelines.GUI_TEXTURED_PREMULTIPLIED_ALPHA
+            else -> RenderPipelines.GUI_TEXTURED
+        }
         ops.add(MeshOp(Mesh(pipeline, setup, elementPose, verts, colors, box, keepVertices)))
     }
+
+    override fun blendSupported(mode: Int): Boolean = BlendPipelines.supports(mode)
+
+    override fun layerBlendSupported(mode: Int): Boolean = BlendPipelines.supports(mode)
 
     override fun mcText(text: String, x: Float, y: Float, color: Int, shadow: Boolean, scale: Float) {
         mcText(text, x, y, color, shadow, scale, false)
@@ -654,7 +676,7 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
         private var held: List<LayerOp> = emptyList()
         private var drawn: List<(GuiGraphicsExtractor) -> Unit>? = null
         private var drawnKey = 0
-        private var drawnBitmaps: Set<PolyBitmap> = emptySet()
+        private var drawnPin = BitmapTextures.unpinned
         private var fadedOp: LiveOp? = null
         private var fadedAlpha = Float.NaN
 
@@ -668,14 +690,14 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
         override fun changed(): Boolean {
             val k = key ?: return true
             val d = drawn ?: return true
-            return k() != drawnKey || anyIndexed(d) { LayerOp.stale(it) }
+            return k() != drawnKey || !drawnPin.intact() || anyIndexed(d) { LayerOp.stale(it) }
         }
 
         override fun invoke(g: GuiGraphicsExtractor) {
             val k = key?.invoke()
             val cached = drawn
-            if (cached != null && k == drawnKey && !anyIndexed(cached) { LayerOp.closed(it) }) {
-                BitmapTextures.touch(drawnBitmaps)
+            if (cached != null && k == drawnKey && drawnPin.intact() && !anyIndexed(cached) { LayerOp.closed(it) }) {
+                drawnPin.touch()
                 for (i in cached.indices) cached[i](g)
                 return
             }
@@ -694,7 +716,7 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
             if (k != null) {
                 drawn = out
                 drawnKey = k
-                drawnBitmaps = if (r.bitmaps.isEmpty()) emptySet() else HashSet(r.bitmaps)
+                drawnPin = BitmapTextures.pin(r.bitmaps, false)
             }
             r.reset()
             GlyphAtlas.uploadDirty()
@@ -855,7 +877,7 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
             val out = if (backdrop != null) {
                 Mesh(pipeline, textureSetup, pose, verts, colors, bounds, keep, scissor, lightmap, backdrop.faded(alpha))
             } else {
-                val premul = pipeline === RenderPipelines.GUI_TEXTURED_PREMULTIPLIED_ALPHA
+                val premul = pipeline === RenderPipelines.GUI_TEXTURED_PREMULTIPLIED_ALPHA || BlendPipelines.premultiplied(pipeline)
                 Mesh(pipeline, textureSetup, pose, verts, IntArray(colors.size) { ColorMath.fadeColor(colors[it], alpha, premul) }, bounds, keep, scissor, lightmap)
             }
             fadedMesh = out
@@ -972,6 +994,46 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
             emit()
             return out
         }
+    }
+}
+
+internal object BlendPipelines {
+    private val snippet = RenderPipelinesAccessor.`polycompose$getGuiTexturedSnippet`()
+    private val built = arrayOfNulls<RenderPipeline>((PolyRenderer.BLEND_PLUS + 1) * 2)
+
+    fun supports(mode: Int): Boolean = mode in PolyRenderer.BLEND_SRC_OVER..PolyRenderer.BLEND_PLUS
+
+    fun of(mode: Int, premultiplied: Boolean): RenderPipeline {
+        val i = mode * 2 + if (premultiplied) 1 else 0
+        built[i]?.let { return it }
+        val src = if (premultiplied) BlendSrc.ONE else BlendSrc.SRC_ALPHA
+        val function = when (mode) {
+            PolyRenderer.BLEND_SRC -> BlendFunction(src, BlendDst.ZERO, BlendSrc.ONE, BlendDst.ZERO)
+            PolyRenderer.BLEND_DST_OUT -> BlendFunction(BlendSrc.ZERO, BlendDst.ONE_MINUS_SRC_ALPHA, BlendSrc.ZERO, BlendDst.ONE_MINUS_SRC_ALPHA)
+            PolyRenderer.BLEND_DST_IN -> BlendFunction(BlendSrc.ZERO, BlendDst.SRC_ALPHA, BlendSrc.ZERO, BlendDst.SRC_ALPHA)
+            else -> BlendFunction(src, BlendDst.ONE, BlendSrc.ONE, BlendDst.ONE)
+        }
+        val pipeline = RenderPipeline.builder(snippet).withLocation("pipeline/polycompose_gui_blend_$i")
+            //? if >= 26.3 {
+            .withFragmentShader(Identifier.fromNamespaceAndPath("polycompose", "core/poly_blend"))
+            //?} else
+            //.withFragmentShader(Identifier.fromNamespaceAndPath("polycompose", "core/poly_blend_legacy"))
+            //? if >= 26.1 {
+            .withColorTargetState(ColorTargetState(function)).build()
+            //?} else
+            //.withBlend(function).build()
+        built[i] = pipeline
+        return pipeline
+    }
+
+    val pipelines: List<RenderPipeline>
+        get() = (PolyRenderer.BLEND_SRC..PolyRenderer.BLEND_PLUS).flatMap { listOf(of(it, false), of(it, true)) }
+
+    fun owns(pipeline: RenderPipeline): Boolean = built.any { it === pipeline }
+
+    fun premultiplied(pipeline: RenderPipeline): Boolean {
+        for (i in 1 until built.size step 2) if (built[i] === pipeline) return true
+        return false
     }
 }
 
@@ -1342,13 +1404,14 @@ private fun renderGui(renderer: GuiRenderer, rt: RenderTarget, itemRenderSizePx:
 private fun compositeMesh(
     view: GpuTextureView, rt: RenderTarget, pose: Matrix3x2f, x0: Float, y0: Float, x1: Float, y1: Float,
     w: Float, h: Float, color: Int, bounds: ScreenRectangle, scissor: ScreenRectangle?,
+    pipeline: RenderPipeline = RenderPipelines.GUI_TEXTURED_PREMULTIPLIED_ALPHA,
 ): BlazeRenderer.Mesh {
     val u1 = w / rt.width
     val v0 = targetV(1f)
     val v1 = targetV(1f - h / rt.height)
     val verts = floatArrayOf(x0, y0, 0f, v0, x0, y1, 0f, v1, x1, y1, u1, v1, x1, y0, u1, v0)
     val setup = TextureSetup.singleTexture(view, sampler(true))
-    return BlazeRenderer.Mesh(RenderPipelines.GUI_TEXTURED_PREMULTIPLIED_ALPHA, setup, pose, verts, IntArray(4) { color }, bounds, false, scissor)
+    return BlazeRenderer.Mesh(pipeline, setup, pose, verts, IntArray(4) { color }, bounds, false, scissor)
 }
 
 internal object OffscreenGuiRenderers {
@@ -1467,6 +1530,7 @@ internal object KeptMeshes {
         vanilla === RenderPipelines.GUI_TEXT -> text
         //~ if >= 26.2 'GUI_TEXT_INTENSITY' -> 'GUI_TEXT_GRAYSCALE'
         vanilla === RenderPipelines.GUI_TEXT_GRAYSCALE -> textGrayscale
+        BlendPipelines.owns(vanilla) -> vanilla
         else -> straight
     }
 
@@ -1745,13 +1809,12 @@ internal class Recording(private val coalesce: Boolean = true, private val coale
     private var ops: List<(GuiGraphicsExtractor) -> Unit> = emptyList()
     private var raw: List<(GuiGraphicsExtractor) -> Unit> = emptyList()
     private var stable = 0
-    private var bitmaps: Set<PolyBitmap> = emptySet()
+    private var pin = BitmapTextures.unpinned
     private var scale = 0f
     private var gameFrame = false
     private var lives: List<LiveDraw> = emptyList()
     private var textures: List<GpuTextureView> = emptyList()
     private var textTextures: List<GpuTextureView> = emptyList()
-    private var touched = -1L
     private var spare: BlazeRenderer? = null
 
     val usesGameFrame: Boolean get() = gameFrame || (lives.isNotEmpty() && anyIndexed(lives) { it.gameFrame })
@@ -1787,8 +1850,8 @@ internal class Recording(private val coalesce: Boolean = true, private val coale
         gameFrame = renderer.usesGameFrame
         lives = if (anyIndexed(raw) { it is LiveDraw }) raw.filterIsInstance<LiveDraw>() else emptyList()
         collectTextures(raw)
-        bitmaps = if (copy) HashSet(renderer.bitmaps) else renderer.bitmaps
-        touched = BitmapTextures.touch(bitmaps, -1L)
+        pin.release()
+        pin = BitmapTextures.pin(renderer.bitmaps, true)
     }
 
     private fun collectTextures(list: List<(GuiGraphicsExtractor) -> Unit>) {
@@ -1805,7 +1868,7 @@ internal class Recording(private val coalesce: Boolean = true, private val coale
     fun stale(): Boolean = anyIndexed(textures) { it.isClosed }
 
     fun idle() {
-        touched = BitmapTextures.touch(bitmaps, touched)
+        pin.touch()
         if (coalesce && ++stable == coalesceFrames) ops = BlazeRenderer.coalesce(raw)
         if (ops !== raw && (anyIndexed(textTextures) { it.isClosed } || stale())) ops = raw
     }
@@ -1819,6 +1882,7 @@ internal class Recording(private val coalesce: Boolean = true, private val coale
 internal class LayerOp private constructor(
     private val ops: List<(GuiGraphicsExtractor) -> Unit>, private val alpha: Float, private val guiScale: Float, val bounds: ScreenRectangle,
     private val effect: LayerEffect? = null,
+    private val mode: Int = PolyRenderer.BLEND_SRC_OVER,
 ) : (GuiGraphicsExtractor) -> Unit {
     private var target: OffscreenTarget? = null
     private var effectTarget: OffscreenTarget? = null
@@ -1830,11 +1894,11 @@ internal class LayerOp private constructor(
     private var fadedOp: LayerOp? = null
     private var fadedAlpha = Float.NaN
 
-    fun moved(dx: Int, dy: Int) = LayerOp(ops, alpha, guiScale, bounds.shifted(dx, dy), effect)
+    fun moved(dx: Int, dy: Int) = LayerOp(ops, alpha, guiScale, bounds.shifted(dx, dy), effect, mode)
 
     fun faded(a: Float): LayerOp {
         fadedOp?.let { if (fadedAlpha == a) return it }
-        return LayerOp(ops, alpha * a, guiScale, bounds, effect).also { fadedOp = it; fadedAlpha = a }
+        return LayerOp(ops, alpha * a, guiScale, bounds, effect, mode).also { fadedOp = it; fadedAlpha = a }
     }
 
     private fun stale(): Boolean = dynamic && anyIndexed(ops) { stale(it) }
@@ -1900,7 +1964,8 @@ internal class LayerOp private constructor(
         val a = ColorMath.alphaByte(alpha)
         val l = bounds.left() + ox; val t = bounds.top() + oy; val r = bounds.right() + ox; val b = bounds.bottom() + oy
         val box = if (ox == 0f && oy == 0f) bounds else bounds.shifted(-ox.roundToInt(), -oy.roundToInt())
-        return compositeMesh(view, shown, Matrix3x2f(), l, t, r, b, w.toFloat(), h.toFloat(), a * 0x01010101, box, null)
+        val pipeline = if (mode == PolyRenderer.BLEND_SRC_OVER) RenderPipelines.GUI_TEXTURED_PREMULTIPLIED_ALPHA else BlendPipelines.of(mode, true)
+        return compositeMesh(view, shown, Matrix3x2f(), l, t, r, b, w.toFloat(), h.toFloat(), a * 0x01010101, box, null, pipeline)
             .also { composite = it }
     }
 
@@ -1975,9 +2040,12 @@ internal class LayerOp private constructor(
             else -> true
         }
 
-        fun of(ops: List<(GuiGraphicsExtractor) -> Unit>, alpha: Float, guiScale: Float, screenW: Int, screenH: Int, effect: LayerEffect? = null): LayerOp? {
+        fun of(
+            ops: List<(GuiGraphicsExtractor) -> Unit>, alpha: Float, guiScale: Float, screenW: Int, screenH: Int, effect: LayerEffect? = null,
+            mode: Int = PolyRenderer.BLEND_SRC_OVER,
+        ): LayerOp? {
             val screen = ScreenRectangle(0, 0, screenW, screenH)
-            fun full() = LayerOp(ops, alpha, guiScale, screen, effect)
+            fun full() = LayerOp(ops, alpha, guiScale, screen, effect, mode)
             var bounds: ScreenRectangle? = null
             fun add(b: ScreenRectangle) { bounds = bounds?.let { rectUnion(it, b) } ?: b }
             for (op in ops) when (op) {
@@ -2000,7 +2068,7 @@ internal class LayerOp private constructor(
             val b = bounds?.intersection(screen) ?: return null
             if (b.width() <= 0 || b.height() <= 0) return null
             val dx = b.left(); val dy = b.top()
-            return LayerOp(ops.map { shiftOp(it, dx, dy) }, alpha, guiScale, b, effect?.local(dx * guiScale, dy * guiScale))
+            return LayerOp(ops.map { shiftOp(it, dx, dy) }, alpha, guiScale, b, effect?.local(dx * guiScale, dy * guiScale), mode)
         }
 
         fun retire(old: List<(GuiGraphicsExtractor) -> Unit>, next: List<(GuiGraphicsExtractor) -> Unit>) {
@@ -2190,8 +2258,7 @@ internal object GlyphAtlas {
             val at = MemoryUtil.memAddress(staging)
             MemoryUtil.memIntBuffer(at, h * SIZE).put(page.pixels, rows.first * SIZE, h * SIZE)
             RenderCounters.upload(h * SIZE * 4L)
-            //~ if < 26.2 ', 0, 0, 0,' -> ', NativeImage.Format.RGBA, 0, 0, 0,'
-            RenderSystem.getDevice().createCommandEncoder().writeToTexture(e.ref.texture.texture, MemoryUtil.memByteBuffer(at, h * SIZE * 4), 0, 0, 0, rows.first, SIZE, h)
+            writeTexture(e.ref.texture, MemoryUtil.memByteBuffer(at, h * SIZE * 4), rows.first, SIZE, h)
         } finally {
             MemoryUtil.memFree(staging)
         }
@@ -2217,16 +2284,31 @@ internal object GlyphAtlas {
     private const val RELEASE_FRAMES = 600L
 }
 
-internal object BitmapTextures {
-    private class Entry(val ref: AbstractTextureRef, var lastUsed: Long)
+private fun writeTexture(texture: DynamicTexture, data: ByteBuffer, y: Int, w: Int, h: Int) {
+    //~ if < 26.2 ', 0, 0, 0,' -> ', NativeImage.Format.RGBA, 0, 0, 0,'
+    RenderSystem.getDevice().createCommandEncoder().writeToTexture(texture.texture, data, 0, 0, 0, y, w, h)
+}
 
-    private val cache = IdentityHashMap<PolyBitmap, Entry>()
-    private var frame = 0L
-    private var scanAt = 0L
+internal object BitmapTextures {
+    private val cache = BitmapTextureCache<AbstractTextureRef>(RELEASE_FRAMES)
 
     fun get(bitmap: PolyBitmap): AbstractTextureRef {
-        cache[bitmap]?.let { it.lastUsed = frame; return it.ref }
-        return FrameProfiler.active.measure(ProfilePhase.Upload) { upload(bitmap) }
+        cache.get(bitmap)?.let { return it.texture }
+        return FrameProfiler.active.measure(ProfilePhase.Upload) { adopt(bitmap) ?: upload(bitmap) }
+    }
+
+    private fun adopt(bitmap: PolyBitmap): AbstractTextureRef? {
+        val ref = cache.adopt(bitmap)?.texture ?: return null
+        val px = bitmap.pixels
+        val staging = MemoryUtil.memAlloc(px.size)
+        try {
+            staging.put(px).flip()
+            RenderCounters.upload(px.size.toLong())
+            writeTexture(ref.texture, staging, 0, bitmap.width, bitmap.height)
+        } finally {
+            MemoryUtil.memFree(staging)
+        }
+        return ref
     }
 
     private fun upload(bitmap: PolyBitmap): AbstractTextureRef {
@@ -2235,8 +2317,7 @@ internal object BitmapTextures {
         val img = NativeImage(bitmap.width, bitmap.height, false)
         MemoryUtil.memByteBuffer(img.pointer, px.size).put(px)
         val ref = AbstractTextureRef(DynamicTexture({ "polycompose_hud_image" }, img))
-        cache[bitmap] = Entry(ref, frame)
-        scanAt = min(scanAt, frame + RELEASE_FRAMES + 1)
+        cache.add(bitmap, ref)
         return ref
     }
 
@@ -2255,33 +2336,15 @@ internal object BitmapTextures {
         }.getOrNull()
     }
 
-    fun touch(bitmaps: Set<PolyBitmap>) {
-        for (b in bitmaps) cache[b]?.lastUsed = frame
-    }
+    val unpinned: BitmapTextureCache<AbstractTextureRef>.Pin = cache.pin(emptyList(), false)
 
-    fun touch(bitmaps: Set<PolyBitmap>, last: Long): Long {
-        if (bitmaps.isEmpty() || (last >= 0 && frame - last < TOUCH_FRAMES)) return last
-        touch(bitmaps)
-        return frame
-    }
+    fun pin(bitmaps: Collection<PolyBitmap>, hold: Boolean): BitmapTextureCache<AbstractTextureRef>.Pin = cache.pin(bitmaps, hold)
 
     @JvmStatic
     fun endFrame() {
-        frame++
-        if (frame < scanAt) return
-        var next = Long.MAX_VALUE
-        val it = cache.values.iterator()
-        while (it.hasNext()) {
-            val e = it.next()
-            if (frame - e.lastUsed > RELEASE_FRAMES) {
-                e.ref.texture.close()
-                it.remove()
-            } else next = min(next, e.lastUsed + RELEASE_FRAMES + 1)
-        }
-        scanAt = next
+        cache.endFrame { it.texture.close() }
     }
 
     private const val RELEASE_FRAMES = 600L
-    private const val TOUCH_FRAMES = RELEASE_FRAMES / 4
 }
 //?}

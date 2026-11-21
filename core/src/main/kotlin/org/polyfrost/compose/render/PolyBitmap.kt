@@ -7,11 +7,16 @@ import java.io.ByteArrayInputStream
 import javax.imageio.ImageIO
 import javax.imageio.spi.IIORegistry
 import javax.imageio.stream.MemoryCacheImageInputStream
+import org.jetbrains.annotations.ApiStatus
 
 public class PolyBitmap(public val width: Int, public val height: Int, public val pixels: ByteArray) {
     init {
         require(width > 0 && height > 0 && pixels.size.toLong() == width.toLong() * height * 4) { "bad bitmap ${width}x$height, ${pixels.size} bytes" }
     }
+
+    @get:ApiStatus.Internal
+    public var lineage: Any? = null
+        internal set
 
     public fun interface Decoder {
         public fun decode(bytes: ByteArray): PolyBitmap?

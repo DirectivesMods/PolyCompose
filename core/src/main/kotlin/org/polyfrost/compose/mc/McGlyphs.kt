@@ -72,6 +72,8 @@ public object McGlyphs {
         return w * scale
     }
 
+    internal fun available(): Boolean = source != null || PolyGlyphPage.rasterizer?.face("minecraft") != null
+
     private fun bundledAdvance(cp: Int, bold: Boolean): Float {
         val r = PolyGlyphPage.rasterizer ?: return 0f
         val main = r.face(if (bold) "minecraft-bold" else "minecraft")

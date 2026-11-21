@@ -60,7 +60,7 @@ public object PolyGraphics : PlatformGraphics {
         return PolyCanvas(target.renderer ?: BitmapRenderer(target).also { target.renderer = it })
     }
     override fun createPaint(): Paint = PolyPaint()
-    override fun isBlendModeSupported(blendMode: BlendMode): Boolean = blendMode == BlendMode.SrcOver
+    override fun isBlendModeSupported(blendMode: BlendMode): Boolean = isPortableBlend(blendMode)
     override fun isTileModeSupported(tileMode: TileMode): Boolean = true
     override fun createPath(): Path = PolyComposePath()
     override fun createPathIterator(path: Path, conicEvaluation: PathIterator.ConicEvaluation, tolerance: Float): PathIterator =
@@ -68,19 +68,62 @@ public object PolyGraphics : PlatformGraphics {
     override fun createPathMeasure(): PathMeasure = PolyPathMeasure()
 
     override fun createImageBitmap(width: Int, height: Int, config: ImageBitmapConfig, hasAlpha: Boolean, colorSpace: ColorSpace): ImageBitmap =
-        PolyImageBitmap(PolyBitmap(width, height, ByteArray(width * height * 4)), config)
+        PolyImageBitmap(PolyBitmap(width, height, ByteArray(width * height * 4).also { if (!hasAlpha) for (i in 3 until it.size step 4) it[i] = -1 }), config, hasAlpha).owned()
 
     override fun decodeImageBitmap(bytes: ByteArray): ImageBitmap =
         PolyImageBitmap(PolyBitmap.decode(bytes) ?: error("cannot decode image (${bytes.size} bytes)"))
 
-    override fun createLinearGradientShader(from: Offset, to: Offset, colors: List<Color>, colorStops: List<Float>?, tileMode: TileMode): Shader =
-        Shader(GradientShader(PolyGradient.Points(colors.map(::polyColor), colorStops, from.x, from.y, to.x, to.y), null, 0f, tileMode))
+    override fun createLinearGradientShader(from: Offset, to: Offset, colors: List<Color>, colorStops: List<Float>?, tileMode: TileMode): Shader {
+        validateColorStops(colors, colorStops)
+        if ((to - from).getDistance() <= DEGENERATE_GRADIENT) return degenerateGradient(colors, colorStops, tileMode, from)
+        return Shader(GradientShader(PolyGradient.Points(colors.map(::polyColor), colorStops, from.x, from.y, to.x, to.y), null, 0f, tileMode))
+    }
 
-    override fun createRadialGradientShader(center: Offset, radius: Float, colors: List<Color>, colorStops: List<Float>?, tileMode: TileMode): Shader =
-        Shader(GradientShader(PolyGradient.Radial(colors.map(::polyColor), colorStops), center, radius, tileMode))
+    override fun createRadialGradientShader(center: Offset, radius: Float, colors: List<Color>, colorStops: List<Float>?, tileMode: TileMode): Shader {
+        validateColorStops(colors, colorStops)
+        if (radius <= DEGENERATE_GRADIENT) return degenerateGradient(colors, colorStops, tileMode, center)
+        return Shader(GradientShader(PolyGradient.Radial(colors.map(::polyColor), colorStops), center, radius, tileMode))
+    }
 
-    override fun createSweepGradientShader(center: Offset, colors: List<Color>, colorStops: List<Float>?): Shader =
-        Shader(GradientShader(PolyGradient.Sweep(colors.map(::polyColor), colorStops), center, 0f))
+    override fun createSweepGradientShader(center: Offset, colors: List<Color>, colorStops: List<Float>?): Shader {
+        validateColorStops(colors, colorStops)
+        return Shader(GradientShader(PolyGradient.Sweep(colors.map(::polyColor), colorStops), center, 0f))
+    }
+
+    private fun validateColorStops(colors: List<Color>, colorStops: List<Float>?) {
+        if (colorStops == null) require(colors.size >= 2) { "colors must have length of at least 2 if colorStops is omitted." }
+        else require(colors.size == colorStops.size) { "colors and colorStops arguments must have equal length." }
+    }
+
+    private fun degenerateGradient(colors: List<Color>, colorStops: List<Float>?, tileMode: TileMode, at: Offset): Shader {
+        if (colors.isEmpty() || tileMode == TileMode.Decal) return Shader(ClearShader)
+        val color = if (tileMode == TileMode.Clamp || colors.size == 1) colors.last().toArgb() else averageColor(colors, colorStops)
+        return Shader(GradientShader(PolyGradient.Points(listOf(PolyColor(color)), null, at.x, at.y, at.x + 1f, at.y), null, 0f))
+    }
+
+    private fun averageColor(colors: List<Color>, colorStops: List<Float>?): Int {
+        val n = colors.size
+        val sum = FloatArray(4)
+        fun add(c: Int, weight: Float) {
+            for (ch in 0..3) sum[ch] += (c ushr (24 - ch * 8) and 0xFF) * weight
+        }
+        for (i in 0 until n - 1) {
+            val c0 = colors[i].toArgb()
+            val c1 = colors[i + 1].toArgb()
+            val w = if (colorStops == null) 1f / (n - 1) else {
+                val p0 = colorStops[i].coerceIn(0f, 1f)
+                val p1 = colorStops[i + 1].coerceIn(p0, 1f)
+                if (i == 0 && p0 > 0f) add(c0, p0)
+                if (i == n - 2 && p1 < 1f) add(c1, 1f - p1)
+                p1 - p0
+            }
+            add(c0, w / 2f)
+            add(c1, w / 2f)
+        }
+        var out = 0
+        for (ch in 0..3) out = out or ((sum[ch] + 0.5f).toInt().coerceIn(0, 255) shl (24 - ch * 8))
+        return out
+    }
 
     override fun createImageShader(image: ImageBitmap, tileModeX: TileMode, tileModeY: TileMode): Shader = Shader(ImageShader(image, tileModeX, tileModeY))
     override fun createCompositeShader(destination: Shader, source: Shader, blendMode: BlendMode): Shader =
@@ -146,6 +189,8 @@ public object PolyGraphics : PlatformGraphics {
     }
 
     internal fun polyColor(c: Color) = PolyColor(c.toArgb())
+
+    private const val DEGENERATE_GRADIENT = 1f / (1 shl 15)
 }
 
 internal fun GradientShader.fade(alpha: Float, tint: Boolean = false): PolyFade? {
@@ -155,10 +200,57 @@ internal fun GradientShader.fade(alpha: Float, tint: Boolean = false): PolyFade?
     val a = if (vertical) g.y0 else g.x0
     val b = if (vertical) g.y1 else g.x1
     val n = g.colors.size
-    val stops = FloatArray(n) { a + (b - a) * (g.stops?.get(it) ?: if (n == 1) 0f else it / (n - 1f)) }
-    val alphas = FloatArray(n) { g.colors[it].alpha / 255f * alpha }
-    val colors = if (tint) IntArray(n) { g.colors[it].argb and 0xFFFFFF } else null
+    if (n == 0) return null
+    val pos = g.positions()
+    val stops: FloatArray
+    val alphas: FloatArray
+    var colors: IntArray? = null
+    if (tint && n > 1) {
+        val points = FloatArrayList()
+        colors = tintFade(g.colors.map { it.argb }, pos, points)
+        stops = FloatArray(colors.size) { a + (b - a) * points[it * 2] }
+        alphas = FloatArray(colors.size) { points[it * 2 + 1] * alpha }
+    } else {
+        stops = FloatArray(n) { a + (b - a) * pos[it] }
+        alphas = FloatArray(n) { g.colors[it].alpha / 255f * alpha }
+        if (tint) colors = IntArray(n) { g.colors[it].argb and 0xFFFFFF }
+    }
     return if (b < a) PolyFade(vertical, stops.reversedArray(), alphas.reversedArray(), colors?.reversedArray()) else PolyFade(vertical, stops, alphas, colors)
+}
+
+private const val TINT_STEPS = 8
+
+private fun tintFade(argb: List<Int>, pos: FloatArray, points: FloatArrayList): IntArray {
+    val n = argb.size
+    val rgb = IntArray(n) { i ->
+        val near = when {
+            argb[i] ushr 24 != 0 -> argb[i]
+            i > 0 && argb[i - 1] ushr 24 != 0 -> argb[i - 1]
+            i < n - 1 && argb[i + 1] ushr 24 != 0 -> argb[i + 1]
+            else -> argb[i]
+        }
+        near and 0xFFFFFF
+    }
+    var colors = IntArray(n * 2)
+    var count = 0
+    fun add(p: Float, a: Float, c: Int) {
+        if (count > 0 && points[count * 2 - 2] == p && points[count * 2 - 1] == a && colors[count - 1] == c) return
+        if (count == colors.size) colors = colors.copyOf(count * 2)
+        points.add(p, a)
+        colors[count++] = c
+    }
+    add(pos[0], (argb[0] ushr 24) / 255f, rgb[0])
+    for (i in 0 until n - 1) {
+        val a0 = (argb[i] ushr 24) / 255f
+        val a1 = (argb[i + 1] ushr 24) / 255f
+        val steps = if (a0 != a1 && rgb[i] != rgb[i + 1]) TINT_STEPS else 1
+        for (k in 1 until steps) {
+            val t = k.toFloat() / steps
+            add(pos[i] + (pos[i + 1] - pos[i]) * t, a0 + (a1 - a0) * t, PolyGradient.lerpArgb(argb[i], argb[i + 1], t) and 0xFFFFFF)
+        }
+        add(pos[i + 1], a1, rgb[i + 1])
+    }
+    return colors.copyOf(count)
 }
 
 internal class BlurFilter(val radius: Float) : PlatformBlurFilter()
@@ -176,13 +268,18 @@ internal class ChainEffect(val items: List<Any>) : PlatformRenderEffect {
     override fun hashCode(): Int = items.hashCode()
 }
 
-public class PolyImageBitmap internal constructor(private var current: PolyBitmap, override val config: ImageBitmapConfig) : ImageBitmap {
-    public constructor(bitmap: PolyBitmap) : this(bitmap, ImageBitmapConfig.Argb8888) {
+public class PolyImageBitmap internal constructor(
+    private var current: PolyBitmap, override val config: ImageBitmapConfig, override val hasAlpha: Boolean,
+) : ImageBitmap {
+    public constructor(bitmap: PolyBitmap) : this(bitmap, ImageBitmapConfig.Argb8888, true) {
         handedOut = true
     }
 
     internal var renderer: BitmapRenderer? = null
     private var handedOut = false
+    private val lineage = Any()
+
+    internal fun owned(): PolyImageBitmap = apply { current.lineage = lineage }
 
     /** The pixels drawn so far, including any drawing through a `Canvas` created for this image. */
     public val bitmap: PolyBitmap
@@ -192,25 +289,41 @@ public class PolyImageBitmap internal constructor(private var current: PolyBitma
             return current
         }
 
+    public fun <T> borrowBitmap(block: (PolyBitmap) -> T): T {
+        renderer?.sync()
+        return block(current)
+    }
+
     override val width: Int get() = current.width
     override val height: Int get() = current.height
     override val colorSpace: ColorSpace get() = ColorSpaces.Srgb
-    override val hasAlpha: Boolean get() = true
 
     // Renderers cache textures by PolyBitmap identity, so a bitmap that may have been uploaded must not change in place
     internal fun pixelsForDrawing(): ByteArray {
         if (handedOut) {
-            current = PolyBitmap(current.width, current.height, current.pixels.copyOf())
+            current = PolyBitmap(current.width, current.height, current.pixels.copyOf()).also { it.lineage = lineage }
             handedOut = false
         }
         return current.pixels
     }
 
     override fun readPixels(buffer: IntArray, startX: Int, startY: Int, width: Int, height: Int, bufferOffset: Int, stride: Int) {
+        require(startX >= 0 && startY >= 0 && width >= 0 && height >= 0 && startX + width <= current.width && startY + height <= current.height) {
+            "region $startX,$startY ${width}x$height is outside the ${current.width}x${current.height} image"
+        }
+        require(bufferOffset >= 0 && stride >= width) { "bufferOffset $bufferOffset and stride $stride cannot hold rows of $width pixels" }
+        require(width == 0 || height == 0 || bufferOffset.toLong() + (height - 1).toLong() * stride + width <= buffer.size) {
+            "a ${width}x$height region with stride $stride at offset $bufferOffset does not fit in a buffer of ${buffer.size}"
+        }
         renderer?.sync()
         val px = current.pixels
+        val alphaOnly = config == ImageBitmapConfig.Alpha8
         for (y in 0 until height) for (x in 0 until width) {
             val o = ((startY + y) * current.width + startX + x) * 4
+            if (alphaOnly) {
+                buffer[bufferOffset + y * stride + x] = (px[o + 3].toInt() and 0xFF) shl 24
+                continue
+            }
             buffer[bufferOffset + y * stride + x] = ((px[o + 3].toInt() and 0xFF) shl 24) or ((px[o].toInt() and 0xFF) shl 16) or
                 ((px[o + 1].toInt() and 0xFF) shl 8) or (px[o + 2].toInt() and 0xFF)
         }
@@ -384,10 +497,22 @@ public class PolyComposePath : Path {
     }
 
     // shapes are built clockwise; counter-clockwise ones (Compose's default) are reversed after their first point, like Skia
-    private fun wind(direction: Path.Direction) {
-        if (direction != Path.Direction.CounterClockwise || contours.isEmpty()) return
+    private fun wind(direction: Path.Direction, clockwiseStart: Int = 0, counterClockwiseStart: Int = 0) {
+        if (contours.isEmpty()) return
+        val ccw = direction == Path.Direction.CounterClockwise
         val c = contours.last()
         val n = c.size / 2
+        val start = if (ccw) counterClockwiseStart else clockwiseStart
+        if (start in 1 until n) {
+            val rotated = FloatArray(c.size)
+            for (i in 0 until n) {
+                val src = (i + start) % n * 2
+                rotated[i * 2] = c[src]; rotated[i * 2 + 1] = c[src + 1]
+            }
+            rotated.copyInto(c)
+            startX = c[0]; startY = c[1]; lastX = c[0]; lastY = c[1]
+        }
+        if (!ccw) return
         for (i in 0 until (n - 1) / 2) {
             val a = (1 + i) * 2
             val b = (n - 1 - i) * 2
@@ -416,12 +541,14 @@ public class PolyComposePath : Path {
             }
         }
         moveTo(r.left + r.topLeftCornerRadius.x, r.top)
+        val base = cur.size / 2 - 1
         corner(r.right - r.topRightCornerRadius.x, r.top + r.topRightCornerRadius.y, r.topRightCornerRadius.x, r.topRightCornerRadius.y, 270f)
         corner(r.right - r.bottomRightCornerRadius.x, r.bottom - r.bottomRightCornerRadius.y, r.bottomRightCornerRadius.x, r.bottomRightCornerRadius.y, 0f)
         corner(r.left + r.bottomLeftCornerRadius.x, r.bottom - r.bottomLeftCornerRadius.y, r.bottomLeftCornerRadius.x, r.bottomLeftCornerRadius.y, 90f)
+        val leftBottom = cur.size / 2 - 1 - base
         corner(r.left + r.topLeftCornerRadius.x, r.top + r.topLeftCornerRadius.y, r.topLeftCornerRadius.x, r.topLeftCornerRadius.y, 180f)
         close()
-        wind(direction)
+        wind(direction, leftBottom, leftBottom + 1)
         if (empty) this.roundRect = r
     }
 
@@ -468,6 +595,45 @@ public class PolyComposePath : Path {
         poly = null
         roundRect = roundRect?.let { it.copy(left = it.left + offset.x, top = it.top + offset.y, right = it.right + offset.x, bottom = it.bottom + offset.y) }
         plainRect = plainRect?.translate(offset)
+    }
+
+    override fun transform(matrix: Matrix) {
+        val m = matrix.values
+        val a = m[Matrix.ScaleX]; val b = m[Matrix.SkewY]; val c = m[Matrix.SkewX]; val d = m[Matrix.ScaleY]
+        val tx = m[Matrix.TranslateX]; val ty = m[Matrix.TranslateY]
+        val projective = m[3] != 0f || m[7] != 0f || m[15] != 1f
+        val out = FloatArray(2)
+        fun map(x: Float, y: Float) {
+            val w = if (projective) m[3] * x + m[7] * y + m[15] else 1f
+            out[0] = (a * x + c * y + tx) / w
+            out[1] = (b * x + d * y + ty) / w
+        }
+        for (contour in contours) {
+            for (k in contour.indices step 2) {
+                map(contour[k], contour[k + 1])
+                contour[k] = out[0]; contour[k + 1] = out[1]
+            }
+        }
+        for (k in 0 until cur.size step 2) {
+            map(cur[k], cur[k + 1])
+            cur[k] = out[0]; cur[k + 1] = out[1]
+        }
+        map(startX, startY); startX = out[0]; startY = out[1]
+        map(lastX, lastY); lastX = out[0]; lastY = out[1]
+        val rr = roundRect
+        val rect = plainRect
+        shapeChanged()
+        if (projective || b != 0f || c != 0f || a == 0f || d == 0f) return
+        if (rect != null) plainRect = Rect(min(a * rect.left + tx, a * rect.right + tx), min(d * rect.top + ty, d * rect.bottom + ty), max(a * rect.left + tx, a * rect.right + tx), max(d * rect.top + ty, d * rect.bottom + ty))
+        if (rr != null && a > 0f && d > 0f) {
+            roundRect = RoundRect(
+                a * rr.left + tx, d * rr.top + ty, a * rr.right + tx, d * rr.bottom + ty,
+                CornerRadius(rr.topLeftCornerRadius.x * a, rr.topLeftCornerRadius.y * d),
+                CornerRadius(rr.topRightCornerRadius.x * a, rr.topRightCornerRadius.y * d),
+                CornerRadius(rr.bottomRightCornerRadius.x * a, rr.bottomRightCornerRadius.y * d),
+                CornerRadius(rr.bottomLeftCornerRadius.x * a, rr.bottomLeftCornerRadius.y * d),
+            )
+        }
     }
 
     override fun getBounds(): Rect = bounds(allContours())
@@ -524,6 +690,7 @@ internal class FloatArrayList {
     }
 
     operator fun get(i: Int): Float = a[i]
+    operator fun set(i: Int, v: Float) { a[i] = v }
     fun dropPoint() { size -= 2 }
     fun offset(dx: Float, dy: Float) { for (k in 0 until size) a[k] += if (k % 2 == 0) dx else dy }
     fun toArray(): FloatArray = a.copyOf(size)

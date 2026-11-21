@@ -65,6 +65,14 @@ object OffscreenReadback {
             view.position(y * row)
             view.get(pixels, (if (topDown) y else height - 1 - y) * row, row)
         }
+        for (i in 0 until pixels.size step BYTES_PER_PIXEL) {
+            val alpha = pixels[i + 3].toInt() and 0xFF
+            if (alpha == 0 || alpha == 0xFF) continue
+            for (c in 0 until 3) {
+                val v = pixels[i + c].toInt() and 0xFF
+                pixels[i + c] = minOf(0xFF, (v * 0xFF + alpha / 2) / alpha).toByte()
+            }
+        }
         return PolyBitmap(width, height, pixels)
     }
 
