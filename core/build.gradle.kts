@@ -80,6 +80,7 @@ kotlin {
         progressiveMode = true
         freeCompilerArgs.add("-Xwarning-level=REDUNDANT_VISIBILITY_MODIFIER:disabled")
     }
+    explicitApi()
     abiValidation {
         filters.exclude {
             annotatedWith.add("org.jetbrains.annotations.ApiStatus.Internal")
