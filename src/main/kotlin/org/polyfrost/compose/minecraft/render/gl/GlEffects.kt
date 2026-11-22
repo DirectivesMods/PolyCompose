@@ -77,7 +77,10 @@ internal object GlEffects {
         val pending: Boolean
             get() {
                 if (settled) return false
-                if (stages.any { it is PolyEffect.Custom && !customs.containsKey(it.shader.key) }) return true
+                for (i in stages.indices) {
+                    val e = stages[i]
+                    if (e is PolyEffect.Custom && !customs.containsKey(e.shader.key)) return true
+                }
                 settled = true
                 return false
             }
@@ -219,6 +222,7 @@ internal object GlEffects {
     private val IDENTITY = floatArrayOf(1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f)
     private val ZERO = FloatArray(4)
     private val NO_PARAMS = FloatArray(PolyEffectShader.MAX_PARAMS)
+    private val paramScratch = FloatArray(PolyEffectShader.MAX_PARAMS)
 
     private var core = false
     private var failed = false
@@ -232,7 +236,7 @@ internal object GlEffects {
     private val customs = HashMap<String, Prog?>()
     private val customJobs = HashMap<String, GlShaderJob>()
     private var liquid = false
-    private val alphaTest: Boolean by lazy { GlProgram.hasAlphaTest() }
+    private val alphaTest: Boolean by lazy(LazyThreadSafetyMode.NONE) { GlProgram.hasAlphaTest() }
     private var vao = 0
     private var vbo = 0
     private val pool = ArrayList<Target>()
@@ -611,8 +615,13 @@ internal object GlEffects {
         val t = acquire(w, h)
         GL20.glUseProgram(p.id)
         GL20.glUniform4f(p.rect, r[0].toFloat(), r[1].toFloat(), r[2].toFloat(), r[3].toFloat())
-        val params = if (e.params.size >= PolyEffectShader.MAX_PARAMS) e.params.copyOf(PolyEffectShader.MAX_PARAMS)
-        else NO_PARAMS.copyOf().also { e.params.copyInto(it) }
+        val params = paramScratch
+        if (e.params.size >= PolyEffectShader.MAX_PARAMS) {
+            e.params.copyInto(params, 0, 0, PolyEffectShader.MAX_PARAMS)
+        } else {
+            NO_PARAMS.copyInto(params)
+            e.params.copyInto(params)
+        }
         GL20.glUniform4fv(p.params, params)
         pass(p, cur, t, w, h, r[0].toFloat(), r[1].toFloat(), sc.toFloat(), clamp, false)
         return local(t, w, h, r, sc)
@@ -655,9 +664,12 @@ internal object GlEffects {
         val aw = s.allocW.toFloat()
         val ah = s.allocH.toFloat()
         GL20.glUniform4f(p.source, s.ox, s.oy, 1f / (s.sx * aw), 1f / (s.sy * ah))
-        val c = clamp ?: floatArrayOf(0f, 0f, s.usedW.toFloat(), s.usedH.toFloat())
-        GL20.glUniform4f(p.clamp, (c[0] + 0.5f) / aw, (c[1] + 0.5f) / ah, (c[2] - 0.5f) / aw, (c[3] - 0.5f) / ah)
-        GL20.glUniform4f(p.bounds, c[0] / aw, c[1] / ah, c[2] / aw, c[3] / ah)
+        val c0 = if (clamp != null) clamp[0] else 0f
+        val c1 = if (clamp != null) clamp[1] else 0f
+        val c2 = if (clamp != null) clamp[2] else s.usedW.toFloat()
+        val c3 = if (clamp != null) clamp[3] else s.usedH.toFloat()
+        GL20.glUniform4f(p.clamp, (c0 + 0.5f) / aw, (c1 + 0.5f) / ah, (c2 - 0.5f) / aw, (c3 - 0.5f) / ah)
+        GL20.glUniform4f(p.bounds, c0 / aw, c1 / ah, c2 / aw, c3 / ah)
         GL20.glUniform1f(p.decal, if (decal) 1f else 0f)
     }
 

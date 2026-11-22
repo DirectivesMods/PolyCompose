@@ -7,6 +7,7 @@ import org.polyfrost.compose.minecraft.platform.HostEvents
 import org.polyfrost.compose.minecraft.render.gl.GlBlur
 import org.polyfrost.compose.minecraft.render.gl.GlEffects
 import org.polyfrost.compose.minecraft.render.gl.GlGlass
+import org.polyfrost.compose.minecraft.render.gl.GlGlint
 import org.polyfrost.compose.minecraft.render.gl.GlHost
 import org.polyfrost.compose.minecraft.render.gl.GlProgram
 import org.slf4j.LoggerFactory
@@ -22,6 +23,7 @@ import org.polyfrost.compose.minecraft.mixin.render.PostChainAccessor
 import org.polyfrost.compose.minecraft.mixin.render.PostPassAccessor
 import org.polyfrost.compose.minecraft.render.blaze.BlazeBackdrop
 import org.polyfrost.compose.minecraft.render.blaze.BlendPipelines
+import org.polyfrost.compose.minecraft.render.blaze.ItemGlint
 import org.polyfrost.compose.minecraft.render.blaze.KeptMeshes
 import org.polyfrost.compose.minecraft.render.blaze.UiBlur
 //?}
@@ -94,10 +96,12 @@ internal object GpuWarmup {
             steps += Step { GlBlur.warm() }
             steps += Step { GlGlass.warm() }
             steps += Step { keepingProgram { GlEffects.warmPasses() } }
+            steps += Step { GlGlint.warm() }
         }
         //? if >= 1.21.11 {
         steps += compile(KeptMeshes.pipelines)
         steps += compile(BlendPipelines.pipelines)
+        steps += compile(listOf(ItemGlint.pipeline))
         steps += compile(listOf(BlazeBackdrop.composite))
         steps += compile(listOf(BlazeBackdrop.blur))
         steps += Step {

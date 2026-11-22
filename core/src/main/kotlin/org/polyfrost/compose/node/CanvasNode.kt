@@ -7,6 +7,8 @@ public class CanvasNode : PolyNode() {
 
     public var live: Boolean = false
 
+    override val tracksChanges: Boolean get() = true
+
     override fun renderContent(ctx: RenderContext) {
         val draw = onDraw ?: return
         val pad = style.padding

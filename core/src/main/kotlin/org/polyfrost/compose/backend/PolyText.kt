@@ -11,10 +11,13 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Canvas
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmapConfig
+import androidx.compose.ui.graphics.LinearGradient
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.RadialGradient
 import androidx.compose.ui.graphics.ShaderBrush
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.SweepGradient
 import androidx.compose.ui.graphics.colorspace.ColorSpaces
 import androidx.compose.ui.graphics.drawscope.DrawStyle
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -75,6 +78,7 @@ import java.text.BreakIterator
 import java.util.BitSet
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.function.IntSupplier
 import kotlin.coroutines.CoroutineContext
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -251,11 +255,15 @@ internal class PolyIntrinsics(
 
     init {
         val base = style.toSpanStyle()
-        val spans = annotations.mapNotNull { r -> (r.item as? SpanStyle)?.let { AnnotatedString.Range(it, r.start.coerceIn(0, text.length), r.end.coerceIn(0, text.length)) } }
-        val cuts = sortedSetOf(0, text.length)
-        for (s in spans) { cuts += s.start; cuts += s.end }
-        for (p in placeholders) { cuts += p.start.coerceIn(0, text.length); cuts += p.end.coerceIn(0, text.length) }
-        val bounds = cuts.toList()
+        val spans = if (annotations.isEmpty()) emptyList() else annotations.mapNotNull { r -> (r.item as? SpanStyle)?.let { AnnotatedString.Range(it, r.start.coerceIn(0, text.length), r.end.coerceIn(0, text.length)) } }
+        val bounds = if (spans.isEmpty() && placeholders.isEmpty()) {
+            if (text.isEmpty()) intArrayOf(0) else intArrayOf(0, text.length)
+        } else {
+            val cuts = sortedSetOf(0, text.length)
+            for (s in spans) { cuts += s.start; cuts += s.end }
+            for (p in placeholders) { cuts += p.start.coerceIn(0, text.length); cuts += p.end.coerceIn(0, text.length) }
+            cuts.toIntArray()
+        }
         val fontCache = HashMap<Pair<String, Float>, PolyFont>()
         runs = ArrayList()
         for (i in 0 until bounds.size - 1) {
@@ -311,7 +319,8 @@ internal class PolyIntrinsics(
         // shortcut: one glyph per code point without OpenType shaping, so scripts that reorder or substitute glyphs
         // (e.g. Devanagari) render unshaped; fixing that needs a shaping engine such as HarfBuzz
         val emojiFace = PolyGlyphPage.rasterizer?.emoji()
-        for (run in runs) {
+        for (r in runs.indices) {
+            val run = runs[r]
             val placeholder = run.placeholder
             if (placeholder != null) {
                 advances[run.start] = placeholderSize(placeholder.width, run)
@@ -328,7 +337,8 @@ internal class PolyIntrinsics(
             while (i < run.end) {
                 val cp = glyphs.codePointAt(i)
                 val n = Character.charCount(cp)
-                val sequence = if (!mc && emojiFace != null && !PolyGlyphPage.isIgnorable(cp)) PolyGlyphPage.sequence(emojiFace, glyphs, i, run.end) else 0L
+                val ignorable = PolyGlyphPage.isIgnorable(cp)
+                val sequence = if (!mc && emojiFace != null && !ignorable) PolyGlyphPage.sequence(emojiFace, glyphs, i, run.end) else 0L
                 if (sequence != 0L) {
                     val end = sequence.toInt()
                     advances[i] = run.font.measureTextWidth(glyphs.substring(i, end)) * scaleX + letter
@@ -337,7 +347,6 @@ internal class PolyIntrinsics(
                     continue
                 }
                 val emoji = !mc && i + n < glyphs.length && glyphs.codePointAt(i + n) == PolyGlyphPage.EMOJI_VARIATION
-                val ignorable = PolyGlyphPage.isIgnorable(cp)
                 advances[i] = if (cp == '\n'.code || cp == LIGATURE_PLACEHOLDER.code || ignorable) 0f else Advances.of(run.font, cp, emoji) * scaleX + letter
                 if (kernFace != null && !ignorable) {
                     val glyph = if (PolyGlyphPage.kernable(cp)) kernFace.glyph(cp) else 0
@@ -503,14 +512,26 @@ private object Advances {
     @Volatile private var fonts = -1
     private const val MAX_FONTS = 128
 
+    private class Last(val font: PolyFont, val revision: Int, val widths: ConcurrentHashMap<Int, Float>)
+
+    private var last: Last? = null
+
+    private fun widths(font: PolyFont, revision: Int): ConcurrentHashMap<Int, Float> {
+        val l = last
+        if (l != null && l.font === font && l.revision == revision && fonts == revision) return l.widths
+        if (cache.size > MAX_FONTS) cache.clear()
+        val widths = cache.getOrPut(font) { ConcurrentHashMap() }
+        last = Last(font, revision, widths)
+        return widths
+    }
+
     fun of(font: PolyFont, cp: Int, emoji: Boolean): Float {
         val revision = FontManager.revision
         if (revision != fonts) {
             cache.clear()
             fonts = revision
         }
-        if (cache.size > MAX_FONTS) cache.clear()
-        return cache.getOrPut(font) { ConcurrentHashMap() }.getOrPut(if (emoji) cp.inv() else cp) {
+        return widths(font, revision).getOrPut(if (emoji) cp.inv() else cp) {
             val s = String(Character.toChars(cp))
             font.measureTextWidth(if (emoji) s + String(Character.toChars(PolyGlyphPage.EMOJI_VARIATION)) else s)
         }
@@ -1197,8 +1218,8 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
             val c = (brush as? SolidColor)?.value
             return draw(canvas, c, a, shadow, textDecoration, style = textPaint(stroke, blendMode, (c?.alpha ?: 1f) * a))
         }
-        val shader = brush.createShader(Size(width, height)).platformShader
-        val fade = (shader as? GradientShader)?.fade(a, true)
+        val shader = shaderOf(brush)
+        val fade = (shader as? GradientShader)?.let { fadeOf(it, a) }
         if (fade != null) return draw(canvas, Color.White, 1f, shadow, textDecoration, fade, style = textPaint(stroke, blendMode, a))
         val fill = brushFill(brush, shader)
         if (fill == null) {
@@ -1212,6 +1233,35 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
 
     private fun textPaint(stroke: Stroke?, blend: BlendMode, alpha: Float): TextPaint? =
         if (stroke == null && blend == BlendMode.SrcOver) null else TextPaint(stroke, blend, alpha)
+
+    private var shaderBrush: ShaderBrush? = null
+    private var shaderSize = Size.Zero
+    private var shaderCached: PlatformShader? = null
+    private var fadeShader: GradientShader? = null
+    private var fadeAlpha = 0f
+    private var fadeCached: PolyFade? = null
+
+    private fun shaderOf(brush: ShaderBrush): PlatformShader {
+        val size = Size(width, height)
+        if (brush !is LinearGradient && brush !is RadialGradient && brush !is SweepGradient) return brush.createShader(size).platformShader
+        val cached = shaderCached
+        if (cached != null && brush === shaderBrush && size == shaderSize) return cached
+        val made = brush.createShader(size).platformShader
+        shaderBrush = brush
+        shaderSize = size
+        shaderCached = made
+        return made
+    }
+
+    private fun fadeOf(shader: GradientShader, alpha: Float): PolyFade? {
+        if (shader !== shaderCached) return shader.fade(alpha, true)
+        if (shader === fadeShader && alpha.toRawBits() == fadeAlpha.toRawBits()) return fadeCached
+        val made = shader.fade(alpha, true)
+        fadeShader = shader
+        fadeAlpha = alpha
+        fadeCached = made
+        return made
+    }
 
     private var fillBrush: Brush? = null
     private var fillSize = Size.Zero
@@ -1276,7 +1326,7 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
         (canvas as? PolyDrawCanvas)?.polyOp { pc ->
             pc.blendedText(style.blend, style.alpha) { forced ->
                 if (forced != null) paintLines(pc.renderer, Color(brush.argb()), alpha, shadow, decoration, PASS_ALL, style.stroke, forced)
-                else pc.renderer.live(-pad, -pad, width + pad * 2f, height + pad * 2f, brush::argb) { r ->
+                else pc.renderer.live(-pad, -pad, width + pad * 2f, height + pad * 2f, IntSupplier { brush.argb() }) { r ->
                     paintLines(r, Color(brush.argb()), alpha, shadow, decoration, PASS_ALL, style.stroke)
                 }
             }
@@ -1298,10 +1348,10 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
                 }
                 if (l.rtl) x = l.left
             } else if (l.gapStart >= 0) {
-                x = drawRange(r, l, l.start, l.gapStart, x, color, alpha, shadow, decoration, pass, outer, bake)
+                x = drawRange(r, l, index * 2, l.start, l.gapStart, x, color, alpha, shadow, decoration, pass, outer, bake)
                 if (pass == PASS_ALL || pass == PASS_OVER) drawEllipsis(r, l, intr.runAt(max(0, gapRunOffset(l.start, l.gapStart, l.gapEnd) - 1)), x, color, alpha)
-                x = drawRange(r, l, l.gapEnd, l.visibleEnd, x + l.gapW, color, alpha, shadow, decoration, pass, outer, bake)
-            } else x = drawRange(r, l, l.start, l.visibleEnd, x, color, alpha, shadow, decoration, pass, outer, bake)
+                x = drawRange(r, l, index * 2 + 1, l.gapEnd, l.visibleEnd, x + l.gapW, color, alpha, shadow, decoration, pass, outer, bake)
+            } else x = drawRange(r, l, index * 2, l.start, l.visibleEnd, x, color, alpha, shadow, decoration, pass, outer, bake)
             if (l.ellipsis && l.gapStart < 0 && (pass == PASS_ALL || pass == PASS_OVER)) {
                 drawEllipsis(r, l, intr.runAt(max(0, l.visibleEnd - 1)), x - intr.kernAfter(l.visibleEnd - 1), color, alpha)
             }
@@ -1309,19 +1359,29 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
     }
 
     private fun drawRange(
-        r: PolyRenderer, l: Line, from: Int, to: Int, x0: Float, color: Color?, alpha: Float, shadow: Shadow?, decoration: TextDecoration?, pass: Int,
+        r: PolyRenderer, l: Line, slot: Int, from: Int, to: Int, x0: Float, color: Color?, alpha: Float, shadow: Shadow?, decoration: TextDecoration?, pass: Int,
         outer: PolyImageFill?, bake: Shadow?,
     ): Float {
         var x = x0
-        for (run in intr.runs) {
+        val runs = intr.runs
+        for (k in runs.indices) {
+            val run = runs[k]
             val s = max(run.start, from)
             val e = min(run.end, to)
             if (s >= e) continue
             val w = intr.width(s, e)
-            drawRun(r, l, run, intr.glyphs.substring(s, e), x, w, color, alpha, shadow, decoration, pass, outer, bake)
+            drawRun(r, l, run, rangeText(slot, k, s, e), x, w, color, alpha, shadow, decoration, pass, outer, bake)
             x += w
         }
         return x
+    }
+
+    private var rangeTexts: Array<Array<String?>?>? = null
+
+    private fun rangeText(slot: Int, k: Int, s: Int, e: Int): String {
+        val all = rangeTexts ?: arrayOfNulls<Array<String?>>(lines.size * 2).also { rangeTexts = it }
+        val row = all[slot] ?: arrayOfNulls<String>(intr.runs.size).also { all[slot] = it }
+        return row[k] ?: intr.glyphs.substring(s, e).also { row[k] = it }
     }
 
     private val justifiedSegs: Array<Array<Seg>?> by lazy { Array(lines.size) { i -> lines[i].takeIf { it.extra != 0f }?.let(::justifiedSegs) } }
@@ -1362,7 +1422,11 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
             }
             if (fallback != null) return fallback.copy(alpha = fallback.alpha * if (run.brushAlpha.isNaN()) 1f else run.brushAlpha.coerceIn(0f, 1f))
         }
-        return run.spanColor.takeIf { it.isSpecified } ?: color ?: run.style.color.takeIf { it.isSpecified } ?: Color.Black
+        val span = run.spanColor
+        if (span.isSpecified) return span
+        if (color != null) return color
+        val own = run.style.color
+        return if (own.isSpecified) own else Color.Black
     }
 
     private val spanFills = HashMap<Brush, PolyImageFill>()
@@ -1398,8 +1462,9 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
 
     private fun drawBlurredShadows(r: PolyRenderer, shadow: Shadow?) {
         var done: ArrayList<Shadow>? = null
-        for (run in intr.runs) {
-            val sh = blurredShadow(run, shadow) ?: continue
+        val runs = intr.runs
+        for (k in runs.indices) {
+            val sh = blurredShadow(runs[k], shadow) ?: continue
             if (done?.contains(sh) == true) continue
             done = (done ?: ArrayList()).also { it += sh }
             val p = shadowBake(r, sh, shadow) ?: continue
@@ -1542,12 +1607,13 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
             return
         }
         val base = runColor(run, color)
-        val c = base.copy(alpha = base.alpha * alpha).toArgb()
+        val c = if (alpha == 1f && base.colorSpace.isSrgb) base.toArgb() else base.copy(alpha = base.alpha * alpha).toArgb()
         val sh = run.spanShadow ?: shadow ?: run.style.shadow
         val mcShadow = McFonts.isShadow(sh)
         val mc = McFonts.isMinecraft(run.font.name)
         if (pass != PASS_OVER) {
-            if (run.style.background.isSpecified && run.style.background.alpha > 0f) r.rect(x, l.top, w, l.bottom - l.top, run.style.background.toArgb(), 0f)
+            val background = run.style.background
+            if (background.isSpecified && background.alpha > 0f) r.rect(x, l.top, w, l.bottom - l.top, background.toArgb(), 0f)
             val o = McFonts.scale(run.font)
             when {
                 mcShadow && mc -> if (pass == PASS_UNDER) runText(r, run, str, x + o, baseline + o, McFonts.shadowArgb(c), false)
@@ -1579,7 +1645,8 @@ internal class PolyParagraph(private val intr: PolyIntrinsics, maxLines: Int, ov
     private fun mcRun(r: PolyRenderer, run: TextRun, str: String, x: Float, baseline: Float, color: Int, letter: Float, shadow: Boolean) {
         val scale = McFonts.scale(run.font)
         val top = baseline - McFonts.ASCENT * scale
-        val prefix = (if (run.font.name == McFonts.BOLD) "§l" else "") + (if (run.skew != 0f) "§o" else "")
+        val bold = run.font.name == McFonts.BOLD
+        val prefix = if (run.skew != 0f) (if (bold) "§l§o" else "§o") else if (bold) "§l" else ""
         val formatted = prefix.isNotEmpty() && '§' !in str
         if (letter == 0f) {
             if (formatted) r.mcText(prefix + str, x, top, color, shadow, scale, false, false)

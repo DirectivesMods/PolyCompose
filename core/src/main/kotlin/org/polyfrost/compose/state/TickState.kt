@@ -114,6 +114,7 @@ internal class TickStateEntry<T>(
     val activity: TickActivity?,
 ) {
     val state = mutableStateOf(initial, policy)
+    private var committed: T = initial
     private var pending: T? = null
     private var hasPending = false
 
@@ -143,7 +144,7 @@ internal class TickStateEntry<T>(
         val reader = read.value
         return HostCallbacks.call(reader, "A tick state read", false) {
             val next = reader()
-            if (policy.equivalent(state.value, next)) return false
+            if (policy.equivalent(committed, next)) return false
             pending = next
             hasPending = true
             true
@@ -153,7 +154,9 @@ internal class TickStateEntry<T>(
     @Suppress("UNCHECKED_CAST")
     fun commit() {
         if (!hasPending) return
-        state.value = pending as T
+        val next = pending as T
+        state.value = next
+        committed = next
         pending = null
         hasPending = false
     }

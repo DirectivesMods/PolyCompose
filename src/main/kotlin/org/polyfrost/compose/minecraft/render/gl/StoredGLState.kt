@@ -115,13 +115,20 @@ class StoredGLState(val exact: Boolean = false) {
             drawFramebuffer = glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING)
             readFramebuffer = glGetInteger(GL_READ_FRAMEBUFFER_BINDING)
         }
-        activeTexture = glGetInteger(GL_ACTIVE_TEXTURE) - GL_TEXTURE0
+        activeTexture = if (exact) glGetInteger(GL_ACTIVE_TEXTURE) - GL_TEXTURE0 else cachedActiveTexture()
         program = glGetInteger(GL_CURRENT_PROGRAM)
         arrayBuffer = glGetInteger(GL_ARRAY_BUFFER_BINDING)
         unpackBuffer = glGetInteger(GL_PIXEL_UNPACK_BUFFER_BINDING)
         if (unpackBuffer != 0) glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
         glActiveTexture(GL_TEXTURE0)
         if (exact) saveFromGl() else saveFromCache()
+    }
+
+    private fun cachedActiveTexture(): Int {
+        //? if < 1.21.10 {
+        /^return GlStateManager._getActiveTexture() - GL_TEXTURE0
+        ^///?} else
+        //return glGetInteger(GL_ACTIVE_TEXTURE) - GL_TEXTURE0
     }
 
     private fun saveBindingsFromCache(): Boolean {
@@ -196,7 +203,7 @@ class StoredGLState(val exact: Boolean = false) {
         if (unpackBuffer != 0) glBindBuffer(GL_PIXEL_UNPACK_BUFFER, unpackBuffer)
         glActiveTexture(GL_TEXTURE0)
         glBindTexture(GL_TEXTURE_2D, texture.coerceAtLeast(0))
-        glActiveTexture(GL_TEXTURE0 + activeTexture)
+        if (activeTexture != 0) glActiveTexture(GL_TEXTURE0 + activeTexture)
         toggle(GL_BLEND, blend)
         glBlendFuncSeparate(blendSrcRgb, blendDstRgb, blendSrcAlpha, blendDstAlpha)
         toggle(GL_DEPTH_TEST, depthTest)
@@ -235,10 +242,10 @@ class StoredGLState(val exact: Boolean = false) {
 
     private fun save() {
         drawFramebuffer = GlFbo.binding(GL30.GL_DRAW_FRAMEBUFFER)
-        readFramebuffer = GlFbo.binding(GL30.GL_READ_FRAMEBUFFER)
+        readFramebuffer = if (GlFbo.canBlit) GlFbo.binding(GL30.GL_READ_FRAMEBUFFER) else drawFramebuffer
         program = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM)
         activeTexture = GlStateManager.texture
-        unit = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE) - GL13.GL_TEXTURE0
+        unit = if (exact) GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE) - GL13.GL_TEXTURE0 else activeTexture
         texture = GlStateManager.TEXTURES[0].texture
         alphaTest = GlStateManager.ALPHA_TEST.state.enabled
         val depthState = GlStateManager.DEPTH
@@ -285,7 +292,7 @@ class StoredGLState(val exact: Boolean = false) {
         GlStateManager.bindTexture(texture)
         GL11.glBindTexture(GL11.GL_TEXTURE_2D, boundTexture)
         GlStateManager.activeTexture(GL13.GL_TEXTURE0 + activeTexture)
-        GL13.glActiveTexture(GL13.GL_TEXTURE0 + unit)
+        if (exact) GL13.glActiveTexture(GL13.GL_TEXTURE0 + unit)
         if (alphaTest) GlStateManager.enableAlphaTest() else GlStateManager.disableAlphaTest()
         if (depthTest) GlStateManager.enableDepthTest() else GlStateManager.disableDepthTest()
         GlStateManager.depthMask(depthMask)

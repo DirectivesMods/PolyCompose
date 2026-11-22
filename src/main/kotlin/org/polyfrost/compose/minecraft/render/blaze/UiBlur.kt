@@ -48,6 +48,10 @@ object UiBlur {
     private var blurInfo: GpuBuffer? = null
     private var infoKey = 0L
     private var compositor: BlazeRenderer? = null
+    private var compositeView: GpuTextureView? = null
+    private var compositeWidth = 0
+    private var compositeHeight = 0
+    private var compositeAlpha = Float.NaN
     private var idleFrames = 0
 
     fun extract(ctx: GuiGraphicsExtractor, alpha: Float) {
@@ -55,8 +59,22 @@ object UiBlur {
         val main = Minecraft.getInstance().gameRenderer.mainRenderTarget()
         val target = out.target ?: return
         val guiScale = Minecraft.getInstance().window.guiScale.toFloat()
-        val renderer = compositor?.takeIf { it.matches(guiScale) }?.also { it.reset() } ?: BlazeRenderer(guiScale).also { compositor = it }
-        renderer.texture(target, 0f, 0f, main.width.toFloat(), main.height.toFloat(), 0f, 1f, 1f, 0f, alpha)
+        val view = target.colorTextureView
+        val cached = compositor?.takeIf { it.matches(guiScale) }
+        val renderer = if (
+            cached != null && view != null && view === compositeView && !view.isClosed &&
+            main.width == compositeWidth && main.height == compositeHeight && alpha == compositeAlpha
+        ) {
+            cached
+        } else {
+            val r = cached?.also { it.reset() } ?: BlazeRenderer(guiScale).also { compositor = it }
+            r.texture(target, 0f, 0f, main.width.toFloat(), main.height.toFloat(), 0f, 1f, 1f, 0f, alpha)
+            compositeView = view
+            compositeWidth = main.width
+            compositeHeight = main.height
+            compositeAlpha = alpha
+            r
+        }
         val ops = renderer.finish()
         for (i in ops.indices) ops[i](ctx)
     }
@@ -134,6 +152,7 @@ object UiBlur {
         a.dispose()
         b.dispose()
         blurred = null
+        compositeView = null
         downInfo?.close()
         blurInfo?.close()
         downInfo = null

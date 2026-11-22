@@ -19,6 +19,7 @@ import org.polyfrost.compose.minecraft.preview.McFrameHooks
 import org.polyfrost.compose.minecraft.render.GuiTargetRedirect
 import org.polyfrost.compose.minecraft.render.OffscreenTarget
 import org.polyfrost.compose.minecraft.render.TextureRenderer
+import org.polyfrost.compose.minecraft.render.gl.GlRenderer
 import org.polyfrost.compose.render.RenderContext
 import org.slf4j.LoggerFactory
 
@@ -38,7 +39,12 @@ import net.minecraft.util.Util
 //? if >= 1.21.11 {
 import org.polyfrost.compose.minecraft.compat.GnetumCompat
 import org.polyfrost.compose.minecraft.compat.GnetumOffscreenState
-//?}
+import org.polyfrost.compose.minecraft.render.blaze.BlazeRenderer
+import org.polyfrost.compose.minecraft.render.blaze.ItemGlint
+//?} else {
+/*import org.polyfrost.compose.minecraft.render.gl.GlGlint
+import org.polyfrost.compose.minecraft.render.gl.GlHost
+*///?}
 
 //? if >= 1.21.8 {
 import net.minecraft.client.gui.GuiGraphicsExtractor
@@ -50,6 +56,7 @@ import org.joml.Matrix3x2f
 
 //? if > 1.8.9 {
 import com.mojang.blaze3d.systems.RenderSystem
+import net.minecraft.core.component.DataComponents
 import net.minecraft.core.registries.BuiltInRegistries
 import net.minecraft.world.item.ItemDisplayContext
 //?}
@@ -228,6 +235,7 @@ internal object McItemAtlas {
         var baseSizePx = 0
         var reservedMultiple = 1
         var shrinkSinceNs = 0L
+        var shrinkTargetPx = 0
         var closedFlag = false
         var slot = 0
         var x = 0
@@ -235,6 +243,7 @@ internal object McItemAtlas {
         val atlasSource = FloatArray(4)
         var atlas: AtlasState? = null
         var animated = false
+        var foil = false
         var special = false
         var specialRefreshAtNs = 0L
         var failed = false
@@ -242,6 +251,15 @@ internal object McItemAtlas {
         var identityInitialized = false
         var resolvedTick = -1
         var resolvedStack: ItemStack? = null
+        //? if = 1.8.9 {
+        /*var resolvedNbt: Any? = null
+        var resolvedMeta = 0
+        var resolvedItem: Any? = null
+        *///?}
+        var publishedTarget: RenderTarget? = null
+        var publishedLayout: AtlasLayout? = null
+        var publishedSlot = -1
+        var publishedFailed = false
         var committedIdentity = IdentityBuffer()
         var scratchIdentity = IdentityBuffer()
         var decorationKey = Long.MIN_VALUE
@@ -254,6 +272,7 @@ internal object McItemAtlas {
         *///?} elif > 1.8.9 {
         /*var resolvedGuiModel: BakedModel? = null
         var resolvedUsesBlockLight = true
+        var bakeStack: ItemStack? = null
         *///?}
         //? if < 1.21.8 && > 1.8.9
         //val resolutionRandom = RandomSource.create(42L)
@@ -290,6 +309,7 @@ internal object McItemAtlas {
                 return
             }
             val now = System.nanoTime()
+            shrinkTargetPx = page
             if (shrinkSinceNs == 0L) shrinkSinceNs = now
             else if (now - shrinkSinceNs >= SHRINK_DELAY_NS) {
                 shrinkSinceNs = 0L
@@ -332,8 +352,15 @@ internal object McItemAtlas {
             if (src[2] <= src[0] || src[3] <= src[1]) return false
             val textures = ctx.renderer as? TextureRenderer ?: return false
             val target = state.offscreenTarget.target ?: return false
-            val size = state.layout?.atlasSizePx?.toFloat() ?: return false
-            textures.texture(target, x, y, w, h, src[0] / size, 1f - src[1] / size, src[2] / size, 1f - src[3] / size, alpha.coerceIn(0f, 1f))
+            val layout = state.layout ?: return false
+            val size = layout.atlasSizePx.toFloat()
+            val u0 = src[0] / size
+            val v0 = 1f - src[1] / size
+            val u1 = src[2] / size
+            val v1 = 1f - src[3] / size
+            val a = alpha.coerceIn(0f, 1f)
+            textures.texture(target, x, y, w, h, u0, v0, u1, v1, a)
+            if (foil) drawGlint(ctx.renderer, target, layout.iconsPerSide, x, y, w, h, u0, v0, u1, v1, a)
             return true
         }
 
@@ -394,6 +421,8 @@ internal object McItemAtlas {
     @Volatile
     private var renderingFailed = false
     private val failedVariants = ArrayList<ItemStack>()
+    private val pendingInvalidations = ArrayList<IconEntry>()
+    private val tickInvalidations = ArrayList<IconEntry>()
     private var clientTick = 0
     private var lastLevel: Any? = null
     private var lastViewportW = 0
@@ -404,7 +433,27 @@ internal object McItemAtlas {
     private var reloadHook: AutoCloseable? = null
     private var initializationStarted = false
 
+    var contentGeneration = 0
+        private set
+    private val pageTargets = ArrayList<RenderTarget>()
+    private var pageTargetsGeneration = -1
+
     val available = mutableStateOf(false)
+
+    fun atlasTargets(): List<RenderTarget> {
+        if (pageTargetsGeneration != contentGeneration) {
+            pageTargets.clear()
+            for (page in atlases.values) page.offscreenTarget.target?.let(pageTargets::add)
+            pageTargetsGeneration = contentGeneration
+        }
+        return pageTargets
+    }
+
+    fun isAtlas(target: RenderTarget): Boolean {
+        val targets = atlasTargets()
+        for (index in targets.indices) if (targets[index] === target) return true
+        return false
+    }
 
     @Volatile
     var unavailableReason: String? = "Item icons start when the first icon is shown"
@@ -421,6 +470,32 @@ internal object McItemAtlas {
     }
 
     private fun renderPx(ctx: RenderContext, size: Float): Int = renderPx(size * ctx.deviceScale())
+
+    private fun drawGlint(
+        renderer: Any, target: RenderTarget, cells: Int, x: Float, y: Float, w: Float, h: Float, u0: Float, v0: Float, u1: Float, v1: Float, alpha: Float,
+    ) {
+        when (renderer) {
+            is GlRenderer -> renderer.itemGlint(target, cells, x, y, w, h, u0, v0, u1, v1, alpha)
+            //? if >= 1.21.11
+            is BlazeRenderer -> renderer.itemGlint(target, cells, x, y, w, h, u0, v0, u1, v1, alpha)
+        }
+    }
+
+    //? if = 1.8.9
+    //private var glintHookMissing = false
+
+    private fun glintOverlay(): Boolean {
+        //? if >= 1.21.11 {
+        return ItemGlint.usable
+        //?} elif > 1.8.9 {
+        /*return !GlHost.vanillaPipeline && GlGlint.usable
+        *///?} else
+        //return !glintHookMissing && GlGlint.usable
+    }
+
+    //? if > 1.8.9 {
+    private fun withoutFoil(stack: ItemStack): ItemStack = stack.copy().also { it.set(DataComponents.ENCHANTMENT_GLINT_OVERRIDE, false) }
+    //?}
 
     private fun renderPx(devicePx: Float): Int = ceil(devicePx - 0.01f).toInt().coerceAtLeast(1)
 
@@ -501,9 +576,15 @@ internal object McItemAtlas {
             lastViewportH = h
             recover()
         }
-        val changed = ArrayList<IconEntry>()
+        val changed = tickInvalidations
+        val now = System.nanoTime()
         synchronized(lock) {
             for (entry in active) {
+                val shrinkSince = entry.shrinkSinceNs
+                if (entry.animated && shrinkSince != 0L && now - shrinkSince >= SHRINK_DELAY_NS) {
+                    entry.shrinkSinceNs = 0L
+                    entry.setRenderSizePx(entry.shrinkTargetPx)
+                }
                 if (!entry.decorations) continue
                 val key = McItemDecorations.key(entry.stack)
                 if (key == entry.decorationKey) continue
@@ -512,7 +593,11 @@ internal object McItemAtlas {
                 if (!first) changed.add(entry)
             }
         }
-        if (changed.isNotEmpty()) invalidateEntries(changed)
+        try {
+            invalidateEntries(changed)
+        } finally {
+            changed.clear()
+        }
     }
 
     private fun clearCaches() {
@@ -587,10 +672,13 @@ internal object McItemAtlas {
         try {
             reconcileTopology()
             for (page in atlases.values) renderAtlas(page)
+            invalidateEntries(pendingInvalidations)
         } catch (throwable: Throwable) {
             renderingFailed = true
             destroyAtlases()
             LOG.warn("Failed to render item icons", throwable)
+        } finally {
+            pendingInvalidations.clear()
         }
     }
 
@@ -622,50 +710,86 @@ internal object McItemAtlas {
 
         val guiSize = layout.iconsPerSide * CELL_SIZE
         val targetChanged = target !== previousTarget
-        if (targetChanged) atlasState.readyForSampling = false
+        if (targetChanged) {
+            atlasState.readyForSampling = false
+            contentGeneration++
+        }
 
         val changed = atlasState.changed
         changed.clear()
         val rebuild = targetChanged || atlasState.rebuild
         val now = System.nanoTime()
-        var special = false
-        for (entry in atlasState.entries) {
+        val animatedDue = atlasState.animatedTick != clientTick
+        val entries = atlasState.entries
+        for (index in entries.indices) {
+            val entry = entries[index]
             if (entry.failed) continue
-            if (entry.special) special = true
-            val stale = rebuild || !entry.identityInitialized || entry.resolvedTick != clientTick || entry.resolvedStack !== entry.stack
-            val resolvedChanged = stale && try {
-                resolveIconState(entry)
-            } catch (throwable: Throwable) {
-                markFailed(entry, "resolving its model", throwable)
-                changed.add(entry)
-                continue
+            var resolvedChanged = false
+            if (rebuild || !entry.identityInitialized || variantChanged(entry) || entry.resolvedTick != clientTick) {
+                resolvedChanged = try {
+                    resolveIconState(entry)
+                } catch (throwable: Throwable) {
+                    markFailed(entry, "resolving its model", throwable)
+                    changed.add(entry)
+                    continue
+                }
+                entry.resolvedTick = clientTick
+                markResolved(entry)
             }
-            entry.resolvedTick = clientTick
-            entry.resolvedStack = entry.stack
             val specialRefresh = entry.special && now - entry.specialRefreshAtNs >= 0
-            if (resolvedChanged || (entry.animated && atlasState.animatedTick != clientTick) || rebuild || specialRefresh) {
+            if (resolvedChanged || (entry.animated && animatedDue) || rebuild || specialRefresh) {
                 changed.add(entry)
                 if (entry.special) entry.specialRefreshAtNs = now + SPECIAL_REFRESH_NS
             }
         }
         atlasState.animatedTick = clientTick
-        atlasState.cleanTick = if (special) -1 else clientTick
+        atlasState.cleanTick = clientTick
 
         if (changed.isEmpty()) return false
 
-        if (rebuild) clearTarget(target) else clearCells(target, changed, layout)
-
-        renderItemsIsolated(atlasState, target, layout, changed, guiSize)
+        if (rebuild) clearTarget(target)
+        renderItemsIsolated(atlasState, target, layout, changed, guiSize, !rebuild)
+        contentGeneration++
         atlasState.readyForSampling = true
         atlasState.rebuild = false
-        invalidateEntries(if (rebuild) atlasState.entries.toList() else changed.toList())
+        publishPlacements(if (rebuild) atlasState.entries else changed, target, layout)
         return true
     }
 
-    private fun invalidateEntries(entries: Collection<IconEntry>) {
+    private fun variantChanged(entry: IconEntry): Boolean {
+        val stack = entry.stack
+        //? if > 1.8.9 {
+        return entry.resolvedStack !== stack
+        //?} else
+        //return entry.resolvedStack !== stack || entry.resolvedNbt !== stack.nbt || entry.resolvedMeta != stack.metadata || entry.resolvedItem !== stack.item
+    }
+
+    private fun markResolved(entry: IconEntry) {
+        val stack = entry.stack
+        entry.resolvedStack = stack
+        //? if = 1.8.9 {
+        /*entry.resolvedNbt = stack.nbt
+        entry.resolvedMeta = stack.metadata
+        entry.resolvedItem = stack.item
+        *///?}
+    }
+
+    private fun publishPlacements(entries: List<IconEntry>, target: RenderTarget, layout: AtlasLayout) {
+        for (index in entries.indices) {
+            val entry = entries[index]
+            if (entry.publishedTarget === target && entry.publishedLayout == layout && entry.publishedSlot == entry.slot && entry.publishedFailed == entry.failed) continue
+            entry.publishedTarget = target
+            entry.publishedLayout = layout
+            entry.publishedSlot = entry.slot
+            entry.publishedFailed = entry.failed
+            pendingInvalidations.add(entry)
+        }
+    }
+
+    private fun invalidateEntries(entries: List<IconEntry>) {
         if (entries.isEmpty()) return
         Snapshot.withMutableSnapshot {
-            for (entry in entries) entry.revisionState.intValue++
+            for (index in entries.indices) entries[index].revisionState.intValue++
         }
     }
 
@@ -675,12 +799,17 @@ internal object McItemAtlas {
         val client = Minecraft.getInstance()
         val scratch = entry.scratchIdentity
         scratch.clear()
+        val overlay = glintOverlay()
+        //? if > 1.8.9 {
+        val foil = overlay && stack.hasFoil()
+        val baked = if (foil) withoutFoil(stack) else stack
+        //?}
         //? if >= 1.21.8 {
         val state = entry.resolutionState
         state.useIdentity(scratch.values)
         client.itemModelResolver.updateForTopItem(
             state,
-            stack,
+            baked,
             ItemDisplayContext.GUI,
             client.level,
             client.player,
@@ -692,7 +821,7 @@ internal object McItemAtlas {
         /*val state = entry.resolutionState
         client.itemModelResolver.updateForTopItem(
             state,
-            stack,
+            baked,
             ItemDisplayContext.GUI,
             //? if = 1.21.4
             //false,
@@ -704,7 +833,8 @@ internal object McItemAtlas {
         val special = false
         *///?} elif > 1.8.9 {
         /*val renderer = client.itemRenderer
-        val resolvedModel = renderer.getModel(stack, client.level, client.player, 0)
+        entry.bakeStack = baked
+        val resolvedModel = renderer.getModel(baked, client.level, client.player, 0)
         val guiModel = when {
             stack.`is`(Items.TRIDENT) -> renderer.itemModelShaper.modelManager.getModel(
                 ModelResourceLocation.inventory(Identifier.withDefaultNamespace("trident")),
@@ -716,7 +846,7 @@ internal object McItemAtlas {
         }
         entry.resolvedGuiModel = guiModel
         entry.resolvedUsesBlockLight = resolvedModel.usesBlockLight()
-        var animated = stack.hasFoil()
+        var animated = baked.hasFoil()
         var tinted = false
         val special = guiModel.isCustomRenderer
         if (special) scratch.int(stack.components.hashCode())
@@ -756,8 +886,10 @@ internal object McItemAtlas {
         scratch.int(if (resolvedModel.usesBlockLight()) 1 else 0)
         *///?} else {
         /*val guiModel = client.itemRenderer.modelShaper.getModel(stack)
-        val animated = stack.hasEnchantmentGlint() || guiModel.particleIcon?.isAnimated == true
         val special = guiModel.isCustomRenderer
+        val glint = !special && stack.hasEnchantmentGlint()
+        val foil = overlay && glint
+        val animated = (glint && !foil) || guiModel.particleIcon?.isAnimated == true
         scratch.ref(guiModel)
         scratch.ref(stack.item)
         scratch.int(stack.metadata)
@@ -775,9 +907,12 @@ internal object McItemAtlas {
         entry.resolutionState.freezeIdentity(entry.stableIdentity)
         entry.identityInitialized = true
         val animationChanged = entry.animated != animated
+        val foilChanged = entry.foil != foil
         entry.animated = animated
+        entry.foil = foil
         entry.special = special
-        return changed || animationChanged
+        if (foilChanged) pendingInvalidations.add(entry)
+        return changed || animationChanged || foilChanged
     }
 
     //? if = 1.21.5 {
@@ -833,19 +968,29 @@ internal object McItemAtlas {
     }
     *///?}
 
-    private fun renderItemsIsolated(atlasState: AtlasState, target: RenderTarget, layout: AtlasLayout, changed: List<IconEntry>, guiSize: Int) {
+    private fun renderItemsIsolated(atlasState: AtlasState, target: RenderTarget, layout: AtlasLayout, changed: List<IconEntry>, guiSize: Int, clearFirst: Boolean) {
         val renderable = if (changed.any { it.failed }) changed.filter { !it.failed } else changed
         if (renderable.isEmpty()) {
+            if (clearFirst) clearCells(target, changed, layout)
             //? if < 1.21.5
             //Minecraft.getInstance().mainRenderTarget.bindWrite(true)
             return
         }
+        //? if > 1.8.9 {
+        if (clearFirst) clearCells(target, changed, layout)
         if (runCatching { renderItems(atlasState, target, renderable, guiSize, guiSize) }.isSuccess) return
         clearCells(target, renderable, layout)
+        //?} else {
+        /*if (runCatching { renderItems(atlasState, target, renderable, guiSize, guiSize, if (clearFirst) changed else emptyList()) }.isSuccess) return
+        clearCells(target, if (clearFirst) changed else renderable, layout)
+        *///?}
         for (entry in renderable) {
             val single = listOf(entry)
             try {
+                //? if > 1.8.9 {
                 renderItems(atlasState, target, single, guiSize, guiSize)
+                //?} else
+                //renderItems(atlasState, target, single, guiSize, guiSize, emptyList())
             } catch (throwable: Throwable) {
                 markFailed(entry, "rendering", throwable)
                 clearCells(target, single, layout)
@@ -854,7 +999,10 @@ internal object McItemAtlas {
     }
 
     @Suppress("LongMethod")
+    //? if > 1.8.9 {
     private fun renderItems(page: AtlasState, target: RenderTarget, entries: List<IconEntry>, guiWidth: Int, guiHeight: Int) {
+    //?} else
+    //private fun renderItems(page: AtlasState, target: RenderTarget, entries: List<IconEntry>, guiWidth: Int, guiHeight: Int, clear: List<IconEntry>) {
         val mc = Minecraft.getInstance()
         //? if > 1.8.9 {
         val previousTarget = GuiTargetRedirect.target
@@ -877,7 +1025,8 @@ internal object McItemAtlas {
             pose.pushMatrix()
             pose.scale(target.width.toFloat() / guiWidth.toFloat(), target.height.toFloat() / guiHeight.toFloat())
             try {
-                entries.forEach { entry ->
+                for (index in entries.indices) {
+                    val entry = entries[index]
                     val itemPose = Matrix3x2f(pose)
                     val scissor = ScreenRectangle(
                         entry.x / CELL_SIZE * renderSizePx, entry.y / CELL_SIZE * renderSizePx,
@@ -932,7 +1081,8 @@ internal object McItemAtlas {
             *///?}
 
             try {
-                entries.forEach { entry ->
+                for (index in entries.indices) {
+                    val entry = entries[index]
                     graphics.enableScissor(entry.x, entry.y, entry.x + CELL_SIZE, entry.y + CELL_SIZE)
                     try {
                         val pose = graphics.pose()
@@ -952,7 +1102,7 @@ internal object McItemAtlas {
                             val flat = !entry.resolvedUsesBlockLight
                             if (flat) Lighting.setupForFlatItems()
                             mc.itemRenderer.render(
-                                entry.stack, ItemDisplayContext.GUI, false, pose, bufferSource,
+                                entry.bakeStack ?: entry.stack, ItemDisplayContext.GUI, false, pose, bufferSource,
                                 15728880, OverlayTexture.NO_OVERLAY, model,
                             )
                             *///?}
@@ -981,14 +1131,31 @@ internal object McItemAtlas {
             Lighting.turnOnGui()
             GL11.glEnable(GL11.GL_SCISSOR_TEST)
             try {
-                entries.forEach { entry ->
+                if (clear.isNotEmpty()) {
+                    GlStateManager.clearColor(0f, 0f, 0f, 0f)
+                    GlStateManager.clearDepth(1.0)
+                    GlStateManager.colorMask(true, true, true, true)
+                    GlStateManager.depthMask(true)
+                    for (index in clear.indices) {
+                        val entry = clear[index]
+                        val top = entry.y / CELL_SIZE * renderSizePx
+                        GL11.glScissor(entry.x / CELL_SIZE * renderSizePx, target.height - top - renderSizePx, renderSizePx, renderSizePx)
+                        GlStateManager.clear(GL11.GL_COLOR_BUFFER_BIT or GL11.GL_DEPTH_BUFFER_BIT)
+                    }
+                }
+                for (index in entries.indices) {
+                    val entry = entries[index]
                     val left = entry.x / CELL_SIZE * renderSizePx
                     val top = entry.y / CELL_SIZE * renderSizePx
                     GL11.glScissor(left, target.height - top - renderSizePx, renderSizePx, renderSizePx)
                     GlStateManager.pushMatrix()
+                    GuiTargetRedirect.suppressItemGlint = entry.foil
+                    GuiTargetRedirect.itemGlintSuppressed = false
                     try {
                         mc.itemRenderer.renderGuiItem(entry.stack, entry.x, entry.y)
+                        if (entry.foil && !GuiTargetRedirect.itemGlintSuppressed) glintHookMissing = true
                     } finally {
+                        GuiTargetRedirect.suppressItemGlint = false
                         GlStateManager.popMatrix()
                     }
                 }
@@ -1089,7 +1256,8 @@ internal object McItemAtlas {
         //~ if < 26.2 '= 0.0' -> '= 1.0'
         val clearDepth = 0.0
 
-        entries.forEach { entry ->
+        for (index in entries.indices) {
+            val entry = entries[index]
             val left = entry.x * target.width / guiSize
             val top = entry.y * target.height / guiSize
             val right = (entry.x + CELL_SIZE) * target.width / guiSize
@@ -1116,7 +1284,8 @@ internal object McItemAtlas {
             ).also { encoder.clearColorTexture(it, 0) }
         }
 
-        entries.forEach { entry ->
+        for (index in entries.indices) {
+            val entry = entries[index]
             val left = entry.x * target.width / guiSize
             val top = entry.y * target.height / guiSize
             val right = (entry.x + CELL_SIZE) * target.width / guiSize
@@ -1146,7 +1315,8 @@ internal object McItemAtlas {
         *///?}
 
         try {
-            entries.forEach { entry ->
+            for (index in entries.indices) {
+                val entry = entries[index]
                 val left = entry.x * target.width / guiSize
                 val top = entry.y * target.height / guiSize
                 val right = (entry.x + CELL_SIZE) * target.width / guiSize
@@ -1299,7 +1469,11 @@ internal object McItemAtlas {
 
     private fun disposeAtlas(state: AtlasState) {
         state.offscreenTarget.dispose()
-        state.entries.forEach { it.atlas = null }
+        contentGeneration++
+        state.entries.forEach {
+            it.atlas = null
+            it.publishedTarget = null
+        }
         state.entries.clear()
         state.freeSlots.clear()
         state.nextUnusedSlot = 0

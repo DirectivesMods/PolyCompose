@@ -3,6 +3,7 @@ package org.polyfrost.compose.minecraft.mixin;
 import com.llamalad7.mixinextras.injector.ModifyExpressionValue;
 import com.llamalad7.mixinextras.injector.ModifyReturnValue;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.Screen;
 import org.polyfrost.compose.host.ComposeHost;
 import org.polyfrost.compose.minecraft.platform.McScreens;
 import org.polyfrost.compose.minecraft.platform.McWindow;
@@ -28,10 +29,12 @@ public class Mixin_MainMenuFpsUncap {
     //?} else
     //@ModifyExpressionValue(method = "getFramerateLimit", at = @At(value = "CONSTANT", args = "intValue=30"))
     private int polycompose$uncapMainMenu(int menuCap) {
-        if (Minecraft.getInstance().level != null || McScreens.current() == null) return menuCap;
+        if (Minecraft.getInstance().level != null) return menuCap;
+        Screen screen = McScreens.current();
+        if (screen == null) return menuCap;
         Integer limit = ComposeHost.requestedFramerate();
         if (limit != null) return limit;
-        if (!(McScreens.current() instanceof ComposeScreen)) return menuCap;
+        if (!(screen instanceof ComposeScreen)) return menuCap;
         int refreshRate = McWindow.refreshRate();
         if (refreshRate <= 0) refreshRate = FALLBACK_MONITOR_REFRESH_RATE;
         return Math.max(menuCap, refreshRate + MAIN_MENU_FPS_HEADROOM);

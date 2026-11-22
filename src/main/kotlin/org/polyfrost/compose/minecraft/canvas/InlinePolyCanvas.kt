@@ -12,6 +12,7 @@ import net.minecraft.client.gui.GuiGraphicsExtractor
 import org.polyfrost.compose.minecraft.render.blaze.BlazeRenderer
 import org.polyfrost.compose.minecraft.render.blaze.GlyphAtlas
 import org.polyfrost.compose.minecraft.render.blaze.Recording
+import org.polyfrost.compose.render.RenderContext
 //?} else {
 /*import org.polyfrost.compose.minecraft.render.RenderTargetFbo
 import org.polyfrost.compose.minecraft.render.gl.GlHost
@@ -90,7 +91,8 @@ internal class InlineCanvasSurface(val name: String) {
         val guiScale = Minecraft.getInstance().window.guiScale.toFloat()
         val renderer = renderer?.takeIf { it.matches(guiScale) }?.also { it.reset() } ?: BlazeRenderer(guiScale).also { renderer = it }
         block(PolyCanvas(renderer))
-        for (op in renderer.finish()) op(ctx)
+        val ops = renderer.finish()
+        for (i in ops.indices) ops[i](ctx)
         GlyphAtlas.uploadDirty()
         return true
     }
@@ -99,6 +101,8 @@ internal class InlineCanvasSurface(val name: String) {
     private var recordedW = -1
     private var recordedH = -1
     private var recorded = false
+    private var recordBlock: ((PolyCanvas) -> Unit)? = null
+    private val record: (RenderContext) -> Unit = { recordBlock?.invoke(PolyCanvas(it.renderer)) }
 
     fun draw(ctx: GuiGraphicsExtractor?, dirty: Boolean, block: (PolyCanvas) -> Unit): Boolean {
         if (ctx == null) return false
@@ -108,7 +112,12 @@ internal class InlineCanvasSurface(val name: String) {
         val recording = recording ?: Recording().also { this.recording = it }
         val redraw = dirty || !recorded || w != recordedW || h != recordedH
         recorded = false
-        recording.render(ctx, redraw) { block(PolyCanvas(it.renderer)) }
+        recordBlock = block
+        try {
+            recording.render(ctx, redraw, record)
+        } finally {
+            recordBlock = null
+        }
         recordedW = w
         recordedH = h
         recorded = true

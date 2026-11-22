@@ -49,6 +49,7 @@ public class Mixin_GuiRendererKeptMeshes implements KeptMeshScissor {
     //? if >= 26.2 {
     @Inject(method = "addElementToMesh", at = @At("TAIL"))
     private void polycompose$noteKept(GuiElementRenderState element, CallbackInfo ci) {
+        if (!KeptMeshes.submitted) return;
         Object draw = draws.get(draws.size() - 1);
         KeptMeshes.added(draw, element);
         LiquidGlass.added(draw, element);
@@ -63,6 +64,7 @@ public class Mixin_GuiRendererKeptMeshes implements KeptMeshScissor {
 
     @Inject(method = "addElementToMesh", at = @At("TAIL"))
     private void polycompose$noteKept(GuiElementRenderState element, CallbackInfo ci) {
+        if (!KeptMeshes.submitted) return;
         KeptMeshes.added(meshesToDraw.size(), element);
         LiquidGlass.added(meshesToDraw.size(), element);
     }

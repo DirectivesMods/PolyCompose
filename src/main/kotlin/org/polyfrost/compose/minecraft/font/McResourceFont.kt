@@ -53,8 +53,8 @@ internal object McResourceFont {
             if (ttf != null) return ttf.glyph(cp)
             if (legacy != null) return baked[cp] ?: legacy.glyph(cp)?.let { baked.putIfAbsent(cp, it) ?: it }
             glyphs[cp]?.let { return it }
-            if (cp !in unihex) return null
             baked[cp]?.let { return it }
+            if (cp !in unihex) return null
             val block = bakeBlock(cp and UNIHEX_BLOCK_MASK.inv(), unihex)
             for ((code, g) in block) baked.putIfAbsent(code, g)
             return baked[cp]
@@ -131,7 +131,7 @@ internal object McResourceFont {
 
     private class Font(private val layers: List<Layer>) {
         fun glyph(cp: Int): McGlyph? {
-            for (layer in layers) layer.glyph(cp)?.let { return it }
+            for (i in layers.indices) layers[i].glyph(cp)?.let { return it }
             return null
         }
 

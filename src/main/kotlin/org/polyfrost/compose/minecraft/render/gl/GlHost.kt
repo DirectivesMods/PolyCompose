@@ -50,6 +50,7 @@ import net.minecraft.resources.Identifier
 import com.mojang.blaze3d.pipeline.TextureTarget
 import com.mojang.blaze3d.systems.RenderSystem
 import net.minecraft.client.gui.GuiGraphicsExtractor
+import org.polyfrost.compose.minecraft.mc.McItemAtlas
 //?}
 
 //? if = 1.21.5 {
@@ -263,7 +264,7 @@ object GlHost {
         }
         *///?}
         val rt = hudTarget ?: return
-        if (liveStale) repaintHud(rt)
+        refreshHud(rt)
         val w = rt.width
         val h = rt.height
         val guiScale = client.window.guiScale.toFloat()
@@ -325,6 +326,25 @@ object GlHost {
         }
         *///? }
     }
+
+    private fun refreshHud(rt: RenderTarget) {
+        val fresh = hudFresh
+        hudFresh = false
+        val generation = McItemAtlas.contentGeneration
+        if (generation != hudAtlasGeneration && !GlRenderer.Layer.samplesAtlas(stableLayer, volatileLayer)) hudAtlasGeneration = generation
+        if (!liveStale && generation == hudAtlasGeneration && (fresh || !GlRenderer.Layer.dirty(stableLayer, volatileLayer))) return
+        val fbo = RenderTargetFbo.getFboId(rt)
+        if (fbo <= 0) return
+        hudAtlasGeneration = generation
+        gl.capture()
+        try {
+            paintHud(fbo, rt.width, rt.height)
+        } catch (e: Throwable) {
+            HostErrors.warn("GlHost.blitHud() error", e)
+        } finally {
+            gl.restore()
+        }
+    }
     //?} else {
     /*fun blitHud() {
         if (!hudLayersReady) return
@@ -333,7 +353,14 @@ object GlHost {
             val fbo = gl.drawFramebuffer
             val w = McWindow.viewportWidth()
             val h = McWindow.viewportHeight()
-            if (w > 0 && h > 0) GlRenderer.Layer.draw(fbo, w, h, topDown = false, clear = false, stableLayer, volatileLayer)
+            if (w > 0 && h > 0) {
+                if (GLX.useFbo()) {
+                    hudCache.draw(fbo, w, h, stableLayer, volatileLayer, liveStale, hudReads)
+                } else {
+                    hudCache.invalidate()
+                    GlRenderer.Layer.draw(fbo, w, h, topDown = false, clear = false, stableLayer, volatileLayer)
+                }
+            }
         } catch (e: Throwable) {
             HostErrors.warn("GlHost.blitHud() error", e)
         } finally {
@@ -599,6 +626,8 @@ object GlHost {
     private class OverlayPass {
         var renderer: GlRenderer? = null
         var vbo: GlProgram.Vbo? = null
+        var drawOwner: OverlayRenderer? = null
+        var draw: ((RenderContext) -> Unit)? = null
         var shown = false
         var seenAt = 0L
         var drawnAt = 0L
@@ -607,6 +636,8 @@ object GlHost {
             renderer = null
             vbo?.let(GlProgram::release)
             vbo = null
+            drawOwner = null
+            draw = null
         }
     }
 
@@ -653,9 +684,13 @@ object GlHost {
         pass.renderer = null
         val drawn = profile.within {
             HostCallbacks.call<Unit?>(overlay, "OverlayRenderer.draw", null) {
-                val cached = previous?.takeUnless { changed || first || !it.matches() || it.stale() }
+                val cached = previous?.takeUnless { changed || first || !it.matches(w, h, gw) || it.stale() }
                 val vbo = pass.vbo ?: GlProgram.retain().also { pass.vbo = it }
-                pass.renderer = paintGl(fbo, cached, previous, vbo = vbo, draw = overlay::draw)
+                val draw = pass.draw?.takeIf { pass.drawOwner === overlay } ?: (overlay::draw).also {
+                    pass.draw = it
+                    pass.drawOwner = overlay
+                }
+                pass.renderer = paintGl(fbo, w, h, cached, previous, false, vbo, draw)
             }
         }
         if (drawn == null) return
@@ -729,6 +764,12 @@ object GlHost {
         val w = McWindow.viewportWidth()
         val h = McWindow.viewportHeight()
         if (w <= 0 || h <= 0 || McWindow.guiWidth() <= 0) return null
+        return paintGl(fbo, w, h, cached, spare, kept, vbo, draw)
+    }
+
+    private fun paintGl(
+        fbo: Int, w: Int, h: Int, cached: GlRenderer?, spare: GlRenderer?, kept: Boolean, vbo: GlProgram.Vbo?, draw: (RenderContext) -> Unit,
+    ): GlRenderer? {
         //? if = 1.21.1 {
         /*if (vanillaPipeline) {
             val renderer = cached ?: reuse(spare).also { record(it, draw) }
@@ -794,6 +835,12 @@ object GlHost {
     private val volatileLayer = GlRenderer.Layer()
     //? if = 1.8.9
     //private var hudLayersReady = false
+    //? if = 1.8.9
+    //private val hudCache = GlRenderer.Layer.Cache()
+    //? if > 1.8.9
+    private var hudFresh = false
+    //? if > 1.8.9
+    private var hudAtlasGeneration = 0
 
     private fun reuse(renderer: GlRenderer?): GlRenderer {
         if (renderer == null || !renderer.matches()) return GlRenderer()
@@ -805,6 +852,15 @@ object GlHost {
     private val liveReads = SnapshotStateObserver { it() }.also { it.start() }
     @Volatile private var liveStale = false
     private val onLiveStateChanged: (Any) -> Unit = { liveStale = true }
+
+    //? if = 1.8.9 {
+    /*private val hudReads = GlRenderer.Layer.LiveReads { block ->
+        liveStale = false
+        var painted = false
+        liveReads.observeReads(this, onLiveStateChanged) { painted = block.run() }
+        painted
+    }
+    *///?}
 
     private fun paintHud(fbo: Int, w: Int, h: Int) {
         liveStale = false
@@ -830,6 +886,7 @@ object GlHost {
             draw(RenderContext(stable), RenderContext(volatile))
             stableLayer.take(stable)
             volatileLayer.take(volatile)
+            hudCache.touch()
             hudLayersReady = true
             return true
         } catch (e: Throwable) {
@@ -850,6 +907,8 @@ object GlHost {
             stableLayer.take(stable)
             volatileLayer.take(volatile)
             paintHud(fbo, rt.width, rt.height)
+            hudFresh = true
+            hudAtlasGeneration = McItemAtlas.contentGeneration
             return true
         } catch (e: Throwable) {
             HostErrors.warn("GlHost.drawHudGl() error", e)
@@ -860,18 +919,6 @@ object GlHost {
         //?}
     }
 
-    private fun repaintHud(rt: RenderTarget) {
-        val fbo = RenderTargetFbo.getFboId(rt)
-        if (fbo <= 0) return
-        gl.capture()
-        try {
-            paintHud(fbo, rt.width, rt.height)
-        } catch (e: Throwable) {
-            HostErrors.warn("GlHost.repaintHud() error", e)
-        } finally {
-            gl.restore()
-        }
-    }
 
     private fun resolveHudTarget(): RenderTarget? {
         val w = McWindow.viewportWidth()
