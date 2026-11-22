@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.0.4]
+
+- Improved HUD performance on every version, most of all on 1.8.9. HUDs that haven't changed are no longer laid out and recorded again each frame, 1.8.9 and 1.16 to 1.21.10 keep the HUD in a cached texture, and text, item icons and both renderers allocate much less per frame
+- Enchanted items in HUDs are rendered once with their glint drawn on top, instead of being rendered again every tick
+- Fixed HUD item icons lagging a frame behind on 26.1 and newer
+- Fixed live canvases in the cached HUD not updating when the state they read changed below 1.21.11
+- Fixed characters from `legacy_unicode` fonts not loading below 1.21.11
+- Fixed sprites not loading from protected server resource packs
+- `PolyGlyphPage.Page.pixels` is now a getter, so mods compiled against the old field need a rebuild
+- Added `PolyNode.reportsLayoutChanges`, `liveMeasure` and the `notify*` methods so custom nodes can skip full relayouts, `IntSupplier` overloads of `live` and `mcTextLive`, and `PolyTessellator.submitBuffer`
+
 ## [3.0.3]
 
 - Fixed `NodeMcItemIcon` sometimes still drawing the old item after its stack changed
