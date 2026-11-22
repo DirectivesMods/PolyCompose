@@ -1552,14 +1552,21 @@ internal object GlProgram {
         GL20.glDisableVertexAttribArray(2)
     }
 
+    private inline fun eachBatch(batches: List<Batch>, live: List<Segment>, action: (Batch) -> Unit) {
+        for (i in batches.indices) action(batches[i])
+        for (i in live.indices) {
+            val sb = live[i].batches
+            for (k in sb.indices) action(sb[k])
+        }
+    }
+
     fun drawArena(batches: List<Batch>, w: Int, h: Int, topDown: Boolean, live: List<Segment>, glass: Int = -1) {
         if (program == 0) init()
         val frame = arenaFrame
         val gen = arenaGen
         var inArena = 0
         var adding = 0
-        for (i in batches.indices) {
-            val b = batches[i]
+        eachBatch(batches, live) { b ->
             if (b.arenaGen == gen) inArena += b.colors.size
             else if (b.seen == frame - 1) adding += b.colors.size
         }
@@ -1574,10 +1581,8 @@ internal object GlProgram {
         val newGen = arenaGen
         val adds = arenaAdds
         adds.clear()
-        for (i in batches.indices) {
-            val b = batches[i]
-            if (b.arenaGen == newGen) continue
-            if (b.arenaGen == gen || b.seen == frame - 1) {
+        eachBatch(batches, live) { b ->
+            if (b.arenaGen != newGen && (b.arenaGen == gen || b.seen == frame - 1)) {
                 b.arenaGen = newGen
                 adds.add(b)
             }
@@ -1588,6 +1593,16 @@ internal object GlProgram {
             if (b.arenaGen != newGen) scratchVerts += b.colors.size
             else if (b.seen != frame) arenaLive += b.colors.size
             b.seen = frame
+        }
+        var liveVerts = 0
+        for (i in live.indices) {
+            val sb = live[i].batches
+            for (k in sb.indices) {
+                val b = sb[k]
+                if (b.arenaGen != newGen) liveVerts += b.colors.size
+                else if (b.seen != frame) arenaLive += b.colors.size
+                b.seen = frame
+            }
         }
 
         GL20.glUseProgram(program)
@@ -1612,8 +1627,6 @@ internal object GlProgram {
             adds.clear()
         }
 
-        var liveVerts = 0
-        for (i in live.indices) liveVerts += vertexCount(live[i].batches)
         val scratchSize = scratchVerts + liveVerts
         GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, scratchVbo.id)
         if (scratchSize > 0) {
@@ -1623,7 +1636,7 @@ internal object GlProgram {
             var at = if (scratchVerts > 0) upload(0, batches, newGen) else 0
             for (i in live.indices) {
                 val sb = live[i].batches
-                if (sb.isNotEmpty()) at += upload(at, sb)
+                if (sb.isNotEmpty()) at += upload(at, sb, newGen)
             }
         }
 
@@ -1638,12 +1651,17 @@ internal object GlProgram {
             var seg = 0
             for (i in 0..batches.size) {
                 while (seg < live.size && live[seg].at == i) {
-                    use(scratchVbo.id)
                     val segBatches = live[seg++].batches
                     for (k in segBatches.indices) {
                         val b = segBatches[k]
-                        drawBatch(b, liveFirst)
-                        liveFirst += b.colors.size / 4
+                        if (b.arenaGen == newGen) {
+                            use(arenaVbo.id)
+                            drawBatch(b, b.arenaAt / 4)
+                        } else {
+                            use(scratchVbo.id)
+                            drawBatch(b, liveFirst)
+                            liveFirst += b.colors.size / 4
+                        }
                     }
                 }
                 if (i == batches.size) break

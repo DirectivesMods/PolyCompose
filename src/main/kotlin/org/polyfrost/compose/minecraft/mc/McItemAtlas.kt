@@ -1129,6 +1129,8 @@ internal object McItemAtlas {
         /*withGuiProjection(guiWidth, guiHeight) {
             target.bindWrite(true)
             Lighting.turnOnGui()
+            val depthWasEnabled = GL11.glIsEnabled(GL11.GL_DEPTH_TEST)
+            GlStateManager.enableDepthTest()
             GL11.glEnable(GL11.GL_SCISSOR_TEST)
             try {
                 if (clear.isNotEmpty()) {
@@ -1161,6 +1163,7 @@ internal object McItemAtlas {
                 }
             } finally {
                 GL11.glDisable(GL11.GL_SCISSOR_TEST)
+                if (!depthWasEnabled) GlStateManager.disableDepthTest()
                 Lighting.turnOff()
                 mc.mainRenderTarget.bindWrite(true)
             }

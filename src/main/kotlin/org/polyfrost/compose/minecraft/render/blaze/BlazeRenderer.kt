@@ -325,8 +325,7 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
         touchText(lines.maxOf { lineWidth(font, it, literal) }, lines.size, x, y, scale, shadow)
     }
 
-    private fun lineWidth(font: Font, line: String, literal: Boolean): Int =
-        if (literal) font.width(visualOrder(line, true)) else font.width(line)
+    private fun lineWidth(font: Font, line: String, literal: Boolean): Int = TextWidths.of(font, line, literal)
 
     private fun touchText(maxWidth: Int, count: Int, x: Float, y: Float, scale: Float, shadow: Boolean) {
         val font = Minecraft.getInstance().font
@@ -1534,6 +1533,24 @@ private fun textLines(text: String): List<String> =
 private fun needsBidi(c: Char): Boolean =
     c in '\u0590'..'\u08FF' || c in '\uFB1D'..'\uFDFF' || c in '\uFE70'..'\uFEFF' ||
         c == '\u200E' || c == '\u200F' || c in '\u202A'..'\u202E' || c in '\u2066'..'\u2069' || c.isSurrogate()
+
+private object TextWidths {
+    private val plain = HashMap<String, Int>()
+    private val literal = HashMap<String, Int>()
+
+    init {
+        HostEvents.onResourcesReloaded {
+            plain.clear()
+            literal.clear()
+        }
+    }
+
+    fun of(font: Font, line: String, literal: Boolean): Int {
+        val map = if (literal) this.literal else plain
+        if (map.size > 4096) map.clear()
+        return map.getOrPut(line) { if (literal) font.width(visualOrder(line, true)) else font.width(line) }
+    }
+}
 
 private fun visualOrder(line: String, literal: Boolean = false): FormattedCharSequence {
     if (literal && '§' in line) return FormattedCharSequence.forward(line, Style.EMPTY)
