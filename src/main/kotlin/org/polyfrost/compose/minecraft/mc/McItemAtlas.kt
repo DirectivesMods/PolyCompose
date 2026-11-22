@@ -117,6 +117,10 @@ import net.minecraft.world.item.Items
 /*import net.minecraft.client.render.platform.Lighting
 *///?}
 
+interface GuiItemRenderer {
+    fun guiItem(stack: ItemStack, x: Float, y: Float, w: Float, h: Float): Boolean
+}
+
 interface McItemIconHandle : AutoCloseable {
     val stack: ItemStack
 
@@ -243,6 +247,7 @@ internal object McItemAtlas {
         val atlasSource = FloatArray(4)
         var atlas: AtlasState? = null
         var animated = false
+        var drawnLive = false
         var foil = false
         var special = false
         var specialRefreshAtNs = 0L
@@ -345,6 +350,11 @@ internal object McItemAtlas {
         override fun draw(ctx: RenderContext, x: Float, y: Float, w: Float, h: Float, alpha: Float): Boolean {
             if (closedFlag || w <= 0f || h <= 0f) return false
             revisionState.intValue
+            if (animated && alpha >= 1f && (ctx.renderer as? GuiItemRenderer)?.guiItem(stack, x, y, w, h) == true) {
+                drawnLive = true
+                return true
+            }
+            drawnLive = false
             drawnAt(renderPx(ctx, maxOf(w, h)))
             if (!available.value) return false
             val state = readyAtlas(this) ?: return false
@@ -737,7 +747,7 @@ internal object McItemAtlas {
                 markResolved(entry)
             }
             val specialRefresh = entry.special && now - entry.specialRefreshAtNs >= 0
-            if (resolvedChanged || (entry.animated && animatedDue) || rebuild || specialRefresh) {
+            if (resolvedChanged || (entry.animated && !entry.drawnLive && animatedDue) || rebuild || specialRefresh) {
                 changed.add(entry)
                 if (entry.special) entry.specialRefreshAtNs = now + SPECIAL_REFRESH_NS
             }

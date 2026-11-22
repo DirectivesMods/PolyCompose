@@ -42,6 +42,7 @@ import java.util.function.IntSupplier
 import net.minecraft.client.Minecraft
 import net.minecraft.client.gui.GuiGraphicsExtractor
 import net.minecraft.client.gui.navigation.ScreenRectangle
+import net.minecraft.world.item.ItemStack
 import net.minecraft.client.gui.render.TextureSetup
 //? if >= 26.1 {
 import net.minecraft.client.renderer.state.gui.GuiElementRenderState
@@ -91,6 +92,7 @@ import org.polyfrost.compose.host.HostCallbacks
 import org.polyfrost.compose.host.OverlayRenderer
 import org.polyfrost.compose.minecraft.mc.McItemAtlas
 import org.polyfrost.compose.minecraft.platform.HostEvents
+import org.polyfrost.compose.minecraft.mc.GuiItemRenderer
 import org.polyfrost.compose.minecraft.platform.McWindow
 import org.polyfrost.compose.minecraft.render.gl.GlHost
 import org.polyfrost.compose.minecraft.render.gl.guiHidden
@@ -115,7 +117,7 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boolean = false) : PolyTessellator(), TextureRenderer, CapturingRenderer {
+class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boolean = false) : PolyTessellator(), TextureRenderer, CapturingRenderer, GuiItemRenderer {
     private val ops = ArrayList<(GuiGraphicsExtractor) -> Unit>()
     private val bitmapLog = ArrayList<PolyBitmap>()
 
@@ -409,6 +411,19 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
             else if (formatted || Language.getInstance().isDefaultRightToLeft) bakeText(font, seq, m, c, shadow, scissor)
             else GlyphQuads.bake(font, line, m, c, shadow, scissor) ?: bakeText(font, seq, m, c, shadow, scissor)
         ops.add(BakedTextOp(baked, c) { g, color -> vanillaText(g, font, seq, m, color, shadow, scissor) })
+    }
+
+    override fun guiItem(stack: ItemStack, x: Float, y: Float, w: Float, h: Float): Boolean {
+        val s = state
+        if (s.proj != null || s.rot != null || s.alpha < 1f || !finiteText(x, y, 1f) || w <= 0f || h <= 0f) return false
+        flush()
+        val scissor = s.clip?.let { rectGui(it[0], it[1], it[2], it[3]) ?: return true }
+        val b = deviceBox(x * s.sx + s.tx, y * s.sy + s.ty, (x + w) * s.sx + s.tx, (y + h) * s.sy + s.ty)
+        beginDraw()
+        touch(b[0], b[1], b[2], b[3])
+        val m = guiPose().translate(x * s.sx + s.tx, y * s.sy + s.ty).scale(s.sx * w / 16f, s.sy * h / 16f)
+        ops.add { g -> vanillaItem(g, stack, m, scissor) }
+        return true
     }
 
     override fun mcTextLive(text: String, x: Float, y: Float, color: () -> Int, shadow: Boolean, scale: Float) {
@@ -1408,6 +1423,16 @@ private fun vanillaText(g: GuiGraphicsExtractor, font: Font, seq: FormattedCharS
     g.pose().mul(m)
     //~ if >= 26.1 'drawString' -> 'text'
     g.text(font, seq, 0, 0, c, shadow)
+    g.pose().popMatrix()
+    if (scissor != null) g.disableScissor()
+}
+
+private fun vanillaItem(g: GuiGraphicsExtractor, stack: ItemStack, m: Matrix3x2f, scissor: ScreenRectangle?) {
+    if (scissor != null) g.enableScissor(scissor.left(), scissor.top(), scissor.right(), scissor.bottom())
+    g.pose().pushMatrix()
+    g.pose().mul(m)
+    //~ if >= 26.1 'renderItem' -> 'item'
+    g.item(stack, 0, 0)
     g.pose().popMatrix()
     if (scissor != null) g.disableScissor()
 }
