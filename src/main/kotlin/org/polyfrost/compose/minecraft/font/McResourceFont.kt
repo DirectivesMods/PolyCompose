@@ -229,7 +229,7 @@ internal object McResourceFont {
         val stack = runCatching { rm.getResourceStack(id(ref, "font/", ".json")) }.getOrDefault(emptyList())
         // vanilla lets the highest-priority pack's providers go first
         for (resource in stack.asReversed()) {
-            val root = runCatching { resource.open().use { HostJson.parseOrNull(String(it.readBytes(), Charsets.UTF_8)) } }.getOrNull()
+            val root = runCatching { resource.open().use { HostJson.parseOrNull(String(it.readAllBytes(), Charsets.UTF_8)) } }.getOrNull()
             val providers = (root as? JsonObject)?.getAsJsonArray("providers") ?: continue
             for (element in providers) {
                 val provider = element as? JsonObject ?: continue
@@ -396,7 +396,7 @@ internal object McResourceFont {
     }
 
     private fun read(rm: ResourceManager, ref: String, folder: String): ByteArray? =
-        runCatching { rm.getResource(id(ref, folder)).getOrNull()?.open()?.use { it.readBytes() } }.getOrNull()
+        runCatching { rm.getResource(id(ref, folder)).getOrNull()?.open()?.use { it.readAllBytes() } }.getOrNull()
 
     private fun id(ref: String, folder: String, suffix: String = "") =
         //~ if = 1.8.9 'Identifier.fromNamespaceAndPath' -> 'NamespacedIdentifiers.from'
