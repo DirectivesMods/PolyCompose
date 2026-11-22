@@ -399,6 +399,7 @@ internal object McItemAtlas {
     private var lastViewportW = 0
     private var lastViewportH = 0
     private var frameHook: AutoCloseable? = null
+    private var extractHook: AutoCloseable? = null
     private var tickHook: AutoCloseable? = null
     private var reloadHook: AutoCloseable? = null
     private var initializationStarted = false
@@ -425,13 +426,21 @@ internal object McItemAtlas {
 
     private fun ensureHooks() {
         if (frameHook == null) frameHook = McFrameHooks.beforeUi(::renderAll)
-        if (tickHook == null) tickHook = HostEvents.onClientTick(::onTick)
+        // on 26.1+ HUDs are drawn before beforeUi, so the atlas also has to be ready here
+        if (extractHook == null) extractHook = McFrameHooks.beforeExtract(::renderAll)
+        if (tickHook == null) {
+            // remember the current world so the first tick only clears the atlas if the world changed
+            lastLevel = Minecraft.getInstance().level
+            tickHook = HostEvents.onClientTick(::onTick)
+        }
         if (reloadHook == null) reloadHook = HostEvents.onResourcesReloaded(::clearCaches)
     }
 
     private fun releaseHooks() {
         frameHook?.close()
         frameHook = null
+        extractHook?.close()
+        extractHook = null
         tickHook?.close()
         tickHook = null
         reloadHook?.close()
@@ -482,11 +491,9 @@ internal object McItemAtlas {
         if (level !== lastLevel) {
             val hadLevel = lastLevel != null
             lastLevel = level
-            if (level != null) {
-                if (!available.value) markAvailable()
-                if (hadLevel || atlases.isNotEmpty()) clearCaches()
-            }
+            if (level != null && (hadLevel || atlases.isNotEmpty())) clearCaches()
         }
+        if (level != null && !available.value) markAvailable()
         val w = McWindow.viewportWidth()
         val h = McWindow.viewportHeight()
         if (w != lastViewportW || h != lastViewportH) {
