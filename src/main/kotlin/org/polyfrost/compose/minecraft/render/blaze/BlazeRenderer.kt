@@ -363,7 +363,7 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
         val c = mulAlpha(color, state.alpha)
         if (c ushr 24 == 0) return
         val scissor = state.clip?.let { rectGui(it[0], it[1], it[2], it[3]) ?: return }
-        val lines = text.lines()
+        val lines = textLines(text)
         touchText(lines, x, y, scale, shadow, literal)
         val font = Minecraft.getInstance().font
         lines.forEachIndexed { index, line ->
@@ -389,7 +389,7 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
         flush()
         val alpha = state.alpha
         val scissor = state.clip?.let { rectGui(it[0], it[1], it[2], it[3]) ?: return }
-        val lines = text.lines()
+        val lines = textLines(text)
         touchText(lines, x, y, scale, shadow, false)
         val font = Minecraft.getInstance().font
         lines.forEachIndexed { index, line ->
@@ -489,7 +489,7 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
         val font = Minecraft.getInstance().font
         val s = state
         val cap = GlyphCapture()
-        text.lines().forEachIndexed { index, line ->
+        textLines(text).forEachIndexed { index, line ->
             if (line.isEmpty()) return@forEachIndexed
             val pose = Matrix4f()
                 .translation(x * s.sx + s.tx, (y + index * font.lineHeight * scale) * s.sy + s.ty, 0f)
@@ -1234,10 +1234,17 @@ private object GlyphQuads {
     }
 }
 
+private fun textLines(text: String): List<String> =
+    if (text.indexOf('\n') < 0 && text.indexOf('\r') < 0) listOf(text) else text.lines()
+
+private fun needsBidi(c: Char): Boolean =
+    c in '\u0590'..'\u08FF' || c in '\uFB1D'..'\uFDFF' || c in '\uFE70'..'\uFEFF' ||
+        c == '\u200E' || c == '\u200F' || c in '\u202A'..'\u202E' || c in '\u2066'..'\u2069' || c.isSurrogate()
+
 private fun visualOrder(line: String, literal: Boolean = false): FormattedCharSequence {
     if (literal && '§' in line) return FormattedCharSequence.forward(line, Style.EMPTY)
     val lang = Language.getInstance()
-    if (!lang.isDefaultRightToLeft && line.all { it < '\u0590' }) {
+    if (!lang.isDefaultRightToLeft && line.none(::needsBidi)) {
         return if ('§' in line) FormattedCharSequence { sink -> StringDecomposer.iterateFormatted(line, Style.EMPTY, sink) }
         else FormattedCharSequence.forward(line, Style.EMPTY)
     }
@@ -1273,7 +1280,7 @@ internal object McOutlines {
         val key = Key(text, kx, ky, (fx * 8f).roundToInt() / 8f, (fy * 8f).roundToInt() / 8f, literal)
         entries[key]?.let { return it }
         val font = Minecraft.getInstance().font
-        val lines = text.lines()
+        val lines = textLines(text)
         val width = lines.maxOf { font.width(visualOrder(it, literal)) }
         val pad = ceil(PAD_FONT_PX * max(kx, ky))
         val w = ceil(pad * 2f + width * kx + 1f)
