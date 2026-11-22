@@ -1,5 +1,6 @@
 package org.polyfrost.compose.minecraft.render.gl
 
+import androidx.compose.runtime.snapshots.SnapshotStateObserver
 import com.mojang.blaze3d.pipeline.RenderTarget
 import net.minecraft.client.Minecraft
 import net.minecraft.client.renderer.texture.AbstractTexture
@@ -331,13 +332,13 @@ object GlHost {
         hudFresh = false
         val generation = McItemAtlas.contentGeneration
         if (generation != hudAtlasGeneration && !GlRenderer.Layer.samplesAtlas(stableLayer, volatileLayer)) hudAtlasGeneration = generation
-        if (generation == hudAtlasGeneration && (fresh || !GlRenderer.Layer.dirty(stableLayer, volatileLayer))) return
+        if (!liveStale && generation == hudAtlasGeneration && (fresh || !GlRenderer.Layer.dirty(stableLayer, volatileLayer))) return
         val fbo = RenderTargetFbo.getFboId(rt)
         if (fbo <= 0) return
         hudAtlasGeneration = generation
         gl.capture()
         try {
-            GlRenderer.Layer.draw(fbo, rt.width, rt.height, topDown = true, clear = true, stableLayer, volatileLayer)
+            paintHud(fbo, rt.width, rt.height)
         } catch (e: Throwable) {
             HostErrors.warn("GlHost.blitHud() error", e)
         } finally {
@@ -354,7 +355,7 @@ object GlHost {
             val h = McWindow.viewportHeight()
             if (w > 0 && h > 0) {
                 if (GLX.useFbo()) {
-                    hudCache.draw(fbo, w, h, stableLayer, volatileLayer)
+                    hudCache.draw(fbo, w, h, stableLayer, volatileLayer, liveStale, hudReads)
                 } else {
                     hudCache.invalidate()
                     GlRenderer.Layer.draw(fbo, w, h, topDown = false, clear = false, stableLayer, volatileLayer)
@@ -847,6 +848,27 @@ object GlHost {
         return renderer
     }
 
+    // live canvases only run while the HUD target is painted, so repaint it when state they read changes
+    private val liveReads = SnapshotStateObserver { it() }.also { it.start() }
+    @Volatile private var liveStale = false
+    private val onLiveStateChanged: (Any) -> Unit = { liveStale = true }
+
+    //? if = 1.8.9 {
+    /*private val hudReads = GlRenderer.Layer.LiveReads { block ->
+        liveStale = false
+        var painted = false
+        liveReads.observeReads(this, onLiveStateChanged) { painted = block.run() }
+        painted
+    }
+    *///?}
+
+    private fun paintHud(fbo: Int, w: Int, h: Int) {
+        liveStale = false
+        liveReads.observeReads(this, onLiveStateChanged) {
+            GlRenderer.Layer.draw(fbo, w, h, topDown = true, clear = true, stableLayer, volatileLayer)
+        }
+    }
+
     fun drawHudGl(draw: (RenderContext, RenderContext?) -> Unit): Boolean {
         //? if = 1.21.1 {
         /*if (vanillaPipeline) {
@@ -884,7 +906,7 @@ object GlHost {
             draw(RenderContext(stable), RenderContext(volatile))
             stableLayer.take(stable)
             volatileLayer.take(volatile)
-            GlRenderer.Layer.draw(fbo, rt.width, rt.height, topDown = true, clear = true, stableLayer, volatileLayer)
+            paintHud(fbo, rt.width, rt.height)
             hudFresh = true
             hudAtlasGeneration = McItemAtlas.contentGeneration
             return true
@@ -896,6 +918,7 @@ object GlHost {
         }
         //?}
     }
+
 
     private fun resolveHudTarget(): RenderTarget? {
         val w = McWindow.viewportWidth()

@@ -16,10 +16,38 @@ object McFrameHooks {
     }
 
     private fun remove(callback: Runnable) {
-        synchronized(lock) {
-            val current = beforeUi
-            val index = current.indexOf(callback)
-            if (index >= 0) beforeUi = current.filterIndexed { i, _ -> i != index }.toTypedArray()
+        synchronized(lock) { beforeUi = without(beforeUi, callback) }
+    }
+
+    @Volatile
+    private var beforeExtract: Array<Runnable> = emptyArray()
+    private var extracting = false
+
+    /** For 26.1+: like [beforeUi], but runs before GUI extraction, which happens before rendering */
+    @JvmStatic
+    fun beforeExtract(callback: Runnable): AutoCloseable {
+        synchronized(lock) { beforeExtract += callback }
+        return AutoCloseable { synchronized(lock) { beforeExtract = without(beforeExtract, callback) } }
+    }
+
+    private fun without(current: Array<Runnable>, callback: Runnable): Array<Runnable> {
+        val index = current.indexOf(callback)
+        return if (index < 0) current else current.filterIndexed { i, _ -> i != index }.toTypedArray()
+    }
+
+    @ApiStatus.Internal
+    @JvmStatic
+    fun runBeforeExtract() {
+        val hooks = beforeExtract
+        if (hooks.isEmpty() || extracting) return
+        extracting = true
+        try {
+            for (i in hooks.indices) {
+                val hook = hooks[i]
+                HostCallbacks.call(hook, "A pre-extract frame hook", Unit) { hook.run() }
+            }
+        } finally {
+            extracting = false
         }
     }
 

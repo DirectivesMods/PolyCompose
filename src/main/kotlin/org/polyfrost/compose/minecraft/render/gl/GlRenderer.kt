@@ -663,6 +663,14 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
             return false
         }
 
+        fun interface LiveReads {
+            fun observe(block: Block): Boolean
+
+            fun interface Block {
+                fun run(): Boolean
+            }
+        }
+
         class Cache {
             private val target = GlTarget()
             private var vbo: GlProgram.Vbo? = null
@@ -681,27 +689,37 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
                 valid = false
             }
 
-            fun draw(fbo: Int, w: Int, h: Int, first: Layer, second: Layer) {
+            fun draw(fbo: Int, w: Int, h: Int, first: Layer, second: Layer, force: Boolean = false, reads: LiveReads? = null) {
                 val generation = McItemAtlas.contentGeneration
-                val changed = touched || first.changed() || second.changed() || (generation != atlasGeneration && samplesAtlas(first, second))
+                val changed = touched || force || first.changed() || second.changed() || (generation != atlasGeneration && samplesAtlas(first, second))
                 touched = false
                 atlasGeneration = generation
                 streak = if (changed) streak + 1 else 0
                 try {
                     first.appendTo(all)
                     second.appendTo(all)
-                    if (streak > 1 || !first.plain || !second.plain) return direct(fbo, w, h, liveSegments(first, second))
-                    if (changed || !valid || target.width != w || target.height != h) {
-                        val segs = liveSegments(first, second)
-                        if (!plainSegments(segs) || !target.ensure(w, h)) return direct(fbo, w, h, segs)
-                        drawBatches(target.fbo, w, h, true, true, all, segs, false, true)
-                        valid = true
+                    val direct = streak > 1 || !first.plain || !second.plain
+                    if (direct || changed || !valid || target.width != w || target.height != h) {
+                        val run = LiveReads.Block { paint(fbo, w, h, first, second, direct) }
+                        val cached = reads?.observe(run) ?: run.run()
+                        if (!cached) return
                     }
                     drawBatches(fbo, w, h, false, false, quad(w, h), emptyList(), false, false, vbo ?: GlProgram.retain().also { vbo = it })
                 } finally {
                     all.clear()
                     allSegments.clear()
                 }
+            }
+
+            private fun paint(fbo: Int, w: Int, h: Int, first: Layer, second: Layer, direct: Boolean): Boolean {
+                val segs = liveSegments(first, second)
+                if (direct || !plainSegments(segs) || !target.ensure(w, h)) {
+                    direct(fbo, w, h, segs)
+                    return false
+                }
+                drawBatches(target.fbo, w, h, true, true, all, segs, false, true)
+                valid = true
+                return true
             }
 
             private fun direct(fbo: Int, w: Int, h: Int, segs: List<GlProgram.Segment>) {
