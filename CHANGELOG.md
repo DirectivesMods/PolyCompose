@@ -1,5 +1,10 @@
 # Changelog
 
+## [3.0.3]
+
+- Fixed `NodeMcItemIcon` sometimes still drawing the old item after its stack changed
+- Improved performance on 1.8.9 by no longer querying and rebinding the main framebuffer every frame to find its ID
+
 ## [3.0.2]
 
 - Fixed item icons in HUDs showing up blank for their first frame
