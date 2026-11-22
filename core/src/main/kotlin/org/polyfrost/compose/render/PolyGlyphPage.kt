@@ -1,5 +1,6 @@
 package org.polyfrost.compose.render
 
+import java.nio.IntBuffer
 import java.util.WeakHashMap
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
@@ -50,9 +51,107 @@ public object PolyGlyphPage {
     }
 
     public class Page internal constructor(private val shared: Boolean = true) {
-        @JvmField
-        public val pixels: IntArray = IntArray(SIZE * SIZE).also { px ->
-            for (y in 0 until WHITE) for (x in 0 until WHITE) px[(PAD + y) * SIZE + PAD + x] = -1
+        private val full: IntArray? = if (shared) null else IntArray(SIZE * SIZE)
+        private val alpha = arrayOfNulls<ByteArray>(if (shared) STRIPS else 0)
+        private val inked = arrayOfNulls<LongArray>(if (shared) STRIPS else 0)
+        private val argb = arrayOfNulls<IntArray>(if (shared) STRIPS else 0)
+
+        public val pixels: IntArray
+            get() = full ?: IntArray(SIZE * SIZE).also { out -> for (y in 0 until SIZE) readRow(y, out, y * SIZE) }
+
+        @ApiStatus.Internal
+        public fun readRow(y: Int, out: IntArray, offset: Int) {
+            val full = full
+            if (full != null) {
+                full.copyInto(out, offset, y * SIZE, y * SIZE + SIZE)
+                return
+            }
+            val s = y / STRIP_ROWS
+            val at = (y - s * STRIP_ROWS) * SIZE
+            val ints = argb[s]
+            if (ints != null) {
+                ints.copyInto(out, offset, at, at + SIZE)
+                return
+            }
+            val bytes = alpha[s]
+            val ink = inked[s]
+            if (bytes == null || ink == null) {
+                out.fill(0, offset, offset + SIZE)
+                return
+            }
+            for (x in 0 until SIZE) {
+                val i = at + x
+                out[offset + x] = if ((ink[i ushr 6] and (1L shl i)) != 0L) ((bytes[i].toInt() and 0xFF) shl 24) or 0xFFFFFF else 0
+            }
+        }
+
+        @ApiStatus.Internal
+        public fun readRows(first: Int, count: Int, out: IntBuffer) {
+            val full = full
+            if (full != null) {
+                out.put(full, first * SIZE, count * SIZE)
+                return
+            }
+            var row: IntArray? = null
+            for (y in first until first + count) {
+                val s = y / STRIP_ROWS
+                val ints = argb[s]
+                if (ints != null) {
+                    out.put(ints, (y - s * STRIP_ROWS) * SIZE, SIZE)
+                } else {
+                    var buf = row
+                    if (buf == null) {
+                        buf = IntArray(SIZE)
+                        row = buf
+                    }
+                    readRow(y, buf, 0)
+                    out.put(buf)
+                }
+            }
+        }
+
+        private fun writeCoverage(x: Int, y: Int, src: ByteArray, from: Int, w: Int) {
+            val full = full
+            if (full != null) {
+                val row = y * SIZE + x
+                for (gx in 0 until w) full[row + gx] = ((src[from + gx].toInt() and 0xFF) shl 24) or 0xFFFFFF
+                return
+            }
+            val s = y / STRIP_ROWS
+            val at = (y - s * STRIP_ROWS) * SIZE + x
+            val ints = argb[s]
+            if (ints != null) {
+                for (gx in 0 until w) ints[at + gx] = ((src[from + gx].toInt() and 0xFF) shl 24) or 0xFFFFFF
+                return
+            }
+            val bytes = alpha[s] ?: ByteArray(STRIP_ROWS * SIZE).also { alpha[s] = it }
+            val ink = inked[s] ?: LongArray(STRIP_ROWS * SIZE / 64).also { inked[s] = it }
+            src.copyInto(bytes, at, from, from + w)
+            for (i in at until at + w) ink[i ushr 6] = ink[i ushr 6] or (1L shl i)
+        }
+
+        private fun writeArgb(x: Int, y: Int, src: IntArray, w: Int) {
+            val full = full
+            if (full != null) {
+                src.copyInto(full, y * SIZE + x, 0, w)
+                return
+            }
+            val s = y / STRIP_ROWS
+            src.copyInto(argbStrip(s), (y - s * STRIP_ROWS) * SIZE + x, 0, w)
+        }
+
+        private fun argbStrip(s: Int): IntArray {
+            argb[s]?.let { return it }
+            val ints = IntArray(STRIP_ROWS * SIZE)
+            val bytes = alpha[s]
+            val ink = inked[s]
+            if (bytes != null && ink != null) {
+                for (i in ints.indices) if ((ink[i ushr 6] and (1L shl i)) != 0L) ints[i] = ((bytes[i].toInt() and 0xFF) shl 24) or 0xFFFFFF
+            }
+            argb[s] = ints
+            alpha[s] = null
+            inked[s] = null
+            return ints
         }
 
         public var version: Int = 1
@@ -68,6 +167,8 @@ public object PolyGlyphPage {
 
         init {
             if (shared) revision++
+            val white = ByteArray(WHITE) { -1 }
+            for (y in 0 until WHITE) writeCoverage(PAD, PAD + y, white, 0, WHITE)
         }
 
         /** The rows written to since [version] was [since], so only those need uploading again. Empty if there are none. */
@@ -106,11 +207,7 @@ public object PolyGlyphPage {
             if (at < 0) return null
             val x = at ushr 16
             val y = at and 0xFFFF
-            for (gy in 0 until r.h) {
-                val row = (y + gy) * SIZE + x
-                val src = gy * r.w
-                for (gx in 0 until r.w) pixels[row + gx] = ((r.coverage[src + gx].toInt() and 0xFF) shl 24) or 0xFFFFFF
-            }
+            for (gy in 0 until r.h) writeCoverage(x, y + gy, r.coverage, gy * r.w, r.w)
             return Glyph(this, r.offX, r.offY, r.w, r.h, x / SIZE.toFloat(), y / SIZE.toFloat(), (x + r.w) / SIZE.toFloat(), (y + r.h) / SIZE.toFloat())
         }
 
@@ -123,10 +220,14 @@ public object PolyGlyphPage {
             val x = (at ushr 16) + 1
             val y = (at and 0xFFFF) + 1
             val px = b.pixels
-            for (gy in -1..h) for (gx in -1..w) {
-                val o = (gy.coerceIn(0, h - 1) * w + gx.coerceIn(0, w - 1)) * 4
-                pixels[(y + gy) * SIZE + x + gx] = ((px[o + 3].toInt() and 0xFF) shl 24) or ((px[o + 2].toInt() and 0xFF) shl 16) or
-                    ((px[o + 1].toInt() and 0xFF) shl 8) or (px[o].toInt() and 0xFF)
+            val row = IntArray(w + 2)
+            for (gy in -1..h) {
+                for (gx in -1..w) {
+                    val o = (gy.coerceIn(0, h - 1) * w + gx.coerceIn(0, w - 1)) * 4
+                    row[gx + 1] = ((px[o + 3].toInt() and 0xFF) shl 24) or ((px[o + 2].toInt() and 0xFF) shl 16) or
+                        ((px[o + 1].toInt() and 0xFF) shl 8) or (px[o].toInt() and 0xFF)
+                }
+                writeArgb(x - 1, y + gy, row, w + 2)
             }
             return Glyph(this, offX, offY, w, h, x / SIZE.toFloat(), y / SIZE.toFloat(), (x + w) / SIZE.toFloat(), (y + h) / SIZE.toFloat(), color)
         }
@@ -203,6 +304,8 @@ public object PolyGlyphPage {
     }
 
     public const val SIZE: Int = 1024
+    private const val STRIP_ROWS = 32
+    private const val STRIPS = SIZE / STRIP_ROWS
     private const val PAD = 1
     private const val WHITE = 2
     private const val INITIAL_SLOTS = 32
@@ -266,7 +369,10 @@ public object PolyGlyphPage {
         for (a in recent) if (a != null && a.matches(face, bucket, lum, outline, ring)) return a
         val list = atlases.getOrPut(face) { ArrayList(4) }
         var hit: Atlas? = null
-        for (a in list) if (a.matches(face, bucket, lum, outline, ring)) { hit = a; break }
+        for (i in list.indices) {
+            val a = list[i]
+            if (a.matches(face, bucket, lum, outline, ring)) { hit = a; break }
+        }
         if (hit == null) {
             hit = Atlas(face, bucket, lum, outline, ring)
             if (outline == 0 && list.none { it.bucket == bucket && it.outline == 0 }) moved(face, bucket)

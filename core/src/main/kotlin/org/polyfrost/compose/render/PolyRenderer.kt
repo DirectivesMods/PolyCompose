@@ -1,5 +1,6 @@
 package org.polyfrost.compose.render
 
+import java.util.function.IntSupplier
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -102,6 +103,9 @@ public interface PolyRenderer {
     public fun mcTextLive(text: String, x: Float, y: Float, color: () -> Int, shadow: Boolean, scale: Float, literal: Boolean): Unit =
         if (literal) live { it.mcText(text, x, y, color(), shadow, scale, true) } else mcTextLive(text, x, y, color, shadow, scale)
 
+    public fun mcTextLive(text: String, x: Float, y: Float, color: IntSupplier, shadow: Boolean, scale: Float, literal: Boolean): Unit =
+        mcTextLive(text, x, y, { color.asInt }, shadow, scale, literal)
+
     public fun image(bitmap: PolyBitmap, x: Float, y: Float, w: Float, h: Float, filterQuality: FilterQuality = FilterQuality.Low): Unit =
         image(bitmap, x, y, w, h, 0f, 0f, 1f, 1f, -1, filterQuality)
 
@@ -110,6 +114,8 @@ public interface PolyRenderer {
     public fun live(draw: (PolyRenderer) -> Unit)
 
     public fun live(x: Float, y: Float, w: Float, h: Float, key: () -> Int, draw: (PolyRenderer) -> Unit): Unit = live(draw)
+
+    public fun live(x: Float, y: Float, w: Float, h: Float, key: IntSupplier, draw: (PolyRenderer) -> Unit): Unit = live(x, y, w, h, { key.asInt }, draw)
 
     public fun backdropGlass(x: Float, y: Float, w: Float, h: Float, radius: Float, band: Float, refraction: Float, alpha: Float) {}
 

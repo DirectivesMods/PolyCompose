@@ -55,6 +55,7 @@ public object McGlyphs {
     @JvmStatic
     public fun width(text: String, scale: Float, literal: Boolean): Float {
         val source = source
+        val cache = if (source != null) cacheFor(source) else null
         var w = 0f
         var bold = false
         var i = 0
@@ -66,10 +67,36 @@ public object McGlyphs {
                 if (code == 'l') bold = true else if (code == 'r' || code in '0'..'9' || code in 'a'..'f') bold = false
                 continue
             }
-            val g = source?.invoke(cp)
+            val g = if (cache != null && cp < CACHE) cached(cache, cp) else source?.invoke(cp)
             w += if (g == null) bundledAdvance(cp, bold) else if (bold) g.advance + g.offset else g.advance
         }
         return w * scale
+    }
+
+    private const val CACHE = 0x800
+
+    private val MISSING = Any()
+
+    private class GlyphCache(val source: (Int) -> McGlyph?, val revision: Int) {
+        val glyphs = arrayOfNulls<Any>(CACHE)
+    }
+
+    @Volatile
+    private var glyphCache: GlyphCache? = null
+
+    private fun cacheFor(source: (Int) -> McGlyph?): GlyphCache {
+        val revision = FontManager.revision
+        val c = glyphCache
+        if (c != null && c.source === source && c.revision == revision) return c
+        return GlyphCache(source, revision).also { glyphCache = it }
+    }
+
+    private fun cached(cache: GlyphCache, cp: Int): McGlyph? {
+        val hit = cache.glyphs[cp]
+        if (hit != null) return if (hit === MISSING) null else hit as McGlyph
+        val g = cache.source(cp)
+        cache.glyphs[cp] = g ?: MISSING
+        return g
     }
 
     internal fun available(): Boolean = source != null || PolyGlyphPage.rasterizer?.face("minecraft") != null

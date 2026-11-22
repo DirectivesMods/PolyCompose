@@ -1,11 +1,13 @@
 package org.polyfrost.compose.minecraft.render.gl
 
+import org.lwjgl.opengl.GL
 import org.lwjgl.opengl.GL11
 import org.lwjgl.BufferUtils
 import org.lwjgl.opengl.GL15
 import org.lwjgl.opengl.GL20
 import org.lwjgl.opengl.GL21
 import org.lwjgl.opengl.GL30
+import org.lwjgl.opengl.GL32
 import org.polyfrost.compose.host.BackdropSample
 import org.polyfrost.compose.minecraft.platform.HostEvents
 import org.polyfrost.compose.render.PolyLiquidSamples
@@ -19,6 +21,7 @@ internal object GlGlass {
         var pending = false
         var frame = 0L
         var usedAt = 0L
+        var fence = 0L
     }
 
     object Global
@@ -42,6 +45,8 @@ internal object GlGlass {
     private var sampleRetryAt = 0L
     private var sampleDisabled = false
     private var sweptAt = 0L
+    private var syncChecked = false
+    private var syncSupported = false
     private val sampleBytes: ByteBuffer by lazy { BufferUtils.createByteBuffer(SAMPLE * SAMPLE * 4) }
 
     private const val SAMPLE = 8
@@ -97,7 +102,10 @@ internal object GlGlass {
     private fun releaseSample() {
         if (sampleFbo != 0) GlFbo.delete(sampleFbo)
         if (sampleTex != 0) GL11.glDeleteTextures(sampleTex)
-        for (slot in slots.values) GL15.glDeleteBuffers(slot.pbo)
+        for (slot in slots.values) {
+            deleteFence(slot)
+            GL15.glDeleteBuffers(slot.pbo)
+        }
         slots.clear()
         anyPending = false
         sampleFbo = 0
@@ -109,6 +117,7 @@ internal object GlGlass {
         while (it.hasNext()) {
             val slot = it.next()
             if (!slot.pending && now - slot.usedAt > IDLE_NANOS) {
+                deleteFence(slot)
                 GL15.glDeleteBuffers(slot.pbo)
                 it.remove()
             }
@@ -125,22 +134,47 @@ internal object GlGlass {
             }
         }
         val slot = slots.remove(oldest ?: return) ?: return
+        deleteFence(slot)
         GL15.glDeleteBuffers(slot.pbo)
+    }
+
+    private fun syncSupported(): Boolean {
+        if (!syncChecked) {
+            syncChecked = true
+            syncSupported = runCatching { GL.getCapabilities().OpenGL32 }.getOrDefault(false)
+        }
+        return syncSupported
+    }
+
+    private fun ready(slot: Slot): Boolean {
+        val fence = slot.fence
+        if (fence == 0L) return true
+        val status = GL32.glClientWaitSync(fence, 0, 0L)
+        return status == GL32.GL_ALREADY_SIGNALED || status == GL32.GL_CONDITION_SATISFIED || status == GL32.GL_WAIT_FAILED
+    }
+
+    private fun deleteFence(slot: Slot) {
+        val fence = slot.fence
+        if (fence == 0L) return
+        slot.fence = 0L
+        GL32.glDeleteSync(fence)
     }
 
     fun resolve() {
         if (!anyPending) return
         val frame = HostEvents.frame
         var still = false
-        val previousPackBuffer = GL11.glGetInteger(GL21.GL_PIXEL_PACK_BUFFER_BINDING)
+        var previousPackBuffer = -1
         try {
             for ((key, slot) in slots) {
                 if (!slot.pending) continue
-                if (slot.frame >= frame) {
+                if (slot.frame >= frame || !ready(slot)) {
                     still = true
                     continue
                 }
                 slot.pending = false
+                deleteFence(slot)
+                if (previousPackBuffer < 0) previousPackBuffer = GL11.glGetInteger(GL21.GL_PIXEL_PACK_BUFFER_BINDING)
                 GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, slot.pbo)
                 val bytes = sampleBytes
                 bytes.clear()
@@ -159,7 +193,7 @@ internal object GlGlass {
         } catch (e: Throwable) {
             sampleFailed(e)
         } finally {
-            GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, previousPackBuffer)
+            if (previousPackBuffer >= 0) GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, previousPackBuffer)
         }
     }
 
@@ -206,6 +240,7 @@ internal object GlGlass {
             GL11.glPixelStorei(GL11.GL_PACK_SKIP_PIXELS, 0)
             GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, 1)
             GL11.glReadPixels(0, 0, SAMPLE, SAMPLE, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, 0L)
+            if (syncSupported()) slot.fence = GL32.glFenceSync(GL32.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
             slot.pending = true
             slot.frame = HostEvents.frame
             anyPending = true

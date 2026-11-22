@@ -6,9 +6,14 @@ import org.polyfrost.compose.render.RenderContext
 public class ImageNode(
     private var image: PolyBitmap
 ) : PolyNode() {
+    override val tracksChanges: Boolean get() = true
+
     internal fun setImage(value: PolyBitmap) {
         image = value
+        val w = intrinsicWidth
+        val h = intrinsicHeight
         remeasure()
+        if (intrinsicWidth != w || intrinsicHeight != h) layoutChanged()
     }
 
     public fun remeasure() {

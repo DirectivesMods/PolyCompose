@@ -50,27 +50,30 @@ public object PolyLayoutEngine {
             is PolySize.Percent -> parentSize * size.value
             PolySize.Fill -> parentSize
             PolySize.Wrap -> {
+                val ns = node.style
                 val intrinsic = if (horizontal) node.intrinsicWidth else node.intrinsicHeight
-                val padding = if (horizontal) node.style.padding.horizontal else node.style.padding.vertical
+                val padding = if (horizontal) ns.padding.horizontal else ns.padding.vertical
                 if (intrinsic >= 0f) return intrinsic + padding
-                val gap = node.style.gap
+                val gap = ns.gap
                 val children = node.children
                 var n = 0
-                for (i in children.indices) if (children[i].style.positionMode != PolyPositionMode.Absolute) n++
-                val gaps = if (n > 1) gap * (n - 1) else 0f
-                val sums = if (horizontal) node.style.layoutType == LayoutType.Row else node.style.layoutType == LayoutType.Column
+                val sums = if (horizontal) ns.layoutType == LayoutType.Row else ns.layoutType == LayoutType.Column
                 var content = 0f
                 var hasFill = false
                 for (i in children.indices) {
                     val c = children[i]
-                    if (c.style.positionMode == PolyPositionMode.Absolute) continue
-                    val childSize = if (horizontal) c.style.width else c.style.height
-                    if (childSize === PolySize.Fill) hasFill = true
-                    val extent = if (childSize === PolySize.Fill) 0f else if (horizontal) c.width else c.height
-                    val margin = if (horizontal) c.style.margin.horizontal else c.style.margin.vertical
+                    val cs = c.style
+                    if (cs.positionMode == PolyPositionMode.Absolute) continue
+                    n++
+                    val childSize = if (horizontal) cs.width else cs.height
+                    val fill = childSize === PolySize.Fill
+                    if (fill) hasFill = true
+                    val extent = if (fill) 0f else if (horizontal) c.width else c.height
+                    val margin = if (horizontal) cs.margin.horizontal else cs.margin.vertical
                     content = if (sums) content + extent + margin else maxOf(content, extent + margin)
                 }
                 if (hasFill && content == 0f) return (parentSize).coerceAtLeast(padding)
+                val gaps = if (n > 1) gap * (n - 1) else 0f
                 if (sums) content += gaps
                 content + padding
             }
@@ -79,62 +82,72 @@ public object PolyLayoutEngine {
 
     private fun arrangeChildren(node: PolyNode) {
         val s = node.style
-        val cx = node.x + s.padding.left
-        val cy = node.y + s.padding.top
-        val cw = (node.width - s.padding.horizontal).coerceAtLeast(0f)
-        val ch = (node.height - s.padding.vertical).coerceAtLeast(0f)
+        val children = node.children
+        if (children.isEmpty()) return
+        val pad = s.padding
+        val nx = node.x
+        val ny = node.y
+        val cx = nx + pad.left
+        val cy = ny + pad.top
+        val cw = (node.width - pad.horizontal).coerceAtLeast(0f)
+        val ch = (node.height - pad.vertical).coerceAtLeast(0f)
 
         when (s.layoutType) {
             LayoutType.Row -> {
                 var cursor = cx
                 var placed = false
-                val children = node.children
+                val gap = s.gap
                 for (i in children.indices) {
                     val child = children[i]
-                    if (child.style.positionMode == PolyPositionMode.Absolute) {
-                        child.x = node.x + child.style.x
-                        child.y = node.y + child.style.y
+                    val cs = child.style
+                    if (cs.positionMode == PolyPositionMode.Absolute) {
+                        child.x = nx + cs.x
+                        child.y = ny + cs.y
                         arrangeChildren(child)
                         continue
                     }
-                    if (placed) cursor += s.gap
+                    if (placed) cursor += gap
                     placed = true
-                    child.x = cursor + child.style.margin.left
-                    child.y = cy + crossAxis(child.style.align, ch, child.height, child.style.margin, false)
+                    val margin = cs.margin
+                    child.x = cursor + margin.left
+                    child.y = cy + crossAxis(cs.align, ch, child.height, margin, false)
                     arrangeChildren(child)
-                    cursor += child.width + child.style.margin.horizontal
+                    cursor += child.width + margin.horizontal
                 }
             }
             LayoutType.Column -> {
                 var cursor = cy
                 var placed = false
-                val children = node.children
+                val gap = s.gap
                 for (i in children.indices) {
                     val child = children[i]
-                    if (child.style.positionMode == PolyPositionMode.Absolute) {
-                        child.x = node.x + child.style.x
-                        child.y = node.y + child.style.y
+                    val cs = child.style
+                    if (cs.positionMode == PolyPositionMode.Absolute) {
+                        child.x = nx + cs.x
+                        child.y = ny + cs.y
                         arrangeChildren(child)
                         continue
                     }
-                    if (placed) cursor += s.gap
+                    if (placed) cursor += gap
                     placed = true
-                    child.x = cx + crossAxis(child.style.align, cw, child.width, child.style.margin, true)
-                    child.y = cursor + child.style.margin.top
+                    val margin = cs.margin
+                    child.x = cx + crossAxis(cs.align, cw, child.width, margin, true)
+                    child.y = cursor + margin.top
                     arrangeChildren(child)
-                    cursor += child.height + child.style.margin.vertical
+                    cursor += child.height + margin.vertical
                 }
             }
             LayoutType.Box -> {
-                val children = node.children
                 for (i in children.indices) {
                     val child = children[i]
-                    if (child.style.positionMode == PolyPositionMode.Absolute) {
-                        child.x = node.x + child.style.x
-                        child.y = node.y + child.style.y
+                    val cs = child.style
+                    if (cs.positionMode == PolyPositionMode.Absolute) {
+                        child.x = nx + cs.x
+                        child.y = ny + cs.y
                     } else {
-                        child.x = cx + crossAxis(child.style.align, cw, child.width, child.style.margin, true)
-                        child.y = cy + crossAxis(child.style.align, ch, child.height, child.style.margin, false)
+                        val margin = cs.margin
+                        child.x = cx + crossAxis(cs.align, cw, child.width, margin, true)
+                        child.y = cy + crossAxis(cs.align, ch, child.height, margin, false)
                     }
                     arrangeChildren(child)
                 }

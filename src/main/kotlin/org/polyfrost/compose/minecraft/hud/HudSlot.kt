@@ -12,6 +12,7 @@ import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.MeasurePolicy
+import androidx.compose.ui.layout.Placeable
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.constrainHeight
@@ -72,14 +73,23 @@ internal class HudSlot(val layer: HudLayer, val seq: Int) {
 
     private val measurePolicy = MeasurePolicy { measurables, constraints ->
         val placeables = profile().measureSlice(layer.sharedScene.profile(), ProfilePhase.Layout) {
-            measurables.map { it.measure(constraints) }
+            val measured = ArrayList<Placeable>(measurables.size)
+            for (i in measurables.indices) measured.add(measurables[i].measure(constraints))
+            measured
         }
-        val width = constraints.constrainWidth(placeables.maxOfOrNull { it.width } ?: 0)
-        val height = constraints.constrainHeight(placeables.maxOfOrNull { it.height } ?: 0)
+        var maxWidth = 0
+        var maxHeight = 0
+        for (i in placeables.indices) {
+            val placeable = placeables[i]
+            if (i == 0 || placeable.width > maxWidth) maxWidth = placeable.width
+            if (i == 0 || placeable.height > maxHeight) maxHeight = placeable.height
+        }
+        val width = constraints.constrainWidth(maxWidth)
+        val height = constraints.constrainHeight(maxHeight)
         layout(width, height) {
             if (shown) {
                 profile().measureSlice(layer.sharedScene.profile(), ProfilePhase.Layout) {
-                    for (placeable in placeables) placeable.place(0, 0)
+                    for (i in placeables.indices) placeables[i].place(0, 0)
                 }
             }
         }

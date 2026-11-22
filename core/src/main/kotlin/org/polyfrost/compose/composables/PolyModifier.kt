@@ -3,6 +3,8 @@ package org.polyfrost.compose.composables
 import org.polyfrost.compose.layout.*
 import org.polyfrost.compose.render.PolyColor
 
+private val NO_INSETS = PolyInsets()
+
 public open class PolyModifier internal constructor(
     internal val key: List<Any?>?,
     internal val block: PolyLayoutStyle.() -> Unit,
@@ -29,8 +31,8 @@ public open class PolyModifier internal constructor(
         style.width = PolySize.Wrap
         style.height = PolySize.Wrap
         style.align = PolyAlign.TopLeft
-        style.padding = PolyInsets()
-        style.margin = PolyInsets()
+        style.padding = NO_INSETS
+        style.margin = NO_INSETS
         style.positionMode = PolyPositionMode.Relative
         style.x = 0f
         style.y = 0f

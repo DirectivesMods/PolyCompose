@@ -1,17 +1,26 @@
 package org.polyfrost.compose.minecraft.preview
 
-import java.util.concurrent.CopyOnWriteArrayList
 import org.jetbrains.annotations.ApiStatus
 import org.polyfrost.compose.host.HostCallbacks
 
 object McFrameHooks {
-    private val beforeUi = CopyOnWriteArrayList<Runnable>()
+    private val lock = Any()
+    @Volatile
+    private var beforeUi: Array<Runnable> = emptyArray()
     private var running = false
 
     @JvmStatic
     fun beforeUi(callback: Runnable): AutoCloseable {
-        beforeUi += callback
-        return AutoCloseable { beforeUi -= callback }
+        synchronized(lock) { beforeUi += callback }
+        return AutoCloseable { remove(callback) }
+    }
+
+    private fun remove(callback: Runnable) {
+        synchronized(lock) {
+            val current = beforeUi
+            val index = current.indexOf(callback)
+            if (index >= 0) beforeUi = current.filterIndexed { i, _ -> i != index }.toTypedArray()
+        }
     }
 
     @JvmStatic
@@ -21,10 +30,14 @@ object McFrameHooks {
     @ApiStatus.Internal
     @JvmStatic
     fun runBeforeUi() {
-        if (beforeUi.isEmpty() || running) return
+        val hooks = beforeUi
+        if (hooks.isEmpty() || running) return
         running = true
         try {
-            HostCallbacks.each(beforeUi, "A pre-UI frame hook") { it.run() }
+            for (i in hooks.indices) {
+                val hook = hooks[i]
+                HostCallbacks.call(hook, "A pre-UI frame hook", Unit) { hook.run() }
+            }
         } finally {
             running = false
         }

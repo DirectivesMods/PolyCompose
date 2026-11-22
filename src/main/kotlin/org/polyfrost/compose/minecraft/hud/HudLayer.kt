@@ -51,7 +51,10 @@ open class HudLayer(
             return if (scale > 0f && scale.isFinite()) scale else 1f
         }
 
-    internal val sharedScene: SharedHudScene get() = SharedHudScene.of(options)
+    private var resolvedSharedScene: SharedHudScene? = null
+
+    internal val sharedScene: SharedHudScene
+        get() = resolvedSharedScene ?: SharedHudScene.of(options).also { resolvedSharedScene = it }
 
     internal val slot = HudSlot(this, order)
     private var isolatedScene: IsolatedHudScene? = null

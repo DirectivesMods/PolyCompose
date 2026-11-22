@@ -25,6 +25,7 @@ import org.polyfrost.compose.render.PolyFont
 import org.polyfrost.compose.render.PolyGlyphPage
 import org.polyfrost.compose.render.PolyTessellator
 import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLongArray
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
@@ -310,14 +311,21 @@ internal object StbFonts : PolyFont.Engine, PolyGlyphPage.Rasterizer {
         }
     }
 
-    private val faces = HashMap<String, Face>()
+    private val faces = ConcurrentHashMap<String, Face>()
     private val failed = HashMap<String, ByteArray>()
 
     override fun face(name: String): PolyGlyphPage.Face? =
         if (name == PolyTessellator.FALLBACK_FONT) CustomEmoji.fallback(stbFace(name)) else stbFace(name)
 
-    @Synchronized
     private fun stbFace(name: String): Face? {
+        val bytes = FontManager.fontData(name) ?: return null
+        val current = faces[name]
+        if (current != null && current.bytes === bytes) return current
+        return loadFace(name)
+    }
+
+    @Synchronized
+    private fun loadFace(name: String): Face? {
         val bytes = FontManager.fontData(name) ?: return null
         val previous = faces[name]
         if (previous != null && previous.bytes === bytes) return previous

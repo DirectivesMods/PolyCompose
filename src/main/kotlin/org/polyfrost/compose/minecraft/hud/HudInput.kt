@@ -61,7 +61,8 @@ object HudInput {
     fun releaseLayers(button: Int): Boolean {
         val pointerButton = pointerButtonOf(button) ?: return false
         val press = presses.remove(button) ?: return false
-        for (scene in press.receivers) scene.release(pointerButton)
+        val receivers = press.receivers
+        for (i in receivers.indices) receivers[i].release(pointerButton)
         return press.consumed
     }
 
@@ -81,7 +82,9 @@ object HudInput {
         val position = HudPointer.position()
         val receivers = ArrayList<HudInputTarget>(2)
         var consumed = false
-        for (layer in topmostLayers()) {
+        val layers = topmostLayers()
+        for (i in layers.indices) {
+            val layer = layers[i]
             if (!layer.takingInput) continue
             val scene = layer.inputTarget ?: continue
             if (scene in receivers || !scene.claims(layer, position)) continue
@@ -97,7 +100,9 @@ object HudInput {
     }
 
     private fun releaseFocusOutside(receivers: List<HudInputTarget>) {
-        for (scene in liveScenes()) {
+        val live = liveScenes()
+        for (i in live.indices) {
+            val scene = live[i]
             if (scene.textFocused && scene !in receivers) scene.releaseFocus()
         }
     }
@@ -108,7 +113,9 @@ object HudInput {
         val position = HudPointer.position()
         tried.clear()
         try {
-            for (layer in topmostLayers()) {
+            val layers = topmostLayers()
+            for (i in layers.indices) {
+                val layer = layers[i]
                 if (!layer.takingInput) continue
                 val scene = layer.inputTarget ?: continue
                 if (scene in tried || !scene.claims(layer, position)) continue
@@ -123,7 +130,7 @@ object HudInput {
 
     @JvmStatic
     fun consumeKey(key: Int, state: KeyState): Boolean {
-        if (state == KeyState.Released && key >= 0) {
+        if (state == KeyState.Released && key >= 0 && heldKeys.isNotEmpty()) {
             val owner = heldKeys.remove(key)
             if (owner != null) {
                 if (key != InputConstants.KEY_ESCAPE) owner.sendKey(HudKeys.key(KeyEventType.KeyUp, key))
@@ -178,7 +185,9 @@ object HudInput {
     }
 
     private fun focusedScene(): HudInputTarget? {
-        for (scene in liveScenes()) {
+        val live = liveScenes()
+        for (i in live.indices) {
+            val scene = live[i]
             if (scene.textFocused && scene.takingInput) return scene
         }
         return null
@@ -186,8 +195,13 @@ object HudInput {
 
     private fun escapeClosesPopup(): Boolean {
         if (runCatching { McScreens.current() }.getOrNull() is ComposeScreen) return false
-        if (liveScenes().none { it.takingInput }) return false
+        if (!anyTakingInput(liveScenes())) return false
         return BackStack.dispatch()
+    }
+
+    private fun anyTakingInput(live: List<HudInputTarget>): Boolean {
+        for (i in live.indices) if (live[i].takingInput) return true
+        return false
     }
 
     private fun liveScenes(): List<HudInputTarget> {
@@ -198,7 +212,8 @@ object HudInput {
 
     private fun topmostLayers(): List<HudLayer> {
         candidates.clear()
-        for (scene in liveScenes()) scene.collectLayers(candidates)
+        val live = liveScenes()
+        for (i in live.indices) live[i].collectLayers(candidates)
         if (candidates.size > 1) candidates.sortWith(topmostFirst)
         return candidates
     }

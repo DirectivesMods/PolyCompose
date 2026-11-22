@@ -1,5 +1,6 @@
 package org.polyfrost.compose.render
 
+import java.util.function.IntSupplier
 
 public class RenderContext(public val renderer: PolyRenderer) {
     @JvmField
@@ -88,6 +89,16 @@ public class RenderContext(public val renderer: PolyRenderer) {
         renderer.mcTextLive(text, x, y, color, shadow, scale, literal)
     }
 
+    public fun mcTextLive(text: String, x: Float, y: Float, color: IntSupplier, shadow: Boolean, scale: Float) {
+        if (text.isEmpty()) return
+        renderer.mcTextLive(text, x, y, color, shadow, scale, false)
+    }
+
+    public fun mcTextLive(text: String, x: Float, y: Float, color: IntSupplier, shadow: Boolean, scale: Float, literal: Boolean) {
+        if (text.isEmpty()) return
+        renderer.mcTextLive(text, x, y, color, shadow, scale, literal)
+    }
+
     public fun mcTextOutline(text: String, x: Float, y: Float, color: Int, outlineColor: Int, scale: Float, literal: Boolean) {
         if (text.isEmpty()) return
         renderer.mcTextOutline(text, x, y, color, outlineColor, scale, literal)
@@ -95,7 +106,34 @@ public class RenderContext(public val renderer: PolyRenderer) {
 
     public fun measureText(text: String, font: PolyFont): Float = font.measureTextWidth(text)
 
-    public fun live(draw: RenderContext.() -> Unit): Unit = renderer.live { RenderContext(it).draw() }
+    public fun live(draw: RenderContext.() -> Unit): Unit = renderer.live { runLive(it, draw) }
+
+    private var liveScratch: RenderContext? = null
+    private var liveBusy = false
+
+    private fun runLive(target: PolyRenderer, draw: RenderContext.() -> Unit) {
+        if (liveBusy) return RenderContext(target).draw()
+        val cached = liveScratch
+        val scratch = if (cached != null && cached.renderer === target) {
+            cached.resetForLive()
+            cached
+        } else {
+            RenderContext(target).also { liveScratch = it }
+        }
+        liveBusy = true
+        try {
+            scratch.draw()
+        } finally {
+            liveBusy = false
+        }
+    }
+
+    private fun resetForLive() {
+        cacheNodes = false
+        _absX = 0f
+        _absY = 0f
+        absDepth = 0
+    }
 
     public fun save() {
         renderer.save()

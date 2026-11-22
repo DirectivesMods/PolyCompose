@@ -7,6 +7,7 @@ import com.mojang.blaze3d.pipeline.RenderTarget;
 import net.minecraft.client.gui.navigation.ScreenRectangle;
 import org.polyfrost.compose.minecraft.render.GuiTargetRedirect;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 
 //? if >= 1.21.8 {
@@ -52,17 +53,20 @@ public class Mixin_ItemAtlasScissor {
         int[] mapped = transform.map(rectangle.left(), rectangle.top(), rectangle.right(), rectangle.bottom());
         RenderTarget target = GuiTargetRedirect.target;
         if (target != null) {
-            int x0 = clamp(mapped[0], 0, target.width - 1);
-            int y0 = clamp(mapped[1], 0, target.height - 1);
-            int x1 = clamp(mapped[0] + mapped[2], x0 + 1, target.width);
-            int y1 = clamp(mapped[1] + mapped[3], y0 + 1, target.height);
-            mapped = new int[]{x0, y0, x1 - x0, y1 - y0};
+            int x0 = polycompose$clamp(mapped[0], 0, target.width - 1);
+            int y0 = polycompose$clamp(mapped[1], 0, target.height - 1);
+            int x1 = polycompose$clamp(mapped[0] + mapped[2], x0 + 1, target.width);
+            int y1 = polycompose$clamp(mapped[1] + mapped[3], y0 + 1, target.height);
+            //~ if < 1.21.8 '(pass, x0' -> '(x0'
+            original.call(pass, x0, y0, x1 - x0, y1 - y0);
+            return;
         }
         //~ if < 1.21.8 '(pass, mapped[0]' -> '(mapped[0]'
         original.call(pass, mapped[0], mapped[1], mapped[2], mapped[3]);
     }
 
-    private static int clamp(int value, int min, int max) {
+    @Unique
+    private static int polycompose$clamp(int value, int min, int max) {
         return Math.max(min, Math.min(max, value));
     }
 }

@@ -35,6 +35,7 @@ import org.polyfrost.compose.render.PolyRenderer
 import org.polyfrost.compose.render.RenderContext
 import org.polyfrost.compose.render.alphaByte
 import org.polyfrost.compose.skiko.PolyGraphicsLayer
+import java.util.function.IntSupplier
 import kotlin.math.abs
 import kotlin.math.min
 
@@ -49,10 +50,18 @@ public fun DrawScope.drawBackdrop(
     alpha: Float = 1f,
 ) {
     if (size.width <= 0f || size.height <= 0f || alpha <= 0f) return
-    val key = DrawKey(backdrop, shape, size, layoutDirection, density, fontScale, settingsStamp())
+    val settings = settingsStamp()
+    val last = lastDraw
+    if (last != null && last.key.matches(backdrop, shape, size, layoutDirection, density, fontScale, settings)) return last.resolved.draw(this, topLeft, alpha)
+    val key = DrawKey(backdrop, shape, size, layoutDirection, density, fontScale, settings)
     val resolved = drawCache[key] ?: ResolvedBackdrop.of(backdrop, shape, size, layoutDirection, this, null).also { drawCache[key] = it }
+    lastDraw = LastDraw(key, resolved)
     resolved.draw(this, topLeft, alpha)
 }
+
+private class LastDraw(val key: DrawKey, val resolved: ResolvedBackdrop)
+
+private var lastDraw: LastDraw? = null
 
 private data class DrawKey(
     val backdrop: Backdrop,
@@ -62,7 +71,11 @@ private data class DrawKey(
     val density: Float,
     val fontScale: Float,
     val settings: Int,
-)
+) {
+    fun matches(backdrop: Backdrop, shape: Shape, size: Size, direction: LayoutDirection, density: Float, fontScale: Float, settings: Int): Boolean =
+        backdrop == this.backdrop && shape == this.shape && size == this.size && direction == this.direction &&
+            density.compareTo(this.density) == 0 && fontScale.compareTo(this.fontScale) == 0 && settings == this.settings
+}
 
 private const val DRAW_CACHE_SIZE = 32
 
@@ -154,7 +167,7 @@ internal class ResolvedBackdrop private constructor(
         var usedAt = 0L
         var sampledVersion = -1
         var sampled = base
-        val key: () -> Int = {
+        val key = IntSupplier {
             region.request()
             region.version
         }
@@ -172,7 +185,8 @@ internal class ResolvedBackdrop private constructor(
         val now = System.nanoTime()
         var oldest: Slot? = null
         var recent: Slot? = null
-        for (s in slots) {
+        for (i in slots.indices) {
+            val s = slots[i]
             if (abs(s.x - px) < SLOT_TOLERANCE && abs(s.y - py) < SLOT_TOLERANCE) {
                 s.usedAt = now
                 return s

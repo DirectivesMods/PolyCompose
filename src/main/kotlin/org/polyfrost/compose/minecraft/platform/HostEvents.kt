@@ -1,18 +1,33 @@
 package org.polyfrost.compose.minecraft.platform
 
 import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.CopyOnWriteArrayList
 import org.polyfrost.compose.host.HostCallbacks
 import org.polyfrost.compose.state.TickStates
 
 object HostEvents {
-    private val frameStart = CopyOnWriteArrayList<Runnable>()
-    private val frameEnd = CopyOnWriteArrayList<Runnable>()
-    private val resourcesReloaded = CopyOnWriteArrayList<Runnable>()
-    private val clientTick = CopyOnWriteArrayList<Runnable>()
+    private val frameStart = Listeners()
+    private val frameEnd = Listeners()
+    private val resourcesReloaded = Listeners()
+    private val clientTick = Listeners()
     private val delayed = ConcurrentLinkedQueue<Delayed>()
 
     private class Delayed(var frames: Int, val action: Runnable)
+
+    private class Listeners {
+        @Volatile
+        var snapshot: Array<Runnable> = emptyArray()
+            private set
+
+        fun add(listener: Runnable) = synchronized(this) {
+            snapshot += listener
+        }
+
+        fun remove(listener: Runnable) = synchronized(this) {
+            val current = snapshot
+            val index = current.indexOf(listener)
+            if (index >= 0) snapshot = current.filterIndexed { i, _ -> i != index }.toTypedArray()
+        }
+    }
 
     @JvmStatic
     var frame: Long = 0L
@@ -44,8 +59,9 @@ object HostEvents {
     @JvmStatic
     fun postFrameEnd() {
         frame++
-        var queued = delayed.size
+        var queued = if (delayed.isEmpty()) 0 else delayed.size
         fire(frameEnd, "A frame end listener")
+        if (queued == 0) return
         val iterator = delayed.iterator()
         while (queued-- > 0 && iterator.hasNext()) {
             val entry = iterator.next()
@@ -66,13 +82,14 @@ object HostEvents {
         fire(clientTick, "A client tick listener")
     }
 
-    private fun register(listeners: MutableList<Runnable>, listener: Runnable): AutoCloseable {
-        listeners += listener
-        return AutoCloseable { listeners -= listener }
+    private fun register(listeners: Listeners, listener: Runnable): AutoCloseable {
+        listeners.add(listener)
+        return AutoCloseable { listeners.remove(listener) }
     }
 
-    private fun fire(listeners: List<Runnable>, what: String) {
-        for (listener in listeners) run(listener, what)
+    private fun fire(listeners: Listeners, what: String) {
+        val snapshot = listeners.snapshot
+        for (i in snapshot.indices) run(snapshot[i], what)
     }
 
     private fun run(action: Runnable, what: String) {

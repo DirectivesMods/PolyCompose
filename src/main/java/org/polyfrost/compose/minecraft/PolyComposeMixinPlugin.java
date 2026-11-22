@@ -105,6 +105,8 @@ public class PolyComposeMixinPlugin implements IMixinConfigPlugin {
         mixins.add("render.Mixin_SkiaFrame");
         //? if > 1.8.9
         mixins.add("render.Mixin_ItemAtlasScissor");
+        //? if = 1.8.9
+        //mixins.add("render.Mixin_ItemAtlasGlint");
         //? if < 1.21.11
         //mixins.add("render.Mixin_DebugOverlayAboveUi");
         //? if > 1.8.9 && < 1.21.11

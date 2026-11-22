@@ -36,6 +36,10 @@ internal object ClassWarmup {
         "kotlinx/coroutines/stream/", "kotlinx/coroutines/time/", "org/polyfrost/compose/minecraft/",
     )
 
+    private val LOW_PREFIXES = arrayOf("androidx/compose/runtime/", "org/polyfrost/compose/")
+
+    private fun lowAnchors(): Array<Class<*>> = arrayOf(Composer::class.java, PolyCompose::class.java)
+
     private fun anchors(): Array<Class<*>> = arrayOf(
         Composer::class.java, Modifier::class.java, Color::class.java, TextStyle::class.java, Dp::class.java,
         Offset::class.java, BorderStroke::class.java, Arrangement::class.java, Animatable::class.java,
@@ -44,15 +48,17 @@ internal object ClassWarmup {
 
     fun run(loader: ClassLoader?): Result {
         val begin = System.nanoTime()
+        val profile = WarmupProfile.current
+        val low = profile == WarmupProfile.LOW
+        val prefixes = if (low) LOW_PREFIXES else PREFIXES
         val names = LinkedHashSet<String>()
         val sources = HashSet<String>()
-        for (anchor in anchors()) {
+        for (anchor in if (low) lowAnchors() else anchors()) {
             val location = anchor.protectionDomain?.codeSource?.location ?: continue
             if (!sources.add(location.toString())) continue
-            runCatching { collect(Paths.get(location.toURI()), names) }
+            runCatching { collect(Paths.get(location.toURI()), prefixes, names) }
                 .onFailure { LOG.debug("Can't list the classes in {}", location, it) }
         }
-        val profile = WarmupProfile.current
         val ordered = names.sortedBy(::priority).let { if (it.size > profile.maxClasses) it.subList(0, profile.maxClasses) else it }
         var loaded = 0
         var failed = 0
@@ -75,26 +81,26 @@ internal object ClassWarmup {
         return if (index < 0) PREFIXES.size else index
     }
 
-    private fun collect(path: Path, out: MutableSet<String>) {
+    private fun collect(path: Path, prefixes: Array<String>, out: MutableSet<String>) {
         if (Files.isDirectory(path)) {
-            scan(path, out)
+            scan(path, prefixes, out)
         } else {
-            FileSystems.newFileSystem(path, null as ClassLoader?).use { scan(it.getPath("/"), out) }
+            FileSystems.newFileSystem(path, null as ClassLoader?).use { scan(it.getPath("/"), prefixes, out) }
         }
     }
 
-    private fun scan(root: Path, out: MutableSet<String>) {
+    private fun scan(root: Path, prefixes: Array<String>, out: MutableSet<String>) {
         Files.walk(root).use { paths ->
             for (path in paths.iterator()) {
                 val entry = root.relativize(path).toString().replace('\\', '/')
-                if (wanted(entry)) out += entry.substring(0, entry.length - ".class".length).replace('/', '.')
+                if (wanted(entry, prefixes)) out += entry.substring(0, entry.length - ".class".length).replace('/', '.')
             }
         }
     }
 
-    private fun wanted(entry: String): Boolean {
+    private fun wanted(entry: String, prefixes: Array<String>): Boolean {
         if (!entry.endsWith(".class") || entry.endsWith("module-info.class") || entry.startsWith("META-INF/")) return false
-        if (PREFIXES.none { entry.startsWith(it) }) return false
+        if (prefixes.none { entry.startsWith(it) }) return false
         return SKIPPED.none { it in entry }
     }
 

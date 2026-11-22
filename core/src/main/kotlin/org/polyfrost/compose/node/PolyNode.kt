@@ -17,7 +17,64 @@ public open class PolyNode {
     internal var intrinsicWidth: Float = -1f
     internal var intrinsicHeight: Float = -1f
     internal var contentRevision: Int = 0
-    internal open val hasLiveContent: Boolean get() = false
+    internal open val hasLiveContent: Boolean get() = liveMeasure
+
+    internal var tracker: ChangeTracker? = null
+    internal open val tracksChanges: Boolean get() = javaClass === PolyNode::class.java || reportsLayoutChanges
+    private var countedUntracked = false
+
+    protected open val reportsLayoutChanges: Boolean get() = false
+
+    protected open val liveMeasure: Boolean get() = false
+
+    init {
+        style.owner = this
+    }
+
+    protected fun notifyLayoutChanged(): Unit = layoutChanged()
+
+    protected fun notifyLiveMeasureChanged(): Unit = liveChanged()
+
+    protected fun notifyContentChanged() {
+        contentRevision++
+        val t = tracker ?: return
+        t.paint++
+    }
+
+    internal fun layoutChanged() {
+        val t = tracker ?: return
+        t.layout++
+    }
+
+    internal fun liveChanged() {
+        val t = tracker ?: return
+        t.layout++
+        t.live.remove(this)
+        if (hasLiveContent) t.live.add(this)
+    }
+
+    internal fun attach(t: ChangeTracker) {
+        if (tracker === t) return
+        if (tracker != null) detach()
+        tracker = t
+        countedUntracked = !tracksChanges
+        if (countedUntracked) t.untracked++
+        if (hasLiveContent) t.live.add(this)
+        for (i in children.indices) children[i].attach(t)
+    }
+
+    internal fun detach() {
+        val t = tracker ?: return
+        tracker = null
+        if (countedUntracked) t.untracked--
+        countedUntracked = false
+        t.live.remove(this)
+        if (style.pending) {
+            style.pending = false
+            t.pendingStyles.remove(style)
+        }
+        for (i in children.indices) children[i].detach()
+    }
 
     private var decoration: Decoration? = null
     private var liveScratch: RenderContext? = null
@@ -36,15 +93,19 @@ public open class PolyNode {
         val s = style
         decorate(ctx)
 
-        if (s.clipToBounds) {
+        val clip = s.clipToBounds
+        if (clip) {
             ctx.save()
-            if (s.radius > 0f) ctx.clipRRect(x, y, width, height, s.radius) else ctx.clipRect(x, y, width, height)
+            val r = s.radius
+            if (r > 0f) ctx.clipRRect(x, y, width, height, r) else ctx.clipRect(x, y, width, height)
         }
         renderContent(ctx)
-        for (i in children.indices) {
-            val child = children[i]
-            val fade = child.style.fade
-            val staticAlpha = child.style.alpha
+        val kids = children
+        for (i in kids.indices) {
+            val child = kids[i]
+            val cs = child.style
+            val fade = cs.fade
+            val staticAlpha = cs.alpha
             if (fade == null) {
                 if (staticAlpha >= 1f) {
                     child.render(ctx)
@@ -65,7 +126,7 @@ public open class PolyNode {
                 }
             }
         }
-        if (s.clipToBounds) ctx.restore()
+        if (clip) ctx.restore()
     }
 
     private fun decorate(ctx: RenderContext) {
@@ -100,6 +161,34 @@ public open class PolyNode {
         val x: Float, val y: Float, val w: Float, val h: Float, val radius: Float,
         val bg: Int, val border: Int, val stroke: Float, val key: Any, val captured: Any,
     )
+}
+
+internal class ChangeTracker {
+    var layout: Long = 0L
+    var paint: Long = 0L
+    var untracked: Int = 0
+    val live: ArrayList<PolyNode> = ArrayList()
+    val pendingStyles: ArrayList<PolyLayoutStyle> = ArrayList()
+
+    fun settle(): Long {
+        val styles = pendingStyles
+        if (styles.isEmpty()) return layout
+        var differs = false
+        for (i in styles.indices) {
+            val s = styles[i]
+            if (!differs && s.layoutDiffers()) differs = true
+            s.pending = false
+        }
+        styles.clear()
+        if (differs) layout++
+        return layout
+    }
+
+    fun clearStyles() {
+        val styles = pendingStyles
+        for (i in styles.indices) styles[i].pending = false
+        styles.clear()
+    }
 }
 
 private fun drawDecoration(renderer: PolyRenderer, x: Float, y: Float, w: Float, h: Float, radius: Float, bg: Int, border: Int, stroke: Float) {

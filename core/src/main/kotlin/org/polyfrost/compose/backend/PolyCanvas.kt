@@ -49,6 +49,7 @@ import org.polyfrost.compose.render.RenderContext
 import org.polyfrost.compose.render.placeBlur
 import org.polyfrost.compose.skiko.colorFilterEffect
 import java.util.WeakHashMap
+import java.util.function.IntSupplier
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.ceil
@@ -295,9 +296,10 @@ internal fun layerBlendOf(mode: BlendMode): Int = if (mode == BlendMode.Clear) P
 
 internal fun layerAlphaOf(mode: BlendMode, alpha: Float): Float = if (mode == BlendMode.Clear || mode == BlendMode.Dst) 0f else alpha
 
-private val PORTABLE_BLENDS = setOf(BlendMode.SrcOver, BlendMode.Clear, BlendMode.Dst, BlendMode.Src, BlendMode.DstOut, BlendMode.DstIn, BlendMode.Plus)
-
-internal fun isPortableBlend(mode: BlendMode): Boolean = mode in PORTABLE_BLENDS
+internal fun isPortableBlend(mode: BlendMode): Boolean = when (mode) {
+    BlendMode.SrcOver, BlendMode.Clear, BlendMode.Dst, BlendMode.Src, BlendMode.DstOut, BlendMode.DstIn, BlendMode.Plus -> true
+    else -> false
+}
 
 private fun PolyPaint.solid(alpha: Float): PolyPaint = copy().also {
     it.color = Color.Black.copy(alpha = alpha.coerceIn(0f, 1f))
@@ -415,7 +417,7 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
             val c = color.argb
             return (((c ushr 24) * alpha).toInt() shl 24) or (c and 0xFFFFFF)
         }
-        r.live(x, y, w, h, ::argb) {
+        r.live(x, y, w, h, IntSupplier { argb() }) {
             tinted.color = Color(argb())
             draw(if (it === r) this else PolyCanvas(it), tinted)
         }
@@ -456,7 +458,8 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
     private fun fillContours(contours: List<FloatArray>, evenOdd: Boolean, paint: PolyPaint) {
         val poly = PolyPath()
         poly.evenOdd = evenOdd
-        for (c in contours) {
+        for (i in contours.indices) {
+            val c = contours[i]
             if (c.size < 6) continue
             poly.moveTo(c[0], c[1])
             for (k in 2 until c.size step 2) poly.lineTo(c[k], c[k + 1])
@@ -684,18 +687,19 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
 
     private fun shape(x: Float, y: Float, w: Float, h: Float, radius: Float, paint: PolyPaint) {
         if (w <= 0f || h <= 0f) return
+        val style = paint.style
+        val s = paint.shader?.platformShader
         val blur = if (paint.blur > 0f) paint.blur
-        else if (imageBlur > 0.5f && paint.style == PaintingStyle.Fill && paint.shader == null) (imageBlur - 0.5f) / 0.57735f
+        else if (style == PaintingStyle.Fill && s == null) imageBlur.let { if (it > 0.5f) (it - 0.5f) / 0.57735f else 0f }
         else 0f
         if (blur > 0f) {
             r.shadow(x, y, w, h, radius, PolyShadow(PolyColor(paint.argb()), blur, 0f, 0f, 0f))
             return
         }
-        (paint.shader?.platformShader as? ChromaShader)?.let { return chromaShape(x, y, w, h, radius, paint, it.color) }
-        val stroke = paint.style == PaintingStyle.Stroke
+        (s as? ChromaShader)?.let { return chromaShape(x, y, w, h, radius, paint, it.color) }
+        val stroke = style == PaintingStyle.Stroke
         if (paint.pathEffect.reshapes(stroke)) return fillOrStroke(outline(x, y, w, h, radius), paint)
         if (stroke) {
-            val s = paint.shader?.platformShader
             val cutCorners = radius <= 0f && (paint.strokeJoin != StrokeJoin.Miter || paint.strokeMiterLimit * paint.strokeMiterLimit < 2f)
             if (cutCorners || (s != null && !(s is GradientShader && s.tile == TileMode.Clamp) && s !is MaskedShader)) {
                 return strokeContours(outline(x, y, w, h, radius).allContours(), CLOSED, paint)
@@ -717,7 +721,7 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
             val c = color.argb
             return (((c ushr 24) * alpha).toInt() shl 24) or (c and 0xFFFFFF)
         }
-        r.live(x, y, w, h, ::tinted) {
+        r.live(x, y, w, h, IntSupplier { tinted() }) {
             if (stroke) it.rectStroke(x, y, w, h, tinted(), sw, radius) else it.rect(x, y, w, h, tinted(), radius)
         }
     }
@@ -742,7 +746,8 @@ public class PolyCanvas(public val renderer: PolyRenderer) : PolyDrawCanvas {
         var bmp = (image as? PolyImageBitmap)?.bitmap ?: return
         var sx = srcX; var sy = srcY; var sw = srcW; var sh = srcH
         var x = dstX; var y = dstY; var w = dstW; var h = dstH
-        val blur = if (imageBlur > 0f) placeBlur(bmp, imageBlur, sx, sy, sw, sh, x, y, w, h) else null
+        val sigma = imageBlur
+        val blur = if (sigma > 0f) placeBlur(bmp, sigma, sx, sy, sw, sh, x, y, w, h) else null
         if (blur != null) {
             bmp = blur.bitmap
             sx = blur.srcX; sy = blur.srcY; sw = blur.srcW; sh = blur.srcH

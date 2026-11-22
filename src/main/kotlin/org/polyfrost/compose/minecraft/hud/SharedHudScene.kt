@@ -47,7 +47,7 @@ internal class SharedHudScene private constructor(options: ComposeOptions) :
     }
 
     private fun detachIdle(now: Long) {
-        for (i in attachedSlots.indices.reversed()) {
+        for (i in attachedSlots.lastIndex downTo 0) {
             val slot = attachedSlots.getOrNull(i) ?: continue
             if (now - slot.calledAt > IDLE_DETACH_NANOS) detach(slot)
         }
@@ -82,7 +82,11 @@ internal class SharedHudScene private constructor(options: ComposeOptions) :
     private fun clearMark() = GuiDrawMarker.clear()
 
     override fun collectLayers(into: MutableList<HudLayer>) {
-        for (slot in attachedSlots) if (slot.shown) into.add(slot.layer)
+        val attached = attachedSlots
+        for (i in attached.indices) {
+            val slot = attached[i]
+            if (slot.shown) into.add(slot.layer)
+        }
     }
 
     override fun claims(layer: HudLayer, position: Offset): Boolean {
@@ -175,18 +179,20 @@ internal class SharedHudScene private constructor(options: ComposeOptions) :
         val members = head.run
         val surface = head.surface(frame)
         var redraw = head.runChanged()
-        for (member in members) {
+        for (i in members.indices) {
+            val member = members[i]
             if (member.dirty) redraw = true
             member.painting = true
         }
         val drawn = try {
             profile().measure(ProfilePhase.Record) { paint(surface, redraw, paintScene) }
         } finally {
-            for (member in members) member.painting = false
+            for (i in members.indices) members[i].painting = false
         }
         head.recorded(drawn)
         if (drawn) {
-            for (member in members) {
+            for (i in members.indices) {
+                val member = members[i]
                 member.dirty = false
                 member.paintedFrame = frame
             }
@@ -214,7 +220,9 @@ internal class SharedHudScene private constructor(options: ComposeOptions) :
         run = emptyList()
         runNext = 0
         clearMark()
-        for (slot in attachedSlots) {
+        val attached = attachedSlots
+        for (i in attached.indices) {
+            val slot = attached[i]
             slot.runNext = slot.learnedNext
             slot.learnedNext = null
             slot.releaseIdleSurface(frame)
@@ -225,7 +233,8 @@ internal class SharedHudScene private constructor(options: ComposeOptions) :
         advanceFrame({ hudBaseDensity() }, { base, now -> prepareSlots(base, now) }) ?: return false
         if (dirty) {
             dirty = false
-            for (slot in attachedSlots) slot.dirty = true
+            val attached = attachedSlots
+            for (i in attached.indices) attached[i].dirty = true
         }
         afterFrame(lastDrawn)
         return true
@@ -249,7 +258,9 @@ internal class SharedHudScene private constructor(options: ComposeOptions) :
         var wantsInput = false
         var idle: ArrayList<HudSlot>? = null
         val previous = frame - 1
-        for (slot in attachedSlots) {
+        val attached = attachedSlots
+        for (i in attached.indices) {
+            val slot = attached[i]
             val layer = slot.layer
             val shown = layer.visible && slot.requestedFrame >= previous
             if (slot.shown != shown) {

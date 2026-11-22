@@ -7,15 +7,18 @@ object GuiTargetRedirect {
         fun map(left: Int, top: Int, right: Int, bottom: Int): IntArray
     }
 
-    @Volatile
     @JvmField
     var target: RenderTarget? = null
 
-    @Volatile
     @JvmField
     var scissorTransform: ScissorTransform? = null
 
-    @Volatile
     @JvmField
     var itemRenderSizePx: Int = 0
+
+    @JvmField
+    var suppressItemGlint: Boolean = false
+
+    @JvmField
+    var itemGlintSuppressed: Boolean = false
 }

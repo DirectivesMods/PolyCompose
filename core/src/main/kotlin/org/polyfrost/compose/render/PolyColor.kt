@@ -29,7 +29,11 @@ public class PolyColor @JvmOverloads constructor(
 
     public var gradientArgb: Int = argb
 
-    public val alpha: Int get() = (argb ushr 24) and 0xFF
+    public val alpha: Int
+        get() {
+            if (chroma) chromaReads++
+            return (staticArgb ushr 24) and 0xFF
+        }
     public val red: Int get() = (argb ushr 16) and 0xFF
     public val green: Int get() = (argb ushr 8) and 0xFF
     public val blue: Int get() = argb and 0xFF
@@ -164,45 +168,34 @@ public class PolyColor @JvmOverloads constructor(
         }
 
         public fun hsv(h: Float, s: Float, v: Float, a: Float = 1f): PolyColor {
-            val hh = ((h % 360f) + 360f) % 360f
             val c = v * s
-            val x = c * (1f - Math.abs(((hh / 60f) % 2f) - 1f))
-            val m = v - c
-            val (r1, g1, b1) = when {
-                hh < 60f -> Triple(c, x, 0f)
-                hh < 120f -> Triple(x, c, 0f)
-                hh < 180f -> Triple(0f, c, x)
-                hh < 240f -> Triple(0f, x, c)
-                hh < 300f -> Triple(x, 0f, c)
-                else -> Triple(c, 0f, x)
-            }
-            return argb(
-                (a * 255).roundToInt(),
-                ((r1 + m) * 255).roundToInt(),
-                ((g1 + m) * 255).roundToInt(),
-                ((b1 + m) * 255).roundToInt(),
-            )
+            return PolyColor(hueArgb(h, c, v - c, a))
         }
 
         public fun hsl(h: Float, s: Float, l: Float, a: Float = 1f): PolyColor {
-            val hh = ((h % 360f) + 360f) % 360f
             val c = (1f - Math.abs(2f * l - 1f)) * s
+            return PolyColor(hueArgb(h, c, l - c / 2f, a))
+        }
+
+        private fun hueArgb(h: Float, c: Float, m: Float, a: Float): Int {
+            val hh = ((h % 360f) + 360f) % 360f
             val x = c * (1f - Math.abs(((hh / 60f) % 2f) - 1f))
-            val m = l - c / 2f
-            val (r1, g1, b1) = when {
-                hh < 60f -> Triple(c, x, 0f)
-                hh < 120f -> Triple(x, c, 0f)
-                hh < 180f -> Triple(0f, c, x)
-                hh < 240f -> Triple(0f, x, c)
-                hh < 300f -> Triple(x, 0f, c)
-                else -> Triple(c, 0f, x)
+            val r1: Float
+            val g1: Float
+            val b1: Float
+            when {
+                hh < 60f -> { r1 = c; g1 = x; b1 = 0f }
+                hh < 120f -> { r1 = x; g1 = c; b1 = 0f }
+                hh < 180f -> { r1 = 0f; g1 = c; b1 = x }
+                hh < 240f -> { r1 = 0f; g1 = x; b1 = c }
+                hh < 300f -> { r1 = x; g1 = 0f; b1 = c }
+                else -> { r1 = c; g1 = 0f; b1 = x }
             }
-            return argb(
-                (a * 255).roundToInt(),
-                ((r1 + m) * 255).roundToInt(),
-                ((g1 + m) * 255).roundToInt(),
-                ((b1 + m) * 255).roundToInt(),
-            )
+            val ai = (a * 255).roundToInt()
+            val ri = ((r1 + m) * 255).roundToInt()
+            val gi = ((g1 + m) * 255).roundToInt()
+            val bi = ((b1 + m) * 255).roundToInt()
+            return ((ai and 0xFF) shl 24) or ((ri and 0xFF) shl 16) or ((gi and 0xFF) shl 8) or (bi and 0xFF)
         }
 
         public fun lerp(from: PolyColor, to: PolyColor, t: Float): PolyColor = from.lerp(to, t)
@@ -213,26 +206,22 @@ public class PolyColor @JvmOverloads constructor(
 
         private fun chromaArgb(argb: Int, speed: Float): Int {
             val alpha = (argb ushr 24) and 0xFF
-            val hsb = rgbToHsb((argb ushr 16) and 0xFF, (argb ushr 8) and 0xFF, argb and 0xFF)
-            val hue = (hsb[0] + chromaTurn(speed)) % 1f
-            return hsv(hue * 360f, hsb[1], hsb[2], alpha / 255f).rawArgb
-        }
-
-        private fun rgbToHsb(red: Int, green: Int, blue: Int): FloatArray {
-            val r = red / 255f
-            val g = green / 255f
-            val b = blue / 255f
+            val r = ((argb ushr 16) and 0xFF) / 255f
+            val g = ((argb ushr 8) and 0xFF) / 255f
+            val b = (argb and 0xFF) / 255f
             val max = maxOf(r, g, b)
             val min = minOf(r, g, b)
             val delta = max - min
-            val hue = when {
+            val baseHue = when {
                 delta == 0f -> 0f
                 max == r -> (((g - b) / delta).mod(6f)) / 6f
                 max == g -> (((b - r) / delta) + 2f) / 6f
                 else -> (((r - g) / delta) + 4f) / 6f
             }
             val saturation = if (max == 0f) 0f else delta / max
-            return floatArrayOf(hue, saturation, max)
+            val hue = (baseHue + chromaTurn(speed)) % 1f
+            val c = max * saturation
+            return hueArgb(hue * 360f, c, max - c, alpha / 255f)
         }
     }
 }

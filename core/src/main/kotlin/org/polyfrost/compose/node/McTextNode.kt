@@ -5,13 +5,18 @@ import org.polyfrost.compose.render.FontManager
 import org.polyfrost.compose.render.PolyColor
 import org.polyfrost.compose.render.PolyRenderer
 import org.polyfrost.compose.render.RenderContext
+import java.util.function.IntSupplier
+
+private const val LIVE_PAD = 4f
 
 public class McTextNode : PolyNode() {
-    public var text: String = ""
+    private var currentText: String = ""
+    public var text: String
+        get() = currentText
         set(value) {
-            if (field != value) {
-                field = value
-                measureDirty = true
+            if (currentText != value) {
+                currentText = value
+                markMeasureDirty()
             }
         }
     public var color: PolyColor = PolyColor.WHITE
@@ -20,26 +25,43 @@ public class McTextNode : PolyNode() {
         set(value) {
             if (field != value) {
                 field = value
-                measureDirty = true
+                markMeasureDirty()
             }
         }
     public var outlineColor: PolyColor? = null
     public var textProvider: (() -> String)? = null
+        set(value) {
+            val wasLive = field != null
+            field = value
+            if (wasLive != (value != null)) liveChanged()
+        }
     public var literal: Boolean = false
         set(value) {
             if (field != value) {
                 field = value
-                measureDirty = true
+                markMeasureDirty()
             }
         }
     private var measuredFonts = -1
     private var measureDirty = true
 
     override val hasLiveContent: Boolean get() = textProvider != null
+    override val tracksChanges: Boolean get() = true
+
+    private fun markMeasureDirty() {
+        measureDirty = true
+        if (textProvider == null) layoutChanged()
+    }
 
     override fun measureContent() {
         val provider = textProvider
-        if (provider != null) text = provider()
+        if (provider != null) {
+            val next = provider()
+            if (currentText != next) {
+                currentText = next
+                measureDirty = true
+            }
+        }
         if (!measureDirty && measuredFonts == FontManager.revision) return
         remeasure()
         contentRevision++
@@ -48,7 +70,13 @@ public class McTextNode : PolyNode() {
     public fun remeasure() {
         measuredFonts = FontManager.revision
         measureDirty = false
-        val lines = text.lines()
+        val t = currentText
+        if (t.indexOf('\n') < 0 && t.indexOf('\r') < 0) {
+            intrinsicWidth = McFontQueue.measureTextWidth(t, scale, literal)
+            intrinsicHeight = McFontQueue.measureBlockHeight(1, scale)
+            return
+        }
+        val lines = t.lines()
         intrinsicWidth = lines.maxOf { McFontQueue.measureTextWidth(it, scale, literal) }
         intrinsicHeight = McFontQueue.measureBlockHeight(lines.size, scale)
     }
@@ -57,13 +85,20 @@ public class McTextNode : PolyNode() {
         val c = color
         val outline = outlineColor
         val lit = literal
-        val x = x + style.padding.left
-        val y = y + style.padding.top
+        val insets = style.padding
+        val x = x + insets.left
+        val y = y + insets.top
         if (c.chroma && outline == null) {
-            ctx.mcTextLive(text, x, y, { c.argb }, shadow, scale, lit)
-        } else if (c.chroma || outline?.chroma == true) {
-            val t = text; val px = x; val py = y; val sh = shadow; val sc = scale
-            ctx.renderer.live { draw(it, t, px, py, c, outline, sh, sc, lit) }
+            ctx.mcTextLive(text, x, y, IntSupplier { c.argb }, shadow, scale, lit)
+        } else if (outline != null && (c.chroma || outline.chroma)) {
+            val t = text
+            if (t.isEmpty()) return
+            val px = x; val py = y; val sh = shadow; val sc = scale
+            val pad = LIVE_PAD * sc
+            ctx.renderer.live(
+                px - pad, py - pad, intrinsicWidth.coerceAtLeast(0f) + pad * 2f, intrinsicHeight.coerceAtLeast(0f) + pad * 2f,
+                IntSupplier { c.argb * 31 + outline.argb },
+            ) { draw(it, t, px, py, c, outline, sh, sc, lit) }
         } else {
             draw(ctx.renderer, text, x, y, c, outline, shadow, scale, lit)
         }

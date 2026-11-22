@@ -323,7 +323,9 @@ internal object BlazeBackdrop {
 
     private fun stages(start: Src, chain: PolyEffectChain, ctx: Ctx): Src {
         var cur = start
-        for (stage in chain.textureStages) {
+        val stages = chain.textureStages
+        for (i in stages.indices) {
+            val stage = stages[i]
             EffectGpuTimer.mark(EffectGpuTimer.BLUR)
             cur = when (stage) {
                 is PolyEffect.Blur -> blurStage(cur, sigmaOf(stage.radius, ctx), sigmaOf(stage.radiusX, ctx), sigmaOf(stage.radiusY, ctx), ctx) ?: cur

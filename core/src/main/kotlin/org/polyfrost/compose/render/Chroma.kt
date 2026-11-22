@@ -28,6 +28,7 @@ import androidx.compose.ui.unit.Dp
 import org.polyfrost.compose.backend.PolyComposePath
 import org.polyfrost.compose.backend.PolyDrawCanvas
 import org.polyfrost.compose.backend.clipTo
+import java.util.function.IntSupplier
 import kotlin.math.max
 
 public fun chromaBrush(speed: Float = 1f, base: Color = Color.Red): Brush = ChromaBrush(base.toArgb(), speed)
@@ -92,7 +93,7 @@ private class ChromaNode(var color: PolyColor, var shape: Shape, var stroke: Dp?
             (canvas as? PolyDrawCanvas)?.polyOp { pc ->
                 val r = pc.renderer
                 if (!c.chroma) fill(r, outline, c.rawArgb, sw, lines)
-                else r.live(-sw, -sw, w + sw * 2f, h + sw * 2f, { c.argb }) { fill(it, outline, c.argb, sw, lines) }
+                else r.live(-sw, -sw, w + sw * 2f, h + sw * 2f, IntSupplier { c.argb }) { fill(it, outline, c.argb, sw, lines) }
             }
         }
     }
@@ -156,12 +157,13 @@ private class ChromaNode(var color: PolyColor, var shape: Shape, var stroke: Dp?
 
     private fun strokeContours(r: PolyRenderer, outline: Outline, argb: Int, sw: Float, lines: List<FloatArray>) {
         if (outline !is Outline.Generic) {
-            for (l in lines) r.strokePolyline(l, true, argb, sw, PolyRenderer.CAP_BUTT, PolyRenderer.JOIN_MITER)
+            for (i in lines.indices) r.strokePolyline(lines[i], true, argb, sw, PolyRenderer.CAP_BUTT, PolyRenderer.JOIN_MITER)
             return
         }
         r.save()
         r.clipTo(outline.path)
-        for (l in lines) r.strokePolyline(l, true, argb, sw * 2f, PolyRenderer.CAP_BUTT, PolyRenderer.JOIN_MITER)
+        val width = sw * 2f
+        for (i in lines.indices) r.strokePolyline(lines[i], true, argb, width, PolyRenderer.CAP_BUTT, PolyRenderer.JOIN_MITER)
         r.restore()
     }
 }

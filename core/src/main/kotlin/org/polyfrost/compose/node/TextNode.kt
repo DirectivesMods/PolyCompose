@@ -11,6 +11,7 @@ public class TextNode : PolyNode() {
             if (field != value) {
                 field = value
                 measureDirty = true
+                layoutChanged()
             }
         }
     public var color: PolyColor = PolyColor.WHITE
@@ -19,6 +20,7 @@ public class TextNode : PolyNode() {
             if (field != value) {
                 field = value
                 measureDirty = true
+                layoutChanged()
             }
         }
     public var shadow: Boolean = false
@@ -30,11 +32,14 @@ public class TextNode : PolyNode() {
             if (field != value) {
                 field = value
                 measureDirty = true
+                layoutChanged()
             }
         }
 
     private var measureDirty = true
     private var measuredFonts = -1
+
+    override val tracksChanges: Boolean get() = true
 
     private var cachedFont: PolyFont? = null
 
