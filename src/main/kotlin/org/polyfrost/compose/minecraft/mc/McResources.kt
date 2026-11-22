@@ -22,7 +22,7 @@ internal object McResources {
         //~ if = 1.8.9 'Minecraft.getInstance().resourceManager' -> 'ResourceManager.client()'
         val manager = Minecraft.getInstance().resourceManager
         //~ if = 1.8.9 'Identifier.fromNamespaceAndPath' -> 'NamespacedIdentifiers.from'
-        manager.getResource(Identifier.fromNamespaceAndPath(namespace, path)).getOrNull()?.open()?.use { it.readBytes() }
+        manager.getResource(Identifier.fromNamespaceAndPath(namespace, path)).getOrNull()?.open()?.use { it.readAllBytes() }
     }.getOrNull()
 
     fun image(namespace: String, path: String): PolyBitmap? = read(namespace, path)?.let(PolyBitmap::decode)
