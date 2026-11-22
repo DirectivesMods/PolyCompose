@@ -131,6 +131,7 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
 
     override fun mark(): Any {
         flush()
+        transient = false
         return intArrayOf(batches.size, lives.size, drawBoxMark, screenReads)
     }
 
@@ -243,6 +244,17 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
         batches.add(GlProgram.Batch(texture, premultiplied, nearest, verts, colors, blendMode))
     }
 
+    private var transient = false
+
+    override fun submitBuffer(texture: Any, premultiplied: Boolean, nearest: Boolean, verts: FloatArray, colors: IntArray, count: Int, bounds: FloatArray) {
+        if (!transient || !GlLiveArrays.take(count)) return super.submitBuffer(texture, premultiplied, nearest, verts, colors, count, bounds)
+        val v = GlLiveArrays.verts
+        val c = GlLiveArrays.colors
+        System.arraycopy(verts, 0, v, 0, count * 4)
+        System.arraycopy(colors, 0, c, 0, count)
+        submit(texture, premultiplied, nearest, v, c, bounds)
+    }
+
     override val layered: Boolean get() = !GlHost.vanillaPipeline
 
     override fun blendSupported(mode: Int): Boolean = !GlHost.vanillaPipeline && mode in PolyRenderer.BLEND_SRC_OVER..PolyRenderer.BLEND_SCREEN
@@ -283,7 +295,8 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
     private fun grouped(run: List<GlProgram.Batch>, runLives: List<Live>, alpha: Float, effect: GlEffects.Spec?): Group? {
         if (run.isEmpty() && runLives.isEmpty()) return null
         val keys = IntArray(runLives.size)
-        val live = if (runLives.isEmpty()) null else ({ segments(runLives).also { for (i in runLives.indices) keys[i] = runLives[i].stamp } })
+        val segs = if (runLives.isEmpty()) null else Segments()
+        val live = if (segs == null) null else ({ segments(runLives, segs).also { for (i in runLives.indices) keys[i] = runLives[i].stamp } })
         return Group.of(run, live, { anyChanged(runLives, keys) }, liveBox(runLives), alpha, screenW, screenH, effect)
     }
 
@@ -502,19 +515,29 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
 
     fun draw(fbo: Int, w: Int, h: Int, topDown: Boolean, clear: Boolean, kept: Boolean = false): Unit = draw(fbo, w, h, topDown, clear, kept, null)
 
+    private var segmentScratch: Segments? = null
+
+    private fun ownSegments(): Segments = segmentScratch ?: Segments().also { segmentScratch = it }
+
     internal fun draw(fbo: Int, w: Int, h: Int, topDown: Boolean, clear: Boolean, kept: Boolean, vbo: GlProgram.Vbo?) {
         val profile = FrameProfiler.active
+        val segs = ownSegments()
         if (profile == null) {
-            flush()
-            drawBatches(fbo, w, h, topDown, clear, batches, segments(lives), kept, false, vbo)
+            try {
+                flush()
+                drawBatches(fbo, w, h, topDown, clear, batches, segments(lives, segs), kept, false, vbo)
+            } finally {
+                segs.clear()
+            }
             return
         }
         profile.begin(ProfilePhase.Upload)
         val query = GlGpuTimer.begin(profile)
         try {
             flush()
-            drawBatches(fbo, w, h, topDown, clear, batches, segments(lives), kept, false, vbo)
+            drawBatches(fbo, w, h, topDown, clear, batches, segments(lives, segs), kept, false, vbo)
         } finally {
+            segs.clear()
             GlGpuTimer.end(query)
             profile.end()
         }
@@ -523,8 +546,13 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
     //? if = 1.21.1 {
     /*fun drawVanilla(w: Int, h: Int, topDown: Boolean) {
         flush()
-        val segments = segments(lives)
-        if (batches.isNotEmpty() || segments.isNotEmpty()) VanillaProgram.draw(batches, w, h, topDown, segments)
+        val segs = ownSegments()
+        try {
+            val segments = segments(lives, segs)
+            if (batches.isNotEmpty() || segments.isNotEmpty()) VanillaProgram.draw(batches, w, h, topDown, segments)
+        } finally {
+            segs.clear()
+        }
     }
     *///?}
 
@@ -535,19 +563,61 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
 
     private fun flushPending() = flush()
 
-    private fun replay(lives: List<Live>): List<GlProgram.Segment> {
-        val out = ArrayList<GlProgram.Segment>(lives.size)
+    private fun replay(lives: List<Live>, offset: Int, out: Segments) {
         for (i in lives.indices) {
             val l = lives[i]
-            out.add(GlProgram.Segment(l.at, l.cached() ?: run {
-                reset()
-                state = l.state.copy()
+            val cached = l.cached()
+            if (cached != null) {
+                out.add(l.at + offset, cached)
+                continue
+            }
+            reset()
+            state = l.state.copy()
+            transient = l.key == null
+            try {
                 l.draw(this)
                 flush()
-                ArrayList(batches).also(l::keep)
-            }))
+            } finally {
+                transient = false
+            }
+            out.add(l.at + offset, if (l.key != null) ArrayList(batches).also(l::keep) else out.copy(batches))
         }
-        return out
+    }
+
+    internal class Segments {
+        val list = ArrayList<GlProgram.Segment>()
+        private val pool = ArrayList<GlProgram.Segment>()
+        private val copies = ArrayList<ArrayList<GlProgram.Batch>>()
+        private var usedCopies = 0
+
+        fun add(at: Int, batches: List<GlProgram.Batch>) {
+            val n = list.size
+            if (n < pool.size) {
+                val s = pool[n]
+                s.at = at
+                s.batches = batches
+                list.add(s)
+            } else {
+                val s = GlProgram.Segment(at, batches)
+                pool.add(s)
+                list.add(s)
+            }
+        }
+
+        fun copy(batches: List<GlProgram.Batch>): List<GlProgram.Batch> {
+            val n = usedCopies++
+            val out = if (n < copies.size) copies[n] else ArrayList<GlProgram.Batch>(batches.size).also(copies::add)
+            out.ensureCapacity(batches.size)
+            for (i in batches.indices) out.add(batches[i])
+            return out
+        }
+
+        fun clear() {
+            for (i in list.indices) list[i].batches = emptyList()
+            list.clear()
+            for (i in 0 until usedCopies) copies[i].clear()
+            usedCopies = 0
+        }
     }
 
     internal class Layer(private val coalesce: Boolean = false) {
@@ -558,6 +628,8 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
         private var stable = 0
         private var plain = true
         private var glint = false
+        private val ownBatches = ArrayList<GlProgram.Batch>()
+        private val ownLives = ArrayList<Live>()
 
         fun take(renderer: GlRenderer) {
             renderer.flushPending()
@@ -567,8 +639,8 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
                 idle()
                 return
             }
-            raw = ArrayList(next)
-            rawLives = ArrayList(nextLives)
+            raw = refill(ownBatches, next)
+            rawLives = refill(ownLives, nextLives)
             batches = raw
             lives = rawLives
             stable = 0
@@ -616,11 +688,11 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
                 atlasGeneration = generation
                 streak = if (changed) streak + 1 else 0
                 try {
-                    first.appendTo(all, allLives)
-                    second.appendTo(all, allLives)
-                    if (streak > 1 || !first.plain || !second.plain) return direct(fbo, w, h, segments(allLives))
+                    first.appendTo(all)
+                    second.appendTo(all)
+                    if (streak > 1 || !first.plain || !second.plain) return direct(fbo, w, h, liveSegments(first, second))
                     if (changed || !valid || target.width != w || target.height != h) {
-                        val segs = segments(allLives)
+                        val segs = liveSegments(first, second)
                         if (!plainSegments(segs) || !target.ensure(w, h)) return direct(fbo, w, h, segs)
                         drawBatches(target.fbo, w, h, true, true, all, segs, false, true)
                         valid = true
@@ -628,7 +700,7 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
                     drawBatches(fbo, w, h, false, false, quad(w, h), emptyList(), false, false, vbo ?: GlProgram.retain().also { vbo = it })
                 } finally {
                     all.clear()
-                    allLives.clear()
+                    allSegments.clear()
                 }
             }
 
@@ -709,7 +781,24 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
 
         companion object {
             private val all = ArrayList<GlProgram.Batch>()
-            private val allLives = ArrayList<Live>()
+            private val allSegments = Segments()
+
+            private fun <T> refill(own: ArrayList<T>, from: List<T>): ArrayList<T> {
+                own.clear()
+                own.ensureCapacity(from.size)
+                for (i in from.indices) own.add(from[i])
+                return own
+            }
+
+            private fun liveSegments(first: Layer, second: Layer): List<GlProgram.Segment> {
+                val out = allSegments
+                out.clear()
+                if (first.lives.isEmpty() && second.lives.isEmpty()) return out.list
+                val r = replayer()
+                r.replay(first.lives, 0, out)
+                r.replay(second.lives, first.batches.size, out)
+                return out.list
+            }
 
             private fun plainBatches(batches: List<GlProgram.Batch>): Boolean {
                 for (i in batches.indices) {
@@ -730,25 +819,19 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
 
             fun draw(fbo: Int, w: Int, h: Int, topDown: Boolean, clear: Boolean, first: Layer, second: Layer) {
                 try {
-                    first.appendTo(all, allLives)
-                    second.appendTo(all, allLives)
-                    drawBatches(fbo, w, h, topDown, clear, all, segments(allLives), false, true)
+                    first.appendTo(all)
+                    second.appendTo(all)
+                    drawBatches(fbo, w, h, topDown, clear, all, liveSegments(first, second), false, true)
                 } finally {
                     all.clear()
-                    allLives.clear()
+                    allSegments.clear()
                 }
             }
         }
 
-        private fun appendTo(all: ArrayList<GlProgram.Batch>, allLives: ArrayList<Live>) {
-            val offset = all.size
-            val ls = lives
-            for (i in ls.indices) {
-                val l = ls[i]
-                allLives.add(if (offset == 0) l else l.moved(l.at + offset))
-            }
+        private fun appendTo(all: ArrayList<GlProgram.Batch>) {
             val bs = batches
-            all.ensureCapacity(offset + bs.size)
+            all.ensureCapacity(all.size + bs.size)
             for (i in bs.indices) all.add(bs[i])
         }
     }
@@ -969,9 +1052,12 @@ class GlRenderer private constructor(private val inLive: Boolean) : PolyTessella
         private const val COALESCE_FRAMES = 60
         private var liveRenderer: GlRenderer? = null
 
-        fun segments(lives: List<Live>): List<GlProgram.Segment> {
-            if (lives.isEmpty()) return emptyList()
-            return (liveRenderer?.takeIf { it.matches() } ?: GlRenderer(true).also { liveRenderer = it }).replay(lives)
+        fun replayer(): GlRenderer = liveRenderer?.takeIf { it.matches() } ?: GlRenderer(true).also { liveRenderer = it }
+
+        fun segments(lives: List<Live>, out: Segments): List<GlProgram.Segment> {
+            out.clear()
+            if (lives.isNotEmpty()) replayer().replay(lives, 0, out)
+            return out.list
         }
 
         private val transientGroups = ArrayList<Group>()
@@ -1011,6 +1097,76 @@ internal object GlFrames {
         GlProgram.endFrame()
         GlRenderer.Group.endFrame()
         GlTextures.endFrame()
+        GlLiveArrays.endFrame()
+    }
+}
+
+internal object GlLiveArrays {
+    private const val MAX_ARRAYS = 1024
+    private const val MAX_VERTICES = 1 shl 17
+    private const val SCAN = 64
+    private val EMPTY_VERTS = FloatArray(0)
+    private val EMPTY_COLORS = IntArray(0)
+
+    private var freeVerts = ArrayList<FloatArray>()
+    private var freeColors = ArrayList<IntArray>()
+    private var usedVerts = ArrayList<FloatArray>()
+    private var usedColors = ArrayList<IntArray>()
+    private var head = 0
+    private var usedVertices = 0
+
+    var verts: FloatArray = EMPTY_VERTS
+        private set
+    var colors: IntArray = EMPTY_COLORS
+        private set
+
+    init {
+        GlFrames.ensure()
+    }
+
+    fun take(count: Int): Boolean {
+        if (usedColors.size >= MAX_ARRAYS || count > MAX_VERTICES - usedVertices) return false
+        val fc = freeColors
+        val fv = freeVerts
+        val end = min(fc.size, head + SCAN)
+        var i = head
+        while (i < end && fc[i].size != count) i++
+        val v: FloatArray
+        val c: IntArray
+        if (i < end) {
+            c = fc[i]
+            v = fv[i]
+            val h = head
+            fc[i] = fc[h]
+            fv[i] = fv[h]
+            fc[h] = c
+            fv[h] = v
+            head = h + 1
+        } else {
+            c = IntArray(count)
+            v = FloatArray(count * 4)
+        }
+        usedColors.add(c)
+        usedVerts.add(v)
+        usedVertices += count
+        colors = c
+        verts = v
+        return true
+    }
+
+    fun endFrame() {
+        val fv = freeVerts
+        val fc = freeColors
+        fv.clear()
+        fc.clear()
+        freeVerts = usedVerts
+        freeColors = usedColors
+        usedVerts = fv
+        usedColors = fc
+        head = 0
+        usedVertices = 0
+        verts = EMPTY_VERTS
+        colors = EMPTY_COLORS
     }
 }
 
@@ -1119,7 +1275,7 @@ internal object GlProgram {
             }
         }
     }
-    class Segment(val at: Int, val batches: List<Batch>)
+    class Segment(@JvmField var at: Int, @JvmField var batches: List<Batch>)
 
     private val LOG = LoggerFactory.getLogger(GlProgram::class.java)
     private const val STRIDE = 20

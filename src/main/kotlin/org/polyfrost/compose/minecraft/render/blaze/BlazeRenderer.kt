@@ -322,8 +322,16 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
 
     private fun touchText(lines: List<String>, x: Float, y: Float, scale: Float, shadow: Boolean, literal: Boolean) {
         val font = Minecraft.getInstance().font
-        val w = (lines.maxOf { if (literal) font.width(visualOrder(it, true)) else font.width(it) } + 1f) * scale
-        val h = (lines.size * font.lineHeight + 1f) * scale
+        touchText(lines.maxOf { lineWidth(font, it, literal) }, lines.size, x, y, scale, shadow)
+    }
+
+    private fun lineWidth(font: Font, line: String, literal: Boolean): Int =
+        if (literal) font.width(visualOrder(line, true)) else font.width(line)
+
+    private fun touchText(maxWidth: Int, count: Int, x: Float, y: Float, scale: Float, shadow: Boolean) {
+        val font = Minecraft.getInstance().font
+        val w = (maxWidth + 1f) * scale
+        val h = (count * font.lineHeight + 1f) * scale
         val b = deviceBox(x * state.sx + state.tx, y * state.sy + state.ty, (x + w) * state.sx + state.tx, (y + h) * state.sy + state.ty)
         repeat(if (shadow) 2 else 1) {
             beginDraw()
@@ -379,19 +387,29 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
         val c = mulAlpha(color, state.alpha)
         if (c ushr 24 == 0) return
         val scissor = state.clip?.let { rectGui(it[0], it[1], it[2], it[3]) ?: return }
-        val lines = textLines(text)
-        touchText(lines, x, y, scale, shadow, literal)
         val font = Minecraft.getInstance().font
-        lines.forEachIndexed { index, line ->
-            if (line.isEmpty()) return@forEachIndexed
-            val m = lineMatrix(x, y, index, font.lineHeight, scale, snapX)
-            val seq = visualOrder(line, literal)
-            val formatted = '§' in line
-            val baked = if (!keepVertices || (!literal && formatted && line.contains("§k", ignoreCase = true))) null
-                else if (formatted || Language.getInstance().isDefaultRightToLeft) bakeText(font, seq, m, c, shadow, scissor)
-                else GlyphQuads.bake(font, line, m, c, shadow, scissor) ?: bakeText(font, seq, m, c, shadow, scissor)
-            ops.add(BakedTextOp(baked, c) { g, color -> vanillaText(g, font, seq, m, color, shadow, scissor) })
+        if (text.indexOf('\n') < 0 && text.indexOf('\r') < 0) {
+            touchText(lineWidth(font, text, literal), 1, x, y, scale, shadow)
+            textLine(font, text, 0, x, y, c, shadow, scale, literal, snapX, scissor)
+            return
         }
+        val lines = text.lines()
+        touchText(lines, x, y, scale, shadow, literal)
+        for (index in lines.indices) textLine(font, lines[index], index, x, y, c, shadow, scale, literal, snapX, scissor)
+    }
+
+    private fun textLine(
+        font: Font, line: String, index: Int, x: Float, y: Float, c: Int, shadow: Boolean, scale: Float, literal: Boolean, snapX: Boolean,
+        scissor: ScreenRectangle?,
+    ) {
+        if (line.isEmpty()) return
+        val m = lineMatrix(x, y, index, font.lineHeight, scale, snapX)
+        val seq = visualOrder(line, literal)
+        val formatted = '§' in line
+        val baked = if (!keepVertices || (!literal && formatted && line.contains("§k", ignoreCase = true))) null
+            else if (formatted || Language.getInstance().isDefaultRightToLeft) bakeText(font, seq, m, c, shadow, scissor)
+            else GlyphQuads.bake(font, line, m, c, shadow, scissor) ?: bakeText(font, seq, m, c, shadow, scissor)
+        ops.add(BakedTextOp(baked, c) { g, color -> vanillaText(g, font, seq, m, color, shadow, scissor) })
     }
 
     override fun mcTextLive(text: String, x: Float, y: Float, color: () -> Int, shadow: Boolean, scale: Float) {
@@ -749,6 +767,7 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
             private set
         private var held: List<LayerOp> = emptyList()
         private var drawn: List<(GuiGraphicsExtractor) -> Unit>? = null
+        private var drawnRuns: List<(GuiGraphicsExtractor) -> Unit> = emptyList()
         private var drawnKey = 0
         private var drawnPin = BitmapTextures.unpinned
         private var fadedOp: LiveOp? = null
@@ -778,7 +797,8 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
             val cached = drawn
             if (cached != null && keyed != null && k == drawnKey && drawnPin.intact() && !anyIndexed(cached) { LayerOp.closed(it) }) {
                 drawnPin.touch()
-                for (i in cached.indices) cached[i](g)
+                val merged = drawnRuns
+                for (i in merged.indices) merged[i](g)
                 return
             }
             val r = liveRenderer ?: BlazeRenderer(guiScale).also { liveRenderer = it }
@@ -792,10 +812,12 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
                 held = emptyList()
             }
             if (anyIndexed(out) { it is LayerOp }) held = out.filterIsInstance<LayerOp>()
-            for (i in out.indices) out[i](g)
+            val merged = runs(out, false)
+            for (i in merged.indices) merged[i](g)
             gameFrame = r.usesGameFrame
             if (keyed != null) {
                 drawn = out
+                drawnRuns = merged
                 drawnKey = k
                 drawnPin = BitmapTextures.pin(r.bitmaps, false)
             }
@@ -971,6 +993,10 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
 
         fun mergeKey(): Any? = if (keep) MergeKey(pipeline, textureSetup, pose, scissor, lightmap) else null
 
+        fun runsWith(o: Mesh): Boolean =
+            pipeline === o.pipeline && keep == o.keep && lightmap == o.lightmap && backdrop == null && o.backdrop == null &&
+                textureSetup == o.textureSetup && scissor == o.scissor
+
         companion object {
             fun merge(list: List<Mesh>): Mesh {
                 val first = list[0]
@@ -1025,7 +1051,195 @@ class BlazeRenderer(private val guiScale: Float, private val keepVertices: Boole
         override fun bounds() = bounds
     }
 
+    internal class MeshRun(@JvmField val meshes: Array<Mesh>, private val bounds: ScreenRectangle) : (GuiGraphicsExtractor) -> Unit, GuiElementRenderState {
+        override fun invoke(g: GuiGraphicsExtractor) {
+            val ms = meshes
+            val captured = ms[0].gpu != null
+            var uniform = true
+            for (i in 1 until ms.size) if ((ms[i].gpu != null) != captured) {
+                uniform = false
+                break
+            }
+            if (uniform) {
+                for (i in ms.indices) RenderCounters.batch(ms[i].vertexCount)
+                //~ if >= 26.1 'submitGuiElement' -> 'addGuiElement'
+                g.guiRenderState.addGuiElement(this)
+                return
+            }
+            for (i in ms.indices) {
+                RenderCounters.batch(ms[i].vertexCount)
+                //~ if >= 26.1 'submitGuiElement' -> 'addGuiElement'
+                g.guiRenderState.addGuiElement(ms[i])
+            }
+        }
+
+        override fun buildVertices(consumer: VertexConsumer) {
+            val ms = meshes
+            for (i in ms.indices) ms[i].buildVertices(consumer)
+        }
+
+        override fun pipeline() = meshes[0].pipeline()
+        override fun textureSetup() = meshes[0].textureSetup()
+        override fun scissorArea(): ScreenRectangle? = meshes[0].scissorArea()
+        override fun bounds() = bounds
+    }
+
+    private object Runs {
+        const val WINDOW = 48
+        val meshes = ArrayList<Mesh>()
+        val sources = ArrayList<((GuiGraphicsExtractor) -> Unit)?>()
+        var next = IntArray(64)
+        val groupOps = ArrayList<((GuiGraphicsExtractor) -> Unit)?>()
+        var first = IntArray(32)
+        var last = IntArray(32)
+        var count = IntArray(32)
+        var box = IntArray(128)
+
+        val groups: Int get() = groupOps.size
+
+        fun clear() {
+            meshes.clear()
+            sources.clear()
+            groupOps.clear()
+        }
+
+        private fun newGroup(op: ((GuiGraphicsExtractor) -> Unit)?): Int {
+            val g = groupOps.size
+            if (g == first.size) {
+                first = first.copyOf(g * 2)
+                last = last.copyOf(g * 2)
+                count = count.copyOf(g * 2)
+                box = box.copyOf(g * 8)
+            }
+            groupOps.add(op)
+            first[g] = -1
+            last[g] = -1
+            count[g] = 0
+            return g
+        }
+
+        private fun setBox(g: Int, r: ScreenRectangle) {
+            val o = g * 4
+            box[o] = r.left(); box[o + 1] = r.top(); box[o + 2] = r.right(); box[o + 3] = r.bottom()
+        }
+
+        private fun unionBox(g: Int, r: ScreenRectangle) {
+            val o = g * 4
+            box[o] = min(box[o], r.left()); box[o + 1] = min(box[o + 1], r.top())
+            box[o + 2] = max(box[o + 2], r.right()); box[o + 3] = max(box[o + 3], r.bottom())
+        }
+
+        private fun overlaps(g: Int, r: ScreenRectangle): Boolean {
+            val o = g * 4
+            return box[o] < r.right() && r.left() < box[o + 2] && box[o + 1] < r.bottom() && r.top() < box[o + 3]
+        }
+
+        private fun append(g: Int, mesh: Mesh, source: ((GuiGraphicsExtractor) -> Unit)?) {
+            val e = meshes.size
+            if (e == next.size) next = next.copyOf(e * 2)
+            meshes.add(mesh)
+            sources.add(source)
+            next[e] = -1
+            if (last[g] < 0) first[g] = e else next[last[g]] = e
+            last[g] = e
+            count[g]++
+        }
+
+        fun barrier(op: (GuiGraphicsExtractor) -> Unit) {
+            newGroup(op)
+        }
+
+        fun fixed(op: (GuiGraphicsExtractor) -> Unit, meshes: List<Mesh>) {
+            val g = newGroup(op)
+            setBox(g, meshes[0].bounds())
+            for (k in 1 until meshes.size) unionBox(g, meshes[k].bounds())
+        }
+
+        fun place(mesh: Mesh, source: ((GuiGraphicsExtractor) -> Unit)?, floor: Int): Boolean {
+            val b = mesh.bounds()
+            val stop = max(floor, groupOps.size - WINDOW)
+            var g = groupOps.size - 1
+            while (g >= stop) {
+                if (groupOps[g] == null && meshes[first[g]].runsWith(mesh)) {
+                    append(g, mesh, source)
+                    unionBox(g, b)
+                    return true
+                }
+                if (overlaps(g, b)) break
+                g--
+            }
+            val n = newGroup(null)
+            append(n, mesh, source)
+            setBox(n, b)
+            return false
+        }
+
+        fun build(): List<(GuiGraphicsExtractor) -> Unit> {
+            val n = groupOps.size
+            val out = ArrayList<(GuiGraphicsExtractor) -> Unit>(n)
+            for (g in 0 until n) {
+                val op = groupOps[g]
+                if (op != null) {
+                    out.add(op)
+                    continue
+                }
+                val c = count[g]
+                if (c == 1) {
+                    val e = first[g]
+                    out.add(sources[e] ?: MeshOp(meshes[e]))
+                    continue
+                }
+                var e = first[g]
+                val run = Array(c) {
+                    val m = meshes[e]
+                    e = next[e]
+                    m
+                }
+                val o = g * 4
+                out.add(MeshRun(run, ScreenRectangle(box[o], box[o + 1], box[o + 2] - box[o], box[o + 3] - box[o + 1])))
+            }
+            return out
+        }
+    }
+
     companion object {
+        internal fun runs(ops: List<(GuiGraphicsExtractor) -> Unit>, text: Boolean): List<(GuiGraphicsExtractor) -> Unit> {
+            if (ops.size < 2) return ops
+            val r = Runs
+            r.clear()
+            try {
+                var merged = false
+                var floor = 0
+                for (i in ops.indices) {
+                    val op = ops[i]
+                    if (op is MeshOp && !op.mesh.glass) {
+                        if (r.place(op.mesh, op, floor)) merged = true
+                        continue
+                    }
+                    if (text && op is BakedTextOp) {
+                        val meshes = op.meshes
+                        if (meshes != null && !anyIndexed(meshes) { it.closed }) {
+                            val source = if (meshes.size == 1) op else null
+                            for (k in meshes.indices) if (r.place(meshes[k], source, floor)) merged = true
+                            continue
+                        }
+                    }
+                    if (text && op is LiveTextOp) {
+                        val meshes = op.meshes
+                        if (!meshes.isNullOrEmpty() && !anyIndexed(meshes) { it.closed }) {
+                            r.fixed(op, meshes)
+                            continue
+                        }
+                    }
+                    r.barrier(op)
+                    floor = r.groups
+                }
+                return if (merged) r.build() else ops
+            } finally {
+                r.clear()
+            }
+        }
+
         fun coalesce(ops: List<(GuiGraphicsExtractor) -> Unit>): List<(GuiGraphicsExtractor) -> Unit> {
             val out = ArrayList<(GuiGraphicsExtractor) -> Unit>()
             val buckets = ArrayList<ArrayList<Mesh>?>()
@@ -1784,6 +1998,14 @@ internal object KeptMeshes {
     //? if >= 26.2 {
     @JvmStatic
     fun added(draw: Any, element: GuiElementRenderState) {
+        if (element is BlazeRenderer.MeshRun) {
+            val meshes = element.meshes
+            for (i in meshes.indices) {
+                val mesh = kept(meshes[i]) ?: continue
+                (byDraw[draw] ?: list().also { byDraw[draw] = it }).add(mesh)
+            }
+            return
+        }
         val mesh = kept(element) ?: return
         (byDraw[draw] ?: list().also { byDraw[draw] = it }).add(mesh)
     }
@@ -1792,6 +2014,14 @@ internal object KeptMeshes {
 
     @JvmStatic
     fun added(index: Int, element: GuiElementRenderState) {
+        if (element is BlazeRenderer.MeshRun) {
+            val meshes = element.meshes
+            for (i in meshes.indices) {
+                val mesh = kept(meshes[i]) ?: continue
+                (byIndex[index] ?: list().also { byIndex[index] = it }).add(mesh)
+            }
+            return
+        }
         val mesh = kept(element) ?: return
         (byIndex[index] ?: list().also { byIndex[index] = it }).add(mesh)
     }
@@ -2016,12 +2246,13 @@ internal class Recording(private val coalesce: Boolean = true, private val coale
             gameFrame = renderer.usesGameFrame
             stable = 0
             pin.touch()
+            if (ops !== raw && (anyIndexed(textTextures) { it.isClosed } || stale())) ops = raw
             return
         }
         val old = raw
         raw = if (copy) ArrayList(next) else next
         LayerOp.retire(old, raw)
-        ops = raw
+        ops = BlazeRenderer.runs(raw, true)
         stable = 0
         gameFrame = renderer.usesGameFrame
         lives = if (anyIndexed(raw) { it is LiveDraw }) raw.filterIsInstance<LiveDraw>() else emptyList()

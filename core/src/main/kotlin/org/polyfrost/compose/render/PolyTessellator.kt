@@ -35,7 +35,20 @@ public abstract class PolyTessellator : PolyRenderer {
 
         @JvmField internal var region: Region? = null
 
+        @JvmField internal var pooled: Boolean = false
+
         public fun copy(): State = State(sx, sy, tx, ty, alpha, clip, rclip, mask, glyphScale, rot, hole).also { it.proj = proj; it.region = region }
+
+        internal fun setFrom(o: State): State {
+            sx = o.sx; sy = o.sy; tx = o.tx; ty = o.ty; alpha = o.alpha
+            clip = o.clip; rclip = o.rclip; mask = o.mask; glyphScale = o.glyphScale; rot = o.rot; hole = o.hole
+            proj = o.proj; region = o.region
+            return this
+        }
+
+        internal fun release() {
+            clip = null; rclip = null; mask = null; rot = null; hole = null; proj = null; region = null
+        }
     }
 
     internal class RegionPiece(
@@ -2082,6 +2095,7 @@ public abstract class PolyTessellator : PolyRenderer {
 
     public fun swapState(saved: Any): Any {
         val prev = state
+        prev.pooled = false
         state = (saved as State).copy()
         return prev
     }
@@ -2112,9 +2126,21 @@ public abstract class PolyTessellator : PolyRenderer {
 
     public fun restoreState(saved: Any) { state = (saved as State).copy() }
 
+    private val statePool = arrayOfNulls<State>(STATE_POOL)
+    private var statePoolSize = 0
+
     override fun save() {
-        stack.addLast(state)
-        state = state.copy()
+        val s = state
+        stack.addLast(s)
+        val n = statePoolSize
+        if (n == 0) {
+            state = s.copy().also { it.pooled = true }
+            return
+        }
+        statePoolSize = n - 1
+        val p = statePool[n - 1]!!
+        statePool[n - 1] = null
+        state = p.setFrom(s)
     }
 
     override fun restore() {
@@ -2123,8 +2149,13 @@ public abstract class PolyTessellator : PolyRenderer {
             endLayer(l)
             if (l.resume >= 0) wantBlend = l.resume
         }
+        val done = state
         state = stack.removeLast()
         if (stack.size < discardFrom) discardFrom = Int.MAX_VALUE
+        if (done.pooled && done !== state && statePoolSize < STATE_POOL) {
+            done.release()
+            statePool[statePoolSize++] = done
+        }
     }
 
     override fun saveLayerAlpha(alpha: Float) {
@@ -3128,7 +3159,7 @@ public abstract class PolyTessellator : PolyRenderer {
         if (count == 0) return
         val b = boundsTmp
         b[0] = minX; b[1] = minY; b[2] = maxX; b[3] = maxY
-        submit(batchTexture, batchPremul, batchNearest, verts.copyOf(count * 4), colors.copyOf(count), b)
+        submitBuffer(batchTexture, batchPremul, batchNearest, verts, colors, count, b)
         count = 0
         whiteOnly = true
         minX = Float.MAX_VALUE; minY = Float.MAX_VALUE; maxX = -Float.MAX_VALUE; maxY = -Float.MAX_VALUE
@@ -3136,9 +3167,12 @@ public abstract class PolyTessellator : PolyRenderer {
 
     private val boundsTmp = FloatArray(4)
 
+    protected open fun submitBuffer(texture: Any, premultiplied: Boolean, nearest: Boolean, verts: FloatArray, colors: IntArray, count: Int, bounds: FloatArray) {
+        submit(texture, premultiplied, nearest, verts.copyOf(count * 4), colors.copyOf(count), bounds)
+    }
+
     private fun submitPrefix(n: Int) {
-        val v = verts.copyOf(n * 4)
-        submit(batchTexture, batchPremul, batchNearest, v, colors.copyOf(n), boundsOf(v, n))
+        submitBuffer(batchTexture, batchPremul, batchNearest, verts, colors, n, boundsOf(verts, n))
         System.arraycopy(verts, n * 4, verts, 0, (count - n) * 4)
         System.arraycopy(colors, n, colors, 0, count - n)
         count -= n
@@ -3721,21 +3755,24 @@ public abstract class PolyTessellator : PolyRenderer {
     private fun cutQuad(box: FloatArray?, clipped: RClip?, masked: Mask?, hole: RClip?, region: Region?) {
         var crosses = 0
         if (box != null) {
-            val x0 = min(min(qx[0], qx[1]), min(qx[2], qx[3])); val x1 = max(max(qx[0], qx[1]), max(qx[2], qx[3]))
-            val y0 = min(min(qy[0], qy[1]), min(qy[2], qy[3])); val y1 = max(max(qy[0], qy[1]), max(qy[2], qy[3]))
-            if (x1 <= box[0] || x0 >= box[2] || y1 <= box[1] || y0 >= box[3]) return
-            if (x0 < box[0]) crosses = 1
-            if (x1 > box[2]) crosses = crosses or 2
-            if (y0 < box[1]) crosses = crosses or 4
-            if (y1 > box[3]) crosses = crosses or 8
-            if (crosses != 0 && clearOutside(box)) crosses = 0
+            val bl = box[0]; val bt = box[1]; val br = box[2]; val bb = box[3]
+            if (allAtMost(qx, bl) || allAtLeast(qx, br) || allAtMost(qy, bt) || allAtLeast(qy, bb)) return
+            if (!allWithin(qx, bl, br) || !allWithin(qy, bt, bb)) {
+                val x0 = min(min(qx[0], qx[1]), min(qx[2], qx[3])); val x1 = max(max(qx[0], qx[1]), max(qx[2], qx[3]))
+                val y0 = min(min(qy[0], qy[1]), min(qy[2], qy[3])); val y1 = max(max(qy[0], qy[1]), max(qy[2], qy[3]))
+                if (x0 < bl) crosses = 1
+                if (x1 > br) crosses = crosses or 2
+                if (y0 < bt) crosses = crosses or 4
+                if (y1 > bb) crosses = crosses or 8
+                if (crosses != 0 && clearOutside(box)) crosses = 0
+            }
         }
         var rclip = clipped
         while (rclip != null && quadInside(rclip)) rclip = rclip.parent
         var mask = masked
         while (mask != null && maskOpaque(mask.fade)) mask = mask.parent
         if (crosses == 0 && rclip == null && mask == null && hole == null && region == null) {
-            for (i in 0 until 4) emit(qx[i], qy[i], qu[i], qv[i], qc[i])
+            emitQuad()
         } else {
             polyUsed = 0
             val quad = poly()
@@ -3866,6 +3903,58 @@ public abstract class PolyTessellator : PolyRenderer {
             }
         }
         return after
+    }
+
+    private fun allAtMost(p: FloatArray, at: Float): Boolean = p[0] <= at && p[1] <= at && p[2] <= at && p[3] <= at
+
+    private fun allAtLeast(p: FloatArray, at: Float): Boolean = p[0] >= at && p[1] >= at && p[2] >= at && p[3] >= at
+
+    private fun allWithin(p: FloatArray, lo: Float, hi: Float): Boolean {
+        for (i in 0 until 4) {
+            val v = p[i]
+            if (!(v >= lo && v <= hi)) return false
+        }
+        return true
+    }
+
+    private fun emitQuad() {
+        var n = count
+        if (n + 4 > colors.size) {
+            val cap = colors.size * 2
+            colors = colors.copyOf(cap)
+            verts = verts.copyOf(cap * 4)
+        }
+        val vs = verts
+        val cs = colors
+        val tracked = boxCount > 0
+        val o = boxCount * BOX - BOX
+        val bx = boxes
+        var tl = if (tracked) bx[o] else 0f
+        var tt = if (tracked) bx[o + 1] else 0f
+        var tr = if (tracked) bx[o + 2] else 0f
+        var tb = if (tracked) bx[o + 3] else 0f
+        var l = minX; var t = minY; var r = maxX; var b = maxY
+        for (i in 0 until 4) {
+            val x = qx[i]; val y = qy[i]
+            val k = n * 4
+            vs[k] = x; vs[k + 1] = y; vs[k + 2] = qu[i]; vs[k + 3] = qv[i]
+            cs[n++] = qc[i]
+            if (tracked) {
+                if (x < tl) tl = x
+                if (y < tt) tt = y
+                if (x > tr) tr = x
+                if (y > tb) tb = y
+            }
+            if (x < l) l = x
+            if (y < t) t = y
+            if (x > r) r = x
+            if (y > b) b = y
+        }
+        count = n
+        if (tracked) {
+            bx[o] = tl; bx[o + 1] = tt; bx[o + 2] = tr; bx[o + 3] = tb
+        }
+        minX = l; minY = t; maxX = r; maxY = b
     }
 
     private fun emit(x: Float, y: Float, u: Float, v: Float, color: Int) {
@@ -4178,6 +4267,7 @@ public abstract class PolyTessellator : PolyRenderer {
 
     public companion object {
         private const val MAX_FADE_DRAWS = 16
+        private const val STATE_POOL = 32
         private const val BOX = 6
         private const val BOX_SELF = 4
         private const val BOX_BLEND = 5

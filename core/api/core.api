@@ -2723,6 +2723,7 @@ public abstract class org/polyfrost/compose/render/PolyTessellator : org/polyfro
 	public fun strokePolylineGradient ([FZFFFFLorg/polyfrost/compose/render/PolyGradient;FII)V
 	public fun strokePolylineGradient ([FZFFFFLorg/polyfrost/compose/render/PolyGradient;FIIF)V
 	protected abstract fun submit (Ljava/lang/Object;ZZ[F[I[F)V
+	protected fun submitBuffer (Ljava/lang/Object;ZZ[F[II[F)V
 	public final fun swapState (Ljava/lang/Object;)Ljava/lang/Object;
 	public fun text (Ljava/lang/String;FFILorg/polyfrost/compose/render/PolyFont;)V
 	public fun text (Ljava/lang/String;FFILorg/polyfrost/compose/render/PolyFont;F)V
