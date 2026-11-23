@@ -1,5 +1,9 @@
 # Changelog
 
+## [3.0.6]
+
+- Fixed hotbar items disappearing with VanillaHUD when a GUI scale mod such as Precise GUI Scale or FineScale is used on 26.1 and newer
+
 ## [3.0.5]
 
 - Improved HUD performance: live canvas batches that haven't changed stay in the shared vertex buffer instead of being uploaded again every frame below 1.21.11, and text repaints reuse measured line widths on 1.21.11 and newer
