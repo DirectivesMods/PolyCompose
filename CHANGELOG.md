@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.0.5]
+
+- Improved HUD performance: live canvas batches that haven't changed stay in the shared vertex buffer instead of being uploaded again every frame below 1.21.11, and text repaints reuse measured line widths on 1.21.11 and newer
+- Animated item icons are drawn by the game's own item renderer on 1.21.11 and newer instead of being rendered into the atlas again every tick
+- Fixed enchanted item icons showing a dark square on 1.8.9 when the glint overlay isn't available
+- Added `GuiItemRenderer`, which the 1.21.11 and newer renderer implements, for drawing an item through the game's GUI item pass
+
 ## [3.0.4]
 
 - Improved HUD performance on every version, most of all on 1.8.9. HUDs that haven't changed are no longer laid out and recorded again each frame, 1.8.9 and 1.16 to 1.21.10 keep the HUD in a cached texture, and text, item icons and both renderers allocate much less per frame
