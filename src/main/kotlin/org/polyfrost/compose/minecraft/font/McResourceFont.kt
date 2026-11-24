@@ -29,8 +29,6 @@ import net.minecraft.resources.Identifier
 import org.polyfrost.compose.minecraft.compat.ArgentumCompat
 *///?}
 
-// below 1.21.11 the tessellator can't draw with the game's font, so it's rebuilt here from the active resources' font definitions;
-// on 1.8.9, which has none, from whatever the text renderer loaded
 internal object McResourceFont {
     private val LOGGER = LoggerFactory.getLogger("PolyCompose/McResourceFont")
 
@@ -41,8 +39,7 @@ internal object McResourceFont {
     private const val UNIHEX_HEIGHT = 16
     private const val UNIHEX_SHEET_WIDTH = 256
     //? if = 1.8.9 {
-    /*// TextRenderer's sheet slots, row by row
-    private const val SHEET_CHARS =
+    /*private const val SHEET_CHARS =
         "ÀÁÂÈÊËÍÓÔÕÚßãõğİ" +
         "ıŒœŞşŴŵžȇ\u0000\u0000\u0000\u0000\u0000\u0000\u0000" +
         " !\"#\$%&'()*+,-./" +
@@ -83,7 +80,7 @@ internal object McResourceFont {
         }
     }
 
-    private class LegacyUnicode(val sizes: ByteArray, val readPage: (Int) -> PolyBitmap?) {
+    private class LegacyUnicode(val sizes: ByteArray, val boldOffset: Float, val shadow: Float, val readPage: (Int) -> PolyBitmap?) {
         private val pages = ConcurrentHashMap<Int, Optional<PolyBitmap>>()
 
         fun glyph(cp: Int): McGlyph? {
@@ -96,10 +93,9 @@ internal object McResourceFont {
             val page = pages.computeIfAbsent(cp ushr 8) { Optional.ofNullable(readPage(it)) }.orElse(null) ?: return null
             val x = (cp and 15) * 16 + start
             val y = (cp ushr 4 and 15) * 16
-            // vanilla truncates the pen to whole units after each glyph
             return McGlyph(
                 page, x / 256f, y / 256f, (x + columns) / 256f, (y + 16) / 256f,
-                0f, columns / 2f, 8f, (columns / 2 + 1).toFloat(), 0.5f,
+                0f, columns / 2f, 8f, (columns / 2 + 1).toFloat(), boldOffset, 1f, shadow,
             )
         }
     }
@@ -262,12 +258,13 @@ internal object McResourceFont {
     }
 
     //? if = 1.8.9 {
-    /*private class RendererState(val sheet: String, val advances: FloatArray, val unicode: Boolean)
+    /*private class RendererState(val sheet: String, val advances: FloatArray, val unicode: Boolean, val argentum: Boolean)
 
     private fun captureRenderer(): RendererState? {
         val renderer = Minecraft.getInstance().font ?: return null
-        val advances = ArgentumCompat.sheetAdvances(renderer) ?: FloatArray(SHEET_CHARS.length) { renderer.getWidth(SHEET_CHARS[it]).toFloat() }
-        return RendererState(renderer.fontLocation.toString(), advances, renderer.unicode)
+        val argentum = ArgentumCompat.sheetAdvances(renderer)
+        val advances = argentum ?: FloatArray(SHEET_CHARS.length) { renderer.getWidth(SHEET_CHARS[it]).toFloat() }
+        return RendererState(renderer.fontLocation.toString(), advances, renderer.unicode, argentum != null)
     }
 
     private fun loadRendererFont(rm: ResourceManager, renderer: RendererState): Font {
@@ -275,11 +272,12 @@ internal object McResourceFont {
         glyphs[' '.code] = McGlyph(null, 0f, 0f, 0f, 0f, 0f, 0f, 0f, renderer.advances[SHEET_CHARS.indexOf(' ')], 1f)
         if (!renderer.unicode) loadRendererSheet(rm, renderer, glyphs)
         val layers = arrayListOf(Layer(glyphs, emptyMap()))
-        loadLegacyUnicode(rm, "minecraft:font/glyph_sizes.bin", "minecraft:font/unicode_page_%s.png")?.let { layers += Layer(emptyMap(), emptyMap(), legacy = it) }
+        val vanillaWhole = !renderer.argentum && !renderer.unicode
+        loadLegacyUnicode(rm, "minecraft:font/glyph_sizes.bin", "minecraft:font/unicode_page_%s.png", if (vanillaWhole) 1f else 0.5f, if (vanillaWhole) 0f else 0.5f)
+            ?.let { layers += Layer(emptyMap(), emptyMap(), legacy = it) }
         return Font(layers)
     }
 
-    // like TextRenderer, each glyph draws advance - 1 units of its cell
     private fun loadRendererSheet(rm: ResourceManager, renderer: RendererState, out: MutableMap<Int, McGlyph>) {
         val image = read(rm, renderer.sheet, "")?.let(PolyBitmap::decode) ?: return
         val cellW = image.width / 16
@@ -306,12 +304,12 @@ internal object McResourceFont {
     private fun loadLegacyUnicode(rm: ResourceManager, provider: JsonObject): LegacyUnicode? {
         val sizesPath = provider.get("sizes")?.asString ?: return null
         val template = provider.get("template")?.asString ?: return null
-        return loadLegacyUnicode(rm, sizesPath, template)
+        return loadLegacyUnicode(rm, sizesPath, template, 0.5f, 0.5f)
     }
 
-    private fun loadLegacyUnicode(rm: ResourceManager, sizesPath: String, template: String): LegacyUnicode? {
+    private fun loadLegacyUnicode(rm: ResourceManager, sizesPath: String, template: String, boldOffset: Float, shadow: Float): LegacyUnicode? {
         val sizes = read(rm, sizesPath, "") ?: return null
-        return LegacyUnicode(sizes) { page ->
+        return LegacyUnicode(sizes, boldOffset, shadow) { page ->
             val path = template.replace("%s", String.format(Locale.ROOT, "%02x", page))
             read(rm, path, "textures/")?.let(PolyBitmap::decode)
         }

@@ -6,7 +6,6 @@ import net.minecraft.client.render.TextRenderer
 import org.polyfrost.compose.minecraft.platform.LoadedMods
 import org.slf4j.LoggerFactory
 
-// Argentum's unrounded sheet widths (fractional under Cera's HD fonts), which TextRenderer.getWidth rounds
 object ArgentumCompat {
     private class Batcher(val get: Method, val width: Method)
 
@@ -23,7 +22,6 @@ object ArgentumCompat {
 
     @JvmStatic
     fun sheetAdvances(renderer: TextRenderer): FloatArray? {
-        // vanilla text mode; only some versions have isVanilla()
         if (java.lang.Boolean.getBoolean("argentum.vanillaText")) return null
         val b = batcher ?: return null
         return runCatching {
