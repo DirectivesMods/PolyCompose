@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [3.0.7]
 
 - Added `McHeadStyle` and `McPlayerFaces.drawHead` for drawing player heads as only the face, flat, or in 3D with the hat at 9/8 the size of the face like the player model. `McPlayerFace` and `NodeMcPlayerFace` take a style too
 - Fixed translucent hats showing the face through them. Each head is now drawn as one image
