@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+- Added `McHeadStyle` and `McPlayerFaces.drawHead` for drawing player heads as only the face, flat, or in 3D with the hat at 9/8 the size of the face like the player model. `McPlayerFace` and `NodeMcPlayerFace` take a style too
+- Fixed translucent hats showing the face through them. Each head is now drawn as one image
+- Fixed players on a default skin having their skin downloaded when the player list already had it
+- Fixed a player's skin being downloaded again after they left the player list
+- Fixed 3D heads losing detail on HD skins
+- Fixed player faces on 1.8.9 staying on Steve or Alex when the skin was still downloading
+- Fixed player faces read by texture keeping old images after a resource reload
+- Your own face on 1.8.9 now follows your player's skin, the same as on newer versions
+
 ## [3.0.6]
 
 - Fixed hotbar items disappearing with VanillaHUD when a GUI scale mod such as Precise GUI Scale or FineScale is used on 26.1 and newer

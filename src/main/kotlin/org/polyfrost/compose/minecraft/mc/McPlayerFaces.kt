@@ -3,6 +3,7 @@ package org.polyfrost.compose.minecraft.mc
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.snapshots.Snapshot
@@ -19,6 +20,7 @@ import java.nio.charset.StandardCharsets
 import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.delay
 import net.minecraft.client.Minecraft
 import net.minecraft.resources.Identifier
 import org.polyfrost.compose.backend.drawPoly
@@ -28,6 +30,7 @@ import org.polyfrost.compose.composables.size
 import org.polyfrost.compose.minecraft.platform.BackgroundTasks
 import org.polyfrost.compose.minecraft.platform.HostEvents
 import org.polyfrost.compose.minecraft.platform.RenderThread
+import org.polyfrost.compose.mc.McHeadBake
 import org.polyfrost.compose.render.FilterQuality
 import org.polyfrost.compose.render.PolyBitmap
 import org.polyfrost.compose.render.RenderContext
@@ -44,6 +47,16 @@ import org.lwjgl.opengl.GL11
 
 //? if > 1.8.9
 import net.minecraft.client.resources.DefaultPlayerSkin
+//? if = 1.8.9 {
+/*import net.minecraft.client.render.texture.HttpTexture
+import org.polyfrost.compose.minecraft.mixin.render.HttpTextureAccessor
+*///?}
+
+enum class McHeadStyle {
+    FACE,
+    FLAT,
+    LAYERED,
+}
 
 class McSkinLayers internal constructor(
     val texture: String,
@@ -54,22 +67,14 @@ class McSkinLayers internal constructor(
     val size: Int
         get() = face.width
 
-    val flattened: PolyBitmap by lazy {
-        if (!hasHat) return@lazy face
-        val out = face.pixels.copyOf()
-        val top = hat.pixels
-        for (i in 0 until out.size / 4) {
-            val o = i * 4
-            val alpha = top[o + 3].toInt() and 0xFF
-            if (alpha == 0) continue
-            for (c in 0 until 3) {
-                val b = out[o + c].toInt() and 0xFF
-                val t = top[o + c].toInt() and 0xFF
-                out[o + c] = ((t * alpha + b * (255 - alpha)) / 255).toByte()
-            }
-            out[o + 3] = 0xFF.toByte()
-        }
-        PolyBitmap(face.width, face.height, out)
+    val layered: PolyBitmap by lazy { if (hasHat) McHeadBake.layered(face, hat) else face }
+
+    val flattened: PolyBitmap by lazy { if (hasHat) McHeadBake.flat(face, hat) else face }
+
+    fun bitmap(style: McHeadStyle): PolyBitmap = when {
+        !hasHat || style == McHeadStyle.FACE -> face
+        style == McHeadStyle.FLAT -> flattened
+        else -> layered
     }
 }
 
@@ -105,12 +110,15 @@ object McPlayerFaces {
         @Volatile var fetching = false
         var attempts = 0
         var clientKey: String? = null
+        var clientTexture: Any? = null
         var client: McSkinLayers? = null
+        var observed: McSkinLayers? = null
+        var observedDefault = false
         var clientCheckedAt = 0L
         @Volatile var lastUsed = 0L
     }
 
-    private class TextureLayers(val result: McSkinLayersResult, val readAt: Long)
+    private class TextureLayers(val result: McSkinLayersResult, val readAt: Long, val location: Identifier?, val owner: Any?)
 
     private val revisionState = mutableIntStateOf(0)
     private val entries = lru<UUID, Entry>()
@@ -120,6 +128,7 @@ object McPlayerFaces {
     private val textures = lru<String, TextureLayers>()
     private var tickHook: AutoCloseable? = null
     private var reloadHook: AutoCloseable? = null
+    @Volatile private var hooksQueued = false
     private var ticks = 0
 
     @JvmStatic
@@ -160,6 +169,7 @@ object McPlayerFaces {
 
     @JvmStatic
     fun defaultLayers(id: UUID): McSkinLayers? {
+        ensureHooks()
         val (namespace, path) = defaultSkin(id)
         val key = "$namespace:$path"
         synchronized(defaults) { if (defaults.containsKey(key)) return defaults[key] }
@@ -170,17 +180,30 @@ object McPlayerFaces {
 
     @JvmStatic
     fun layers(texture: String): McSkinLayersResult {
+        ensureHooks()
         val now = System.nanoTime()
-        synchronized(textures) {
-            val known = textures[texture]
-            if (known != null && (known.result is McSkinLayersResult.Loaded || now - known.readAt < UNREADABLE_RETRY_NS)) return known.result
+        val render = RenderThread.isCurrent()
+        val known = synchronized(textures) { textures[texture] }
+        if (known != null) {
+            if (known.result !is McSkinLayersResult.Loaded) {
+                if (now - known.readAt < UNREADABLE_RETRY_NS) return known.result
+            } else if (!render || known.location == null || textureOwner(known.location) === known.owner) {
+                return known.result
+            }
         }
-        if (!RenderThread.isCurrent()) return McSkinLayersResult.Pending
+        if (!render) return McSkinLayersResult.Pending
         val location = parse(texture) ?: return McSkinLayersResult.Unreadable
-        val bitmap = readTexture(location) ?: McResources.image(location.namespace, location.path)
-        val result = bitmap?.let { buildLayers(texture, it, opaqueFace = false) }?.let(McSkinLayersResult::Loaded)
-            ?: McSkinLayersResult.Unreadable
-        synchronized(textures) { textures[texture] = TextureLayers(result, now) }
+        val result = when (download(location)) {
+            Download.PENDING -> McSkinLayersResult.Pending
+            Download.FAILED -> McSkinLayersResult.Unreadable
+            Download.DONE -> {
+                val bitmap = readTexture(location) ?: McResources.image(location.namespace, location.path)
+                bitmap?.let { buildLayers(texture, it, opaqueFace = false) }?.let(McSkinLayersResult::Loaded)
+                    ?: if (awaitingUpload(location)) McSkinLayersResult.Pending else McSkinLayersResult.Unreadable
+            }
+        }
+        val owner = if (result is McSkinLayersResult.Loaded) textureOwner(location) else null
+        synchronized(textures) { textures[texture] = TextureLayers(result, now, location, owner) }
         return result
     }
 
@@ -188,8 +211,26 @@ object McPlayerFaces {
     @JvmOverloads
     fun draw(ctx: RenderContext, layers: McSkinLayers, x: Float, y: Float, w: Float, h: Float, hat: Boolean = true) {
         if (w <= 0f || h <= 0f) return
-        ctx.image(layers.face, x, y, w, h, FilterQuality.None)
-        if (hat && layers.hasHat) ctx.image(layers.hat, x, y, w, h, FilterQuality.None)
+        ctx.image(if (hat && layers.hasHat) layers.flattened else layers.face, x, y, w, h, FilterQuality.None)
+    }
+
+    @JvmStatic
+    @JvmOverloads
+    fun drawHead(
+        ctx: RenderContext,
+        layers: McSkinLayers,
+        x: Float,
+        y: Float,
+        size: Float,
+        style: McHeadStyle = McHeadStyle.FLAT,
+        flip: Boolean = false,
+        tint: Int = -1,
+    ) {
+        if (size <= 0f || tint ushr 24 == 0) return
+        val overhang = if (style == McHeadStyle.LAYERED && layers.hasHat) size / 16f else 0f
+        val side = size + 2f * overhang
+        val v0 = if (flip) 1f else 0f
+        ctx.renderer.image(layers.bitmap(style), x - overhang, y - overhang, side, side, 0f, v0, 1f, 1f - v0, tint, FilterQuality.None)
     }
 
     @JvmStatic
@@ -200,14 +241,25 @@ object McPlayerFaces {
             for (entry in entries.values) {
                 entry.client = null
                 entry.clientKey = null
+                entry.clientTexture = null
                 entry.clientCheckedAt = 0L
+                if (entry.observedDefault) entry.observed = null
             }
         }
         bump()
     }
 
     private fun ensureHooks() {
-        if (!RenderThread.isCurrent()) return
+        if (!RenderThread.isCurrent()) {
+            if ((reloadHook == null || tickHook == null) && !hooksQueued) {
+                hooksQueued = true
+                RenderThread.schedule {
+                    hooksQueued = false
+                    ensureHooks()
+                }
+            }
+            return
+        }
         if (reloadHook == null) reloadHook = HostEvents.onResourcesReloaded(::invalidate)
         if (tickHook == null) tickHook = HostEvents.onClientTick(::onTick)
     }
@@ -232,17 +284,31 @@ object McPlayerFaces {
         entry.clientCheckedAt = now
         val location = runCatching { clientSkin(entry.id) }.getOrNull()
         val key = location?.toString()
-        if (key == entry.clientKey && (entry.client != null || key == null)) return
-        val layers = location?.let { runCatching { readTexture(it) }.getOrNull() }?.let { buildLayers(key!!, it, opaqueFace = true) }
-        val changed = entry.clientKey != key || entry.client !== layers
-        entry.clientKey = key
+        val owner = location?.let(::textureOwner)
+        if (key != null && key == entry.clientKey && owner === entry.clientTexture) return
+        val read = when {
+            location == null || download(location) != Download.DONE -> null
+            key == defaultKey(entry.id) -> replacedDefault(location)?.let { buildLayers(key, it, opaqueFace = true) } ?: defaultLayers(entry.id)
+            else -> runCatching { readTexture(location) ?: McResources.image(location.namespace, location.path) }.getOrNull()
+                ?.let { buildLayers(key!!, it, opaqueFace = true) }
+        }
+        if (read != null) {
+            entry.observed = read
+            entry.observedDefault = key == defaultKey(entry.id)
+        }
+        entry.clientKey = if (read != null) key else null
+        entry.clientTexture = if (read != null) owner else null
+        val layers = read ?: entry.observed ?: if (entry.observedDefault) defaultLayers(entry.id) else null
+        if (layers === entry.client) return
         entry.client = layers
-        if (changed && (layers != null || entry.fetched == null)) bump()
+        bump()
     }
 
     private fun ensureFetch(entry: Entry) {
-        if (entry.settled || entry.fetching) return
-        entry.fetching = true
+        synchronized(entry) {
+            if (entry.settled || entry.fetching) return
+            entry.fetching = true
+        }
         enqueueFetch(entry)
     }
 
@@ -346,10 +412,11 @@ object McPlayerFaces {
         //?} else
         //return skin.texture()
         //?} else {
-        /*val info = mc.networkHandler?.getOnlinePlayer(id) ?: return null
-        return if (info.hasSkinTexture()) info.skinTexture else null
+        /*return mc.player?.takeIf { it.getUuid() == id }?.skinTextureLocation ?: mc.networkHandler?.getOnlinePlayer(id)?.skinTexture
         *///?}
     }
+
+    private fun defaultKey(id: UUID): String = defaultSkin(id).let { (namespace, path) -> "$namespace:$path" }
 
     private fun defaultSkin(id: UUID): Pair<String, String> {
         //? if > 1.8.9 {
@@ -360,6 +427,50 @@ object McPlayerFaces {
         return location.namespace to location.path
         //?} else
         //return McResources.DEFAULT_NAMESPACE to if ((id.hashCode() and 1) == 1) "textures/entity/alex.png" else "textures/entity/steve.png"
+    }
+
+    private enum class Download { DONE, PENDING, FAILED }
+
+    private fun download(location: Identifier): Download {
+        //? if = 1.8.9 {
+        /*val texture = Minecraft.getInstance().textureManager.getTexture(location) as? HttpTexture ?: return Download.DONE
+        val access = texture as HttpTextureAccessor
+        fun uploaded(): Boolean {
+            val previous = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D)
+            try {
+                texture.getGlId()
+            } finally {
+                bindTexture(previous)
+            }
+            return access.`polycompose$isUploaded`()
+        }
+        if (uploaded()) return Download.DONE
+        val downloader = access.`polycompose$getDownloader`()
+        if (downloader == null || downloader.isAlive) return Download.PENDING
+        return if (uploaded()) Download.DONE else Download.FAILED
+        *///?} else
+        return Download.DONE
+    }
+
+    private fun textureOwner(location: Identifier): Any? = runCatching { Minecraft.getInstance().textureManager.getTexture(location) }.getOrNull()
+
+    private fun replacedDefault(location: Identifier): PolyBitmap? {
+        //? if >= 1.21.4 {
+        return runCatching { readTexture(location) }.getOrNull()
+        //?} else
+        //return null
+    }
+
+    private fun awaitingUpload(location: Identifier): Boolean {
+        //? if >= 1.21.4 {
+        return false
+        //?} elif > 1.8.9 {
+        /*val texture = Minecraft.getInstance().textureManager.getTexture(location) ?: return false
+        return glWidth(texture.id) <= 0
+        *///?} else {
+        /*val texture = Minecraft.getInstance().textureManager.getTexture(location) ?: return true
+        return glWidth(texture.glId) <= 0
+        *///?}
     }
 
     private fun readTexture(location: Identifier): PolyBitmap? {
@@ -415,6 +526,17 @@ object McPlayerFaces {
         }
     }
 
+    private fun glWidth(id: Int): Int {
+        if (id <= 0) return 0
+        val previous = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D)
+        bindTexture(id)
+        try {
+            return GL11.glGetTexLevelParameteri(GL11.GL_TEXTURE_2D, 0, GL11.GL_TEXTURE_WIDTH)
+        } finally {
+            bindTexture(previous)
+        }
+    }
+
     private fun bindTexture(id: Int) {
         //? if > 1.8.9 {
         GlStateManager._bindTexture(id)
@@ -447,7 +569,9 @@ object McPlayerFaces {
             }
             return PolyBitmap(size, size, out)
         }
-        return McSkinLayers(texture, layer(8, opaqueFace, true), layer(40, false, hasHat), hasHat)
+        val face = layer(8, opaqueFace, true)
+        val hat = layer(40, false, hasHat)
+        return McSkinLayers(texture, face, hat, hasHat && (3 until hat.pixels.size step 4).any { hat.pixels[it] != 0.toByte() })
     }
 
     private fun isOpaque(skin: PolyBitmap, x0: Int, y0: Int, x1: Int, y1: Int): Boolean {
@@ -464,6 +588,18 @@ object McPlayerFaces {
     }
 }
 
+private const val FACE_REFRESH_MS = 1000L
+
+@Composable
+private fun KeepFaceFresh(id: UUID?) {
+    LaunchedEffect(id) {
+        while (true) {
+            delay(FACE_REFRESH_MS)
+            McPlayerFaces.layers(id)
+        }
+    }
+}
+
 @Composable
 fun McPlayerFace(
     id: UUID?,
@@ -471,6 +607,7 @@ fun McPlayerFace(
     size: Dp = 16.dp,
     hat: Boolean = true,
 ) {
+    KeepFaceFresh(id)
     Box(
         modifier
             .size(size)
@@ -501,11 +638,66 @@ fun NodeMcPlayerFace(
     modifier: PolyModifier = PolyModifier,
     hat: Boolean = true,
 ) {
+    KeepFaceFresh(id)
     val revision = McPlayerFaces.revision
     val onDraw: RenderContext.(Float, Float, Float, Float) -> Unit = remember(revision, id, hat) {
         { x, y, w, h ->
             val layers = McPlayerFaces.layers(id)
             if (layers != null) McPlayerFaces.draw(this, layers, x, y, w, h, hat)
+        }
+    }
+    NodeCanvas(modifier.size(size, size), onDraw = onDraw)
+}
+
+@Composable
+fun McPlayerFace(
+    id: UUID?,
+    style: McHeadStyle,
+    modifier: Modifier = Modifier,
+    size: Dp = 16.dp,
+    flip: Boolean = false,
+) {
+    KeepFaceFresh(id)
+    Box(
+        modifier
+            .size(size)
+            .drawBehind {
+                McPlayerFaces.revision
+                val layers = McPlayerFaces.layers(id) ?: return@drawBehind
+                val side = minOf(this.size.width, this.size.height)
+                val x = (this.size.width - side) / 2f
+                val y = (this.size.height - side) / 2f
+                drawPoly { McPlayerFaces.drawHead(it, layers, x, y, side, style, flip) }
+            },
+    )
+}
+
+@Composable
+fun McPlayerFace(
+    profile: GameProfile,
+    style: McHeadStyle,
+    modifier: Modifier = Modifier,
+    size: Dp = 16.dp,
+    flip: Boolean = false,
+) {
+    McPlayerFace(profile.id, style, modifier, size, flip)
+}
+
+@Composable
+fun NodeMcPlayerFace(
+    id: UUID?,
+    style: McHeadStyle,
+    size: Float = 16f,
+    modifier: PolyModifier = PolyModifier,
+    flip: Boolean = false,
+) {
+    KeepFaceFresh(id)
+    val revision = McPlayerFaces.revision
+    val onDraw: RenderContext.(Float, Float, Float, Float) -> Unit = remember(revision, id, style, flip) {
+        { x, y, w, h ->
+            val layers = McPlayerFaces.layers(id)
+            val side = minOf(w, h)
+            if (layers != null) McPlayerFaces.drawHead(this, layers, x + (w - side) / 2f, y + (h - side) / 2f, side, style, flip)
         }
     }
     NodeCanvas(modifier.size(size, size), onDraw = onDraw)
